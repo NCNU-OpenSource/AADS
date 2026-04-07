@@ -346,12 +346,18 @@ class RootCauseAnalyzer:
         Returns:
             Updated diagnosis dictionary
         """
+        # Extract original summary by removing all "(similar to xxx)" suffixes
+        summary = similar_diagnosis['summary']
+        import re
+        # Remove all "(similar to ...)" patterns to get clean summary
+        clean_summary = re.sub(r'\s*\(similar to [^)]+\)', '', summary)
+
         return {
             'diagnosis_id': f"diag_{cluster.cluster_id}_{int(datetime.now().timestamp())}_reused",
             'timestamp': datetime.now(),
             'cluster_id': cluster.cluster_id,
             'severity': similar_diagnosis['severity'],
-            'summary': similar_diagnosis['summary'] + f" (similar to {similar_diagnosis['diagnosis_id']})",
+            'summary': clean_summary,  # Use clean summary without suffixes
             'root_cause': similar_diagnosis['root_cause'],
             'recommended_actions': similar_diagnosis['recommended_actions'],
             'affected_services': [
