@@ -1,0 +1,32 @@
+# Layer 1 Filter Pipeline Configuration
+
+# Pipeline settings
+pipeline:
+  early_stopping: false       # Stop if a filter marks log as normal
+  aggregate_scores: true      # Combine scores from all filters
+  max_score: true             # Use max score (vs average)
+
+# Filter configurations
+filters:
+  # Filter 1: Random Forest (RESERVED - Not implemented)
+  - name: rf
+    enabled: false            # Disabled - not implemented yet
+    threshold: 0.3            # Low threshold for high recall
+    config:
+      max_features: 5000
+      n_estimators: 100
+      window_size: 10
+
+  # Filter 2: LogBERT (ACTIVE)
+  - name: logbert
+    enabled: true             # Currently the only active filter
+    threshold: 0.5            # BERT loss threshold
+    config:
+      model_path: "bert-base-uncased"
+      device: "cuda"          # auto-detect if null
+      window_size: 10
+
+# Logging
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

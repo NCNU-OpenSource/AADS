@@ -1,0 +1,707 @@
+{
+  "title": "LogBERT 異常檢測分析",
+  "description": "基於 BERT 的 AI 日誌異常檢測 Dashboard - 分層結構設計，支援快速定位和深度調查",
+  "tags": [
+    "logbert",
+    "anomaly",
+    "ai",
+    "sre"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 0,
+  "refresh": "30s",
+  "uid": "logbert-anomaly",
+  "id": null,
+  "templating": {
+    "list": [
+      {
+        "name": "container",
+        "label": "容器",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "P2AEF7061FA4CF50C"
+        },
+        "query": "label_values({source=\"logbert\"}, container)",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "name": "severity",
+        "label": "嚴重度",
+        "type": "custom",
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "All",
+            "value": "$__all"
+          },
+          {
+            "selected": false,
+            "text": "High",
+            "value": "high"
+          },
+          {
+            "selected": false,
+            "text": "Medium",
+            "value": "medium"
+          }
+        ],
+        "query": "high,medium"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "異常總數",
+      "description": "在選定時間範圍內檢測到的異常日誌總數",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "count_over_time({source=\"logbert\", type=\"anomaly\", container=~\"$container\", severity=~\"$severity\"}[$__range])",
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "P2AEF7061FA4CF50C"
+          }
+        }
+      ],
+      "options": {
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "value_and_name",
+        "orientation": "auto",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              },
+              {
+                "value": 10,
+                "color": "yellow"
+              },
+              {
+                "value": 50,
+                "color": "orange"
+              },
+              {
+                "value": 100,
+                "color": "red"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "🔴 高危異常",
+      "description": "異常分數 > 0.7 的高危險日誌數量",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "count_over_time({source=\"logbert\", type=\"anomaly\", severity=\"high\", container=~\"$container\"}[$__range])",
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "P2AEF7061FA4CF50C"
+          }
+        }
+      ],
+      "options": {
+        "graphMode": "none",
+        "colorMode": "background",
+        "textMode": "value_and_name",
+        "orientation": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "red",
+            "mode": "fixed"
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              },
+              {
+                "value": 1,
+                "color": "red"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "影響容器數",
+      "description": "出現異常的不同容器數量",
+      "type": "stat",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "count(count by (container) (count_over_time({source=\"logbert\", type=\"anomaly\", container=~\"$container\", severity=~\"$severity\"}[$__range])))",
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "P2AEF7061FA4CF50C"
+          }
+        }
+      ],
+      "options": {
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "value_and_name",
+        "orientation": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "blue"
+              },
+              {
+                "value": 3,
+                "color": "yellow"
+              },
+              {
+                "value": 5,
+                "color": "orange"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "異常趨勢",
+      "description": "每分鐘異常數量變化趨勢",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "sum(count_over_time({source=\"logbert\", type=\"anomaly\", container=~\"$container\", severity=~\"$severity\"}[1m]))",
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "P2AEF7061FA4CF50C"
+          },
+          "legendFormat": "異常/分鐘"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 20,
+            "lineWidth": 2,
+            "showPoints": "auto",
+            "lineInterpolation": "smooth"
+          },
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "容器異常分佈",
+      "description": "各容器產生的異常佔比（Top 10）",
+      "type": "piechart",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 4
+      },
+      "targets": [
+        {
+          "expr": "topk(10, sum by (container) (count_over_time({source=\"logbert\", type=\"anomaly\", container=~\"$container\", severity=~\"$severity\"}[$__range])))",
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "P2AEF7061FA4CF50C"
+          }
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "pieType": "pie",
+        "displayLabels": [
+          "percent"
+        ],
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic"
+          }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "嚴重度分佈",
+      "description": "高危 vs 中等風險異常數量對比",
+      "type": "bargauge",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 4
+      },
+      "targets": [
+        {
+          "expr": "sum by (severity) (count_over_time({source=\"logbert\", type=\"anomaly\", container=~\"$container\", severity=~\"$severity\"}[$__range]))",
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "P2AEF7061FA4CF50C"
+          }
+        }
+      ],
+      "options": {
+        "orientation": "horizontal",
+        "displayMode": "gradient",
+        "showUnfilled": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "value": null,
+                "color": "green"
+              },
+              {
+                "value": 10,
+                "color": "yellow"
+              },
+              {
+                "value": 50,
+                "color": "orange"
+              },
+              {
+                "value": 100,
+                "color": "red"
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "high"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "🔴 高危"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "medium"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "🟡 中等"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 7,
+      "title": "容器異常率（Top 5）",
+      "description": "異常產生速率最高的 5 個容器",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 4
+      },
+      "targets": [
+        {
+          "expr": "topk(5, sum by (container) (rate({source=\"logbert\", type=\"anomaly\", container=~\"$container\", severity=~\"$severity\"}[5m])))",
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "P2AEF7061FA4CF50C"
+          },
+          "legendFormat": "{{container}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 0,
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "reqps"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "最常見異常模板",
+      "description": "按出現頻率排序的 Top 20 異常模板，有助於識別重複問題",
+      "type": "table",
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 12
+      },
+      "targets": [
+        {
+          "expr": "{source=\"logbert\", type=\"anomaly\", container=~\"$container\", severity=~\"$severity\"}",
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "P2AEF7061FA4CF50C"
+          }
+        }
+      ],
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "Line",
+            "format": "json",
+            "replace": true
+          }
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "template": {
+                "aggregations": [
+                  "count"
+                ],
+                "operation": "groupby"
+              },
+              "score": {
+                "aggregations": [
+                  "mean"
+                ],
+                "operation": "aggregate"
+              }
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "sort": [
+              {
+                "field": "template (count)",
+                "desc": true
+              }
+            ]
+          }
+        },
+        {
+          "id": "limit",
+          "options": {
+            "limitField": 20
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "renameByName": {
+              "template": "異常模板",
+              "template (count)": "出現次數",
+              "score (mean)": "平均分數"
+            }
+          }
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "sortBy": []
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "left",
+            "displayMode": "auto",
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "出現次數"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 120
+              },
+              {
+                "id": "custom.displayMode",
+                "value": "color-background"
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "value": null,
+                      "color": "green"
+                    },
+                    {
+                      "value": 5,
+                      "color": "yellow"
+                    },
+                    {
+                      "value": 10,
+                      "color": "red"
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "平均分數"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 120
+              },
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "decimals",
+                "value": 3
+              },
+              {
+                "id": "custom.displayMode",
+                "value": "color-background"
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "value": null,
+                      "color": "green"
+                    },
+                    {
+                      "value": 0.7,
+                      "color": "yellow"
+                    },
+                    {
+                      "value": 1.5,
+                      "color": "orange"
+                    },
+                    {
+                      "value": 2.0,
+                      "color": "red"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 9,
+      "title": "異常日誌詳情",
+      "description": "原始異常日誌，支援變數篩選和搜尋",
+      "type": "logs",
+      "gridPos": {
+        "h": 14,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
+      "targets": [
+        {
+          "expr": "{source=\"logbert\", type=\"anomaly\", container=~\"$container\", severity=~\"$severity\"}",
+          "refId": "A",
+          "datasource": {
+            "type": "loki",
+            "uid": "P2AEF7061FA4CF50C"
+          }
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": true,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none",
+        "enableLogDetails": true
+      }
+    }
+  ],
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": [
+      "10s",
+      "30s",
+      "1m",
+      "5m",
+      "15m",
+      "30m",
+      "1h"
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": []
+}

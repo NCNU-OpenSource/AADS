@@ -1,0 +1,258 @@
+# ============================================
+# Grafana 完整可觀測性堆疊
+# 組件：Loki + Prometheus + cAdvisor + DCGM + Alloy + Grafana + LogBERT
+# ============================================
+
+services:
+  # ============================================
+  # Loki - 日誌聚合系統
+  # 用途：儲存和查詢日誌資料
+  # ============================================
+  loki:
+    image: grafana/loki:3.6.0
+    container_name: loki
+    user: "0:0"               # Run as root to avoid permission issues
+    ports:
+      - "3100:3100"           # HTTP API
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki       # 持久化儲存
+    command: -config.file=/etc/loki/local-config.yaml
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3100/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10          # Increased retries
+      start_period: 60s    # Added start period for initialization
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # ============================================
+  # Prometheus - 時序資料庫
+  # 用途：儲存 metrics（CPU、記憶體等數值型資料）
+  # ============================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"           # Web UI 和 API
+    volumes:
+      - ./prometheus/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'    # 保留 30 天
+      - '--web.enable-lifecycle'                # 允許 reload 設定
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # ============================================
+  # cAdvisor - 容器資源監控
+  # 用途：收集 Docker 容器的 CPU、記憶體、網路、磁碟 metrics
+  # ============================================
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    ports:
+      - "8081:8080"           # Web UI（主機端口改為 8081 避免衝突）
+    volumes:
+      # 唯讀掛載主機資源以收集 metrics
+      - /:/rootfs:ro                          # 主機根目錄
+      - /var/run:/var/run:ro                  # Docker socket 所在
+      - /sys:/sys:ro                          # 系統資訊
+      - /var/lib/docker/:/var/lib/docker:ro   # Docker 資料目錄
+      - /dev/disk/:/dev/disk:ro               # 磁碟資訊
+    command:
+      # 性能優化參數
+      - --housekeeping_interval=30s           # 降低採樣頻率（從 1s 增加到 30s）
+      - --max_housekeeping_interval=35s       # 最大採樣間隔
+      - --storage_duration=1m0s               # 減少歷史數據保留時間（從 2m 降到 1m）
+      - --docker_only=true                    # 只監控 Docker 容器
+      - --disable_metrics=percpu,sched,tcp,udp,diskIO,hugetlb,referenced_memory,cpu_topology,resctrl  # 禁用不需要的 metrics
+    privileged: true          # 需要特權模式讀取系統資源
+    devices:
+      - /dev/kmsg             # Kernel 訊息
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # ============================================
+  # NVIDIA DCGM Exporter - GPU Metrics
+  # 用途：收集 NVIDIA GPU 的使用率、記憶體、溫度等指標
+  # ============================================
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.8-3.6.0-ubuntu22.04
+    container_name: dcgm-exporter
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    ports:
+      - "9400:9400"           # DCGM metrics endpoint
+    cap_add:
+      - SYS_ADMIN
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # ============================================
+  # Grafana Alloy - 遙測收集器
+  # 用途：收集 Docker 日誌 + 系統日誌，轉發到 Loki
+  # ============================================
+  alloy:
+    image: grafana/alloy:latest
+    container_name: alloy
+    ports:
+      - "12345:12345"         # Web UI（除錯介面）
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro    # Docker 日誌
+      - /var/log/journal:/var/log/journal:ro            # systemd journal
+      - /run/log/journal:/run/log/journal:ro            # journal (volatile)
+      - /etc/machine-id:/etc/machine-id:ro              # machine ID
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+    depends_on:
+      loki:
+        condition: service_started    # Changed from service_healthy
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # ============================================
+  # Grafana - 可視化儀表板
+  # 用途：查看日誌和 metrics 的 Web UI
+  # ============================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"           # Web UI
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      loki:
+        condition: service_started    # Changed from service_healthy
+      prometheus:
+        condition: service_started
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # ============================================
+  # LogBERT - AI 日誌異常檢測
+  # 用途：使用 BERT 模型檢測異常日誌
+  # ============================================
+  logbert:
+    build: ./logbert
+    container_name: logbert
+    environment:
+      - LOKI_URL=http://loki:3100
+      - ANOMALY_THRESHOLD=0.5        # 異常閾值
+      - BATCH_SIZE=50                # 緩衝區大小
+      - MAX_WAIT_SECONDS=2.0         # 最大等待時間（秒）
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./logbert/output:/app/output  # 異常日誌輸出
+      - ./logbert/models:/app/models  # 模型檔案
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']      # 使用 GPU 0
+              capabilities: [gpu]
+    depends_on:
+      loki:
+        condition: service_started
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # ============================================
+  # TimescaleDB - Layer 0 持久化存儲
+  # 用途：永久存儲 RAW log 和異常 log
+  # ============================================
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: timescaledb
+    ports:
+      - "5432:5432"             # PostgreSQL 端口
+    environment:
+      - POSTGRES_USER=logdb
+      - POSTGRES_PASSWORD=${TIMESCALEDB_PASSWORD:-logdb_password}
+      - POSTGRES_DB=logdb
+      - TIMESCALEDB_TELEMETRY=off
+    volumes:
+      - ./layer0-storage/timescaledb/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./layer0-storage/timescaledb/retention.sql:/docker-entrypoint-initdb.d/02-retention.sql:ro
+      - timescaledb-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U logdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # ============================================
+  # Log Archiver - Loki → TimescaleDB 同步
+  # 用途：將 RAW log 從 Loki 持久化到 TimescaleDB
+  # ============================================
+  log-archiver:
+    build: ./layer0-storage/sync
+    container_name: log-archiver
+    environment:
+      - LOKI_URL=http://loki:3100
+      - DB_HOST=timescaledb
+      - DB_PORT=5432
+      - DB_NAME=logdb
+      - DB_USER=logdb
+      - DB_PASSWORD=${TIMESCALEDB_PASSWORD:-logdb_password}
+      - POLL_INTERVAL=60          # 每 60 秒拉取一次
+      - BATCH_SIZE=1000           # 每次拉取最多 1000 條
+    depends_on:
+      loki:
+        condition: service_started
+      timescaledb:
+        condition: service_healthy
+    networks:
+      - observability
+    restart: unless-stopped
+
+# ============================================
+# 持久化 Volumes
+# ============================================
+volumes:
+  loki-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+  timescaledb-data:
+    driver: local
+
+# ============================================
+# 網路
+# ============================================
+networks:
+  observability:
+    driver: bridge

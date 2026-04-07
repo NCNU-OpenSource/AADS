@@ -1,0 +1,60 @@
+# ============================================
+# Loki Configuration - 單機模式
+# ============================================
+
+# 啟用多租戶模式（用於隔離原始日誌和異常日誌）
+auth_enabled: true
+
+# 伺服器設定
+server:
+  http_listen_port: 3100      # HTTP API 端口
+  grpc_listen_port: 9096      # gRPC 端口（內部通訊）
+
+# 通用設定
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki          # 資料儲存根目錄
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks    # 日誌 chunk 儲存
+      rules_directory: /loki/rules      # 告警規則儲存
+  replication_factor: 1       # 單機設為 1
+  ring:
+    kvstore:
+      store: inmemory         # 單機使用 inmemory
+
+# 查詢快取設定
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100      # 快取 100MB
+
+# Schema 設定（索引和儲存格式）
+schema_config:
+  configs:
+    - from: 2024-01-01        # 生效日期
+      store: tsdb             # 使用 TSDB（推薦）
+      object_store: filesystem
+      schema: v13             # 最新 schema 版本
+      index:
+        prefix: index_
+        period: 24h           # 每 24 小時一個索引
+
+# 資料保留
+limits_config:
+  retention_period: 744h      # 31 天
+
+# 壓縮器設定
+compactor:
+  working_directory: /loki/compactor
+  compaction_interval: 10m
+  retention_enabled: true
+  retention_delete_delay: 2h
+  retention_delete_worker_count: 150
+  delete_request_store: filesystem
+
+# 日誌模式自動解析（暫時禁用以加速啟動）
+# pattern_ingester:
+#   enabled: true

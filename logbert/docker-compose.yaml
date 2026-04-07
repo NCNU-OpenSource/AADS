@@ -1,0 +1,27 @@
+# LogBERT Anomaly Detection Service
+services:
+  logbert:
+    build: .
+    container_name: logbert
+    environment:
+      - LOKI_URL=http://loki:3100
+      - CHECK_INTERVAL=300           # 每 5 分鐘檢查一次
+      - ANOMALY_THRESHOLD=0.5        # 異常閾值
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ./output:/app/output         # 異常日誌輸出
+      - ./models:/app/models         # 模型檔案
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - grafana_observability        # 連接到 Grafana 網路
+    restart: unless-stopped
+
+networks:
+  grafana_observability:
+    external: true                   # 使用現有的 observability 網路

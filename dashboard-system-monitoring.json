@@ -1,0 +1,313 @@
+{
+  "dashboard": {
+    "title": "系統監控 - GPU / CPU / Memory / Container Stats",
+    "tags": ["monitoring", "gpu", "docker"],
+    "timezone": "browser",
+    "schemaVersion": 38,
+    "version": 1,
+    "refresh": "10s",
+    "time": {
+      "from": "now-30m",
+      "to": "now"
+    },
+    "panels": [
+      {
+        "id": 1,
+        "title": "GPU 使用率",
+        "type": "timeseries",
+        "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "DCGM_FI_DEV_GPU_UTIL",
+            "legendFormat": "GPU {{gpu}} - {{modelName}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "min": 0,
+            "max": 100,
+            "color": {"mode": "palette-classic"},
+            "custom": {
+              "drawStyle": "line",
+              "lineInterpolation": "smooth",
+              "fillOpacity": 10
+            }
+          }
+        },
+        "options": {
+          "legend": {"displayMode": "table", "placement": "right"}
+        }
+      },
+      {
+        "id": 2,
+        "title": "GPU 記憶體使用量",
+        "type": "timeseries",
+        "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "DCGM_FI_DEV_FB_USED",
+            "legendFormat": "GPU {{gpu}} Used",
+            "refId": "A"
+          },
+          {
+            "expr": "DCGM_FI_DEV_FB_FREE",
+            "legendFormat": "GPU {{gpu}} Free",
+            "refId": "B"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "decmbytes",
+            "color": {"mode": "palette-classic"},
+            "custom": {
+              "drawStyle": "line",
+              "lineInterpolation": "smooth",
+              "fillOpacity": 10,
+              "stacking": {"mode": "normal"}
+            }
+          }
+        },
+        "options": {
+          "legend": {"displayMode": "table", "placement": "right"}
+        }
+      },
+      {
+        "id": 3,
+        "title": "GPU 溫度",
+        "type": "timeseries",
+        "gridPos": {"x": 0, "y": 8, "w": 12, "h": 6},
+        "targets": [
+          {
+            "expr": "DCGM_FI_DEV_GPU_TEMP",
+            "legendFormat": "GPU {{gpu}} Temperature",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "celsius",
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": null, "color": "green"},
+                {"value": 70, "color": "yellow"},
+                {"value": 85, "color": "red"}
+              ]
+            },
+            "custom": {
+              "drawStyle": "line",
+              "lineInterpolation": "smooth",
+              "fillOpacity": 20
+            }
+          }
+        },
+        "options": {
+          "legend": {"displayMode": "list", "placement": "bottom"}
+        }
+      },
+      {
+        "id": 4,
+        "title": "GPU 功耗",
+        "type": "timeseries",
+        "gridPos": {"x": 12, "y": 8, "w": 12, "h": 6},
+        "targets": [
+          {
+            "expr": "DCGM_FI_DEV_POWER_USAGE",
+            "legendFormat": "GPU {{gpu}} Power",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "watt",
+            "color": {"mode": "palette-classic"},
+            "custom": {
+              "drawStyle": "line",
+              "lineInterpolation": "smooth",
+              "fillOpacity": 10
+            }
+          }
+        },
+        "options": {
+          "legend": {"displayMode": "list", "placement": "bottom"}
+        }
+      },
+      {
+        "id": 5,
+        "title": "容器 CPU 使用率（Top 10）",
+        "type": "timeseries",
+        "gridPos": {"x": 0, "y": 14, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "topk(10, rate(container_cpu_usage_seconds_total{name=~\".+\"}[5m]) * 100)",
+            "legendFormat": "{{name}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "color": {"mode": "palette-classic"},
+            "custom": {
+              "drawStyle": "line",
+              "lineInterpolation": "smooth",
+              "fillOpacity": 10
+            }
+          }
+        },
+        "options": {
+          "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]}
+        }
+      },
+      {
+        "id": 6,
+        "title": "容器記憶體使用量（Top 10）",
+        "type": "timeseries",
+        "gridPos": {"x": 12, "y": 14, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "topk(10, container_memory_usage_bytes{name=~\".+\"} / 1024 / 1024)",
+            "legendFormat": "{{name}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "decmbytes",
+            "color": {"mode": "palette-classic"},
+            "custom": {
+              "drawStyle": "line",
+              "lineInterpolation": "smooth",
+              "fillOpacity": 10
+            }
+          }
+        },
+        "options": {
+          "legend": {"displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"]}
+        }
+      },
+      {
+        "id": 7,
+        "title": "immich_machine_learning - CPU 使用率",
+        "type": "stat",
+        "gridPos": {"x": 0, "y": 22, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "rate(container_cpu_usage_seconds_total{name=\"immich_machine_learning\"}[5m]) * 100",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": null, "color": "green"},
+                {"value": 50, "color": "yellow"},
+                {"value": 80, "color": "red"}
+              ]
+            }
+          }
+        },
+        "options": {
+          "colorMode": "background",
+          "graphMode": "area",
+          "orientation": "auto"
+        }
+      },
+      {
+        "id": 8,
+        "title": "immich_machine_learning - 記憶體使用",
+        "type": "stat",
+        "gridPos": {"x": 6, "y": 22, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "container_memory_usage_bytes{name=\"immich_machine_learning\"} / 1024 / 1024",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "decmbytes",
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": null, "color": "green"},
+                {"value": 4096, "color": "yellow"},
+                {"value": 8192, "color": "red"}
+              ]
+            }
+          }
+        },
+        "options": {
+          "colorMode": "background",
+          "graphMode": "area",
+          "orientation": "auto"
+        }
+      },
+      {
+        "id": 9,
+        "title": "immich_machine_learning - 網路流量（接收）",
+        "type": "stat",
+        "gridPos": {"x": 12, "y": 22, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "rate(container_network_receive_bytes_total{name=\"immich_machine_learning\"}[5m]) / 1024",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "KBs",
+            "color": {"mode": "palette-classic"}
+          }
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "orientation": "auto"
+        }
+      },
+      {
+        "id": 10,
+        "title": "immich_machine_learning - 網路流量（傳送）",
+        "type": "stat",
+        "gridPos": {"x": 18, "y": 22, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "rate(container_network_transmit_bytes_total{name=\"immich_machine_learning\"}[5m]) / 1024",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "KBs",
+            "color": {"mode": "palette-classic"}
+          }
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "area",
+          "orientation": "auto"
+        }
+      },
+      {
+        "id": 11,
+        "title": "⚠️ API Metrics 說明",
+        "type": "text",
+        "gridPos": {"x": 0, "y": 26, "w": 24, "h": 6},
+        "options": {
+          "mode": "markdown",
+          "content": "## 📊 API Request Metrics 設定說明\n\n目前 **immich_machine_learning** 容器沒有暴露 Prometheus metrics endpoint。\n\n### 方案一：啟用 immich 內建 metrics（推薦）\n\n如果 immich 支援 metrics，需要在容器配置中啟用：\n\n```yaml\nenvironment:\n  - METRICS_ENABLED=true\n  - METRICS_PORT=3003\n```\n\n然後在 Prometheus 添加抓取目標。\n\n### 方案二：從日誌解析 API metrics\n\n如果 immich 會輸出 API request 日誌，可以使用 **Loki** 查詢統計：\n\n```logql\n# API 請求數量（每分鐘）\nsum(rate({container=\"immich_machine_learning\"} |= \"GET\" or |= \"POST\" [1m]))\n\n# API Latency（如果日誌包含響應時間）\navg_over_time({container=\"immich_machine_learning\"} | json | __error__=\"\" | unwrap response_time [5m])\n```\n\n### 方案三：使用 Prometheus Pushgateway\n\n如果可以修改 immich 程式碼，可以在應用內使用 Prometheus client library 推送 metrics。\n\n---\n\n**檢查日誌格式**：\n```bash\ndocker logs immich_machine_learning | grep -E \"(GET|POST|api)\"\n```\n\n如果看到 API request 日誌，可以建立 Loki 查詢來統計 request 數量和 latency。"
+        }
+      }
+    ]
+  },
+  "overwrite": true
+}

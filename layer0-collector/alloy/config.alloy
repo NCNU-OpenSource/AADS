@@ -1,0 +1,145 @@
+// ============================================
+// Grafana Alloy Configuration
+// 收集：Docker 日誌 + Systemd Journal
+// ============================================
+
+// ============================================
+// 第一部分：Docker 容器日誌收集
+// ============================================
+
+// 1. Docker 容器自動發現
+// 作用：連接 Docker daemon，自動發現所有運行中的容器
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "5s"    // 每 5 秒更新容器列表
+}
+
+// 2. 標籤重新映射
+// 作用：從 Docker metadata 提取有意義的標籤
+discovery.relabel "docker_containers" {
+  targets = discovery.docker.containers.targets
+
+  // 規則 0: 排除 logbert 容器（避免自我參照）
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/logbert"
+    action        = "drop"
+  }
+
+  // 規則 1: 提取容器名稱（移除開頭的 /）
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  // 規則 2: 提取 image 名稱
+  rule {
+    source_labels = ["__meta_docker_container_image"]
+    target_label  = "image"
+  }
+
+  // 規則 3: 提取容器 ID（前 12 碼）
+  rule {
+    source_labels = ["__meta_docker_container_id"]
+    regex         = "(.{12}).*"
+    target_label  = "container_id"
+  }
+
+  // 規則 4: Docker Compose 專案名（如果有）
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "compose_project"
+  }
+
+  // 規則 5: Docker Compose 服務名（如果有）
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "compose_service"
+  }
+}
+
+// 3. Docker 日誌來源
+// 作用：從發現的容器讀取日誌
+loki.source.docker "docker_logs" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.docker_containers.output
+  labels     = {"source" = "docker"}
+  forward_to = [loki.process.docker_logs.receiver]
+}
+
+// 4. Docker 日誌處理管線
+// 作用：解析 JSON 格式、添加標籤
+loki.process "docker_logs" {
+  // Stage 1: Docker JSON 日誌解析
+  stage.docker {}
+
+  // Stage 2: 時間戳處理
+  stage.timestamp {
+    source = "time"
+    format = "RFC3339Nano"
+  }
+
+  // Stage 3: 添加 job 標籤
+  stage.static_labels {
+    values = {
+      job = "docker",
+    }
+  }
+
+  forward_to = [loki.write.loki.receiver]
+}
+
+// ============================================
+// 第二部分：Systemd Journal 日誌收集
+// ============================================
+
+// 5. Journal 日誌來源
+// 作用：讀取系統 journal（所有 systemd 服務日誌）
+loki.source.journal "system_logs" {
+  path = "/var/log/journal"
+  labels = {
+    source = "journal",
+    job    = "systemd",
+  }
+  forward_to = [loki.process.journal_logs.receiver]
+}
+
+// 6. Journal 日誌處理管線
+loki.process "journal_logs" {
+  // 從 journal 欄位提取標籤
+  stage.labels {
+    values = {
+      unit     = "__journal__systemd_unit",
+      hostname = "__journal__hostname",
+      priority = "__journal_priority_keyword",
+    }
+  }
+
+  forward_to = [loki.write.loki.receiver]
+}
+
+// ============================================
+// 第三部分：輸出設定
+// ============================================
+
+// 7. 寫入 Loki（使用 tenant ID "raw" 儲存原始日誌）
+loki.write "loki" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+
+    // 多租戶模式：原始日誌使用 tenant "raw"
+    headers = {
+      "X-Scope-OrgID" = "raw",
+    }
+  }
+}
+
+// ============================================
+// 第四部分：Logging 設定
+// ============================================
+
+logging {
+  level  = "info"      // debug, info, warn, error
+  format = "logfmt"    // logfmt 或 json
+}
