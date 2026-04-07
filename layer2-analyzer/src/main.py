@@ -162,6 +162,10 @@ class RootCauseAnalyzer:
             )
             # Reuse diagnosis with updated metadata
             diagnosis = self._reuse_diagnosis(similar_diagnosis, cluster)
+
+            # Run Layer 3 for notifications (respects severity filter)
+            await self._run_layer3(diagnosis)
+
             await self.store_diagnosis(diagnosis)
             logger.info(
                 f"Diagnosis reused: {diagnosis['diagnosis_id']} "
@@ -215,19 +219,8 @@ class RootCauseAnalyzer:
             raw_logs=raw_logs
         )
 
-        # Step 5: Layer 3 - Generate suggestions
-        suggestions = self.suggestion_generator.generate_suggestions(diagnosis)
-        logger.info(f"Generated {len(suggestions)} suggestions")
-
-        # Step 6: Layer 3 - Send notifications
-        formatted_message = self.suggestion_generator.format_for_notification(diagnosis, suggestions)
-        notification_results = await self.notification_hub.send_notification(
-            diagnosis=diagnosis,
-            suggestions=suggestions,
-            formatted_message=formatted_message
-        )
-        if notification_results:
-            logger.info(f"Notifications sent: {notification_results}")
+        # Step 5-6: Layer 3 - Generate suggestions and send notifications
+        await self._run_layer3(diagnosis)
 
         # Step 7: Store diagnosis
         await self.store_diagnosis(diagnosis)
@@ -371,6 +364,37 @@ class RootCauseAnalyzer:
             ],
             'correlated_metrics': {},
             'reused_from': similar_diagnosis['diagnosis_id']
+        }
+
+    async def _run_layer3(self, diagnosis: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute Layer 3 processing: generate suggestions and send notifications
+
+        Args:
+            diagnosis: Diagnosis dictionary (from LLM or reused)
+
+        Returns:
+            Dictionary with suggestions and notification_results
+        """
+        # Generate suggestions
+        suggestions = self.suggestion_generator.generate_suggestions(diagnosis)
+        logger.info(f"Generated {len(suggestions)} suggestions")
+
+        # Format and send notifications
+        formatted_message = self.suggestion_generator.format_for_notification(
+            diagnosis, suggestions
+        )
+        notification_results = await self.notification_hub.send_notification(
+            diagnosis=diagnosis,
+            suggestions=suggestions,
+            formatted_message=formatted_message
+        )
+        if notification_results:
+            logger.info(f"Notifications sent: {notification_results}")
+
+        return {
+            'suggestions': suggestions,
+            'notification_results': notification_results
         }
 
     async def store_diagnosis(self, diagnosis: Dict[str, Any]):
