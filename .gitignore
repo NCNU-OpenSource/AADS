@@ -43,3 +43,6 @@ Thumbs.db
 tmp/
 temp/
 *.tmp
+
+# Conversation memories (local only)
+.conversations/

@@ -15,7 +15,7 @@ services:
     ports:
       - "3100:3100"           # HTTP API
     volumes:
-      - ./loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - ./layer0-collector/loki/loki-config.yaml:/etc/loki/local-config.yaml:ro
       - loki-data:/loki       # 持久化儲存
     command: -config.file=/etc/loki/local-config.yaml
     healthcheck:
@@ -112,7 +112,7 @@ services:
     ports:
       - "12345:12345"         # Web UI（除錯介面）
     volumes:
-      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - ./layer0-collector/alloy/config.alloy:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro    # Docker 日誌
       - /var/log/journal:/var/log/journal:ro            # systemd journal
       - /run/log/journal:/run/log/journal:ro            # journal (volatile)
@@ -156,31 +156,46 @@ services:
     restart: unless-stopped
 
   # ============================================
-  # LogBERT - AI 日誌異常檢測
-  # 用途：使用 BERT 模型檢測異常日誌
+  # Layer 1 Filter - 多層異常過濾
+  # 用途：LogBERT 異常檢測 + PostgreSQL 持久化
   # ============================================
-  logbert:
-    build: ./logbert
-    container_name: logbert
+  layer1-filter:
+    build: ./layer1-filter
+    container_name: layer1-filter
     environment:
+      # Loki configuration
       - LOKI_URL=http://loki:3100
-      - ANOMALY_THRESHOLD=0.5        # 異常閾值
-      - BATCH_SIZE=50                # 緩衝區大小
-      - MAX_WAIT_SECONDS=2.0         # 最大等待時間（秒）
+      - LOKI_TENANT=raw
+      - LOKI_QUERY={source="docker", container!="layer1-filter"}
+      - POLL_INTERVAL=10             # Poll every 10 seconds
+
+      # Database configuration
+      - DB_HOST=timescaledb
+      - DB_PORT=5432
+      - DB_NAME=logdb
+      - DB_USER=logdb
+      - DB_PASSWORD=${TIMESCALEDB_PASSWORD:-logdb_password}
+
+      # LogBERT configuration
+      - ANOMALY_THRESHOLD=${ANOMALY_THRESHOLD:-0.5}
+      - BATCH_SIZE=${BATCH_SIZE:-50}
+
+      # GPU configuration
       - NVIDIA_VISIBLE_DEVICES=all
     volumes:
-      - ./logbert/output:/app/output  # 異常日誌輸出
-      - ./logbert/models:/app/models  # 模型檔案
+      - ./logbert/models:/app/models  # Reuse LogBERT model files
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['0']      # 使用 GPU 0
+              device_ids: ['0']       # Use GPU 0
               capabilities: [gpu]
     depends_on:
       loki:
         condition: service_started
+      timescaledb:
+        condition: service_healthy
     networks:
       - observability
     restart: unless-stopped
@@ -283,6 +298,28 @@ services:
         condition: service_healthy
       prometheus:
         condition: service_started
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # ============================================
+  # Dashboard - 問題監控儀表板
+  # 用途：Web UI 顯示診斷報告和異常統計
+  # ============================================
+  dashboard:
+    build: ./dashboard
+    container_name: dashboard
+    ports:
+      - "5000:5000"           # Web UI
+    environment:
+      - DB_HOST=timescaledb
+      - DB_PORT=5432
+      - DB_NAME=logdb
+      - DB_USER=logdb
+      - DB_PASSWORD=${TIMESCALEDB_PASSWORD:-logdb_password}
+    depends_on:
+      timescaledb:
+        condition: service_healthy
     networks:
       - observability
     restart: unless-stopped

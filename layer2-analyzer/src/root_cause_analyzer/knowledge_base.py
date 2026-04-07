@@ -7,7 +7,6 @@ import logging
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import chromadb
-from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
@@ -44,11 +43,8 @@ class KnowledgeBase:
         self.embedding_model_name = embedding_model
         self.collection_name = collection_name
 
-        # Initialize ChromaDB
-        self.client = chromadb.Client(Settings(
-            chroma_db_impl="duckdb+parquet",
-            persist_directory=str(self.db_path)
-        ))
+        # Initialize ChromaDB with new API
+        self.client = chromadb.PersistentClient(path=str(self.db_path))
 
         # Get or create collection
         self.collection = self.client.get_or_create_collection(

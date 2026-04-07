@@ -14,6 +14,7 @@ Orchestrates the complete AI auto-debug pipeline:
 """
 import os
 import asyncio
+import json
 import logging
 from typing import List, Dict, Any
 from datetime import datetime
@@ -228,6 +229,13 @@ class RootCauseAnalyzer:
         if not self.db_pool:
             await self.init_db_pool()
 
+        # Custom JSON encoder for datetime objects
+        def json_serial(obj):
+            """JSON serializer for objects not serializable by default json code"""
+            if isinstance(obj, datetime):
+                return obj.isoformat()
+            raise TypeError(f"Type {type(obj)} not serializable")
+
         async with self.db_pool.acquire() as conn:
             await conn.execute(
                 """
@@ -240,10 +248,10 @@ class RootCauseAnalyzer:
                 diagnosis['timestamp'],
                 diagnosis['severity'],
                 diagnosis['summary'],
-                diagnosis.get('root_cause', {}),
-                diagnosis.get('affected_services', []),
-                diagnosis.get('correlated_metrics', {}),
-                diagnosis.get('recommended_actions', [])
+                json.dumps(diagnosis.get('root_cause', {}), default=json_serial),
+                json.dumps(diagnosis.get('affected_services', []), default=json_serial),
+                json.dumps(diagnosis.get('correlated_metrics', {}), default=json_serial),
+                json.dumps(diagnosis.get('recommended_actions', []), default=json_serial)
             )
 
         logger.info(f"Stored diagnosis: {diagnosis['diagnosis_id']}")

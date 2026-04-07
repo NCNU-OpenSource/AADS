@@ -77,18 +77,39 @@ class OpenAICompatibleClient(BaseLLMClient):
         Returns:
             LLMResponse object
         """
-        url = f"{self.base_url}/chat/completions"
+        # If base_url already ends with a known endpoint (e.g., /responses),
+        # use it directly instead of appending /chat/completions
+        if self.base_url.endswith('/responses'):
+            url = self.base_url
+        else:
+            url = f"{self.base_url}/chat/completions"
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
 
-        payload = {
-            "model": self.model,
-            "messages": [{"role": msg.role, "content": msg.content} for msg in messages],
-            "temperature": temperature,
-            "max_tokens": max_tokens
-        }
+        # Different payload format for /responses endpoint
+        if self.base_url.endswith('/responses'):
+            # Convert messages to a single input string
+            input_text = "\n\n".join([
+                f"{msg.role}: {msg.content}"
+                for msg in messages
+            ])
+            payload = {
+                "model": self.model,
+                "input": input_text,
+                "temperature": temperature,
+                "max_tokens": max_tokens
+            }
+        else:
+            # Standard OpenAI format
+            payload = {
+                "model": self.model,
+                "messages": [{"role": msg.role, "content": msg.content} for msg in messages],
+                "temperature": temperature,
+                "max_tokens": max_tokens
+            }
 
         for attempt in range(retry):
             try:
@@ -112,11 +133,56 @@ class OpenAICompatibleClient(BaseLLMClient):
 
                         data = await response.json()
 
-                        # Extract response
-                        choice = data['choices'][0]
-                        content = choice['message']['content']
-                        finish_reason = choice.get('finish_reason', 'unknown')
-                        tokens_used = data.get('usage', {}).get('total_tokens', 0)
+                        # Log the response structure for debugging
+                        logger.info(f"API response structure: {list(data.keys())}")
+                        logger.debug(f"Full API response: {data}")
+
+                        # Extract response (support both OpenAI format and custom /responses format)
+                        if 'choices' in data:
+                            # Standard OpenAI format
+                            choice = data['choices'][0]
+                            content = choice['message']['content']
+                            finish_reason = choice.get('finish_reason', 'unknown')
+                            tokens_used = data.get('usage', {}).get('total_tokens', 0)
+                        elif 'output' in data:
+                            # NEW API /responses format
+                            raw_output = data['output']
+                            # Extract text from nested structure: output[0]['content'][0]['text']
+                            if isinstance(raw_output, list) and len(raw_output) > 0:
+                                message = raw_output[0]
+                                if isinstance(message, dict) and 'content' in message:
+                                    content_items = message['content']
+                                    if isinstance(content_items, list) and len(content_items) > 0:
+                                        # Find the first output_text item
+                                        for item in content_items:
+                                            if item.get('type') == 'output_text' and 'text' in item:
+                                                content = item['text']
+                                                break
+                                        else:
+                                            # Fallback: use string representation
+                                            content = str(content_items[0].get('text', raw_output))
+                                    else:
+                                        content = str(message.get('content', raw_output))
+                                else:
+                                    content = str(raw_output)
+                            else:
+                                content = str(raw_output)
+                            finish_reason = data.get('status', 'stop')
+                            tokens_used = data.get('usage', {}).get('total_tokens', 0)
+                        elif 'text' in data:
+                            # Alternative format
+                            raw_text = data['text']
+                            # Handle both list and string formats
+                            if isinstance(raw_text, list):
+                                content = '\n'.join(str(item) for item in raw_text)
+                            else:
+                                content = str(raw_text)
+                            finish_reason = 'stop'
+                            tokens_used = data.get('usage', {}).get('total_tokens', 0)
+                        else:
+                            # Unknown format, log and raise error
+                            logger.error(f"Unknown API response format. Keys: {list(data.keys())}")
+                            raise ValueError(f"Unknown API response format: {list(data.keys())}")
 
                         # Update statistics
                         self.stats["total_requests"] += 1

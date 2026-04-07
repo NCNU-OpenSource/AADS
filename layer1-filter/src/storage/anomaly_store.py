@@ -7,6 +7,7 @@ Writes anomaly logs to the anomaly_logs table for:
 - Manual review and labeling
 """
 import asyncio
+import json
 import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -152,7 +153,7 @@ class AnomalyStore:
                         template,
                         result.anomaly_score,
                         result.filter_stage,
-                        log.get('labels', {})
+                        json.dumps(log.get('labels', {}))
                     )
 
                     written_count += 1
@@ -174,6 +175,26 @@ class AnomalyStore:
         )
 
         return written_count
+
+    async def store_batch(self, results: List[FilterResult]) -> int:
+        """Alias for store_anomalies for compatibility"""
+        return await self.store_anomalies(results)
+
+    async def get_last_timestamp(self) -> Optional[datetime]:
+        """
+        Get timestamp of the last stored anomaly
+
+        Returns:
+            Datetime of last anomaly, or None if no anomalies exist
+        """
+        if not self.pool:
+            await self.connect()
+
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT MAX(time) as last_time FROM anomaly_logs"
+            )
+            return row['last_time'] if row and row['last_time'] else None
 
     async def get_recent_anomalies(
         self,

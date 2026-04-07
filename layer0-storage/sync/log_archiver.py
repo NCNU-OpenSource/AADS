@@ -137,6 +137,8 @@ class LogArchiver:
         if not logs:
             return
 
+        import json
+
         async with self.pool.acquire() as conn:
             # Prepare data for batch insert
             await conn.executemany(
@@ -152,7 +154,7 @@ class LogArchiver:
                     log['compose_project'],
                     log['source'],
                     log['message'],
-                    log['labels']
+                    json.dumps(log['labels'])  # Convert dict to JSON string
                 ) for log in logs]
             )
 

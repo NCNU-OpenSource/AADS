@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Auto-Debug Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    <style>
+        body {
+            background-color: #f8f9fa;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+        .navbar {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        .stat-card {
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            transition: transform 0.2s;
+        }
+        .stat-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+        .severity-badge {
+            font-size: 0.85rem;
+            padding: 0.4rem 0.8rem;
+            border-radius: 20px;
+        }
+        .severity-critical { background-color: #dc3545; color: white; }
+        .severity-high { background-color: #fd7e14; color: white; }
+        .severity-medium { background-color: #ffc107; color: #000; }
+        .severity-low { background-color: #28a745; color: white; }
+        .diagnosis-card {
+            border-left: 4px solid #667eea;
+            transition: all 0.2s;
+        }
+        .diagnosis-card:hover {
+            box-shadow: 0 4px 16px rgba(0,0,0,0.1);
+        }
+        .action-item {
+            background-color: #f8f9fa;
+            border-left: 3px solid #667eea;
+            padding: 10px 15px;
+            margin-bottom: 8px;
+            border-radius: 4px;
+        }
+        .loading {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 200px;
+        }
+        .refresh-btn {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            z-index: 1000;
+        }
+    </style>
+</head>
+<body>
+    <!-- Navbar -->
+    <nav class="navbar navbar-dark mb-4">
+        <div class="container-fluid">
+            <span class="navbar-brand mb-0 h1">
+                <i class="bi bi-bug-fill"></i> AI Auto-Debug Dashboard
+            </span>
+            <div class="d-flex">
+                <select class="form-select form-select-sm" id="timeRange" style="width: 150px;">
+                    <option value="1">最近 1 小時</option>
+                    <option value="6">最近 6 小時</option>
+                    <option value="24" selected>最近 24 小時</option>
+                    <option value="168">最近 7 天</option>
+                </select>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container-fluid">
+        <!-- Statistics Cards -->
+        <div class="row mb-4" id="statsCards">
+            <div class="col-md-3">
+                <div class="card stat-card bg-danger text-white">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2">總異常數</h6>
+                        <h2 class="card-title mb-0" id="totalAnomalies">-</h2>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card stat-card bg-warning text-dark">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2">診斷報告</h6>
+                        <h2 class="card-title mb-0" id="totalDiagnoses">-</h2>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card stat-card bg-info text-white">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2">高危問題</h6>
+                        <h2 class="card-title mb-0" id="criticalIssues">-</h2>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card stat-card bg-success text-white">
+                    <div class="card-body">
+                        <h6 class="card-subtitle mb-2">系統狀態</h6>
+                        <h5 class="card-title mb-0"><i class="bi bi-check-circle"></i> 運行中</h5>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Diagnosis Reports -->
+        <div class="row">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header bg-white">
+                        <h5 class="mb-0"><i class="bi bi-clipboard-data"></i> 診斷報告</h5>
+                    </div>
+                    <div class="card-body" id="diagnosisContainer">
+                        <div class="loading">
+                            <div class="spinner-border text-primary" role="status">
+                                <span class="visually-hidden">Loading...</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Anomaly Statistics -->
+        <div class="row mt-4">
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header bg-white">
+                        <h6 class="mb-0"><i class="bi bi-bar-chart"></i> 異常來源分布</h6>
+                    </div>
+                    <div class="card-body" id="anomalyByContainer">
+                        <div class="loading">
+                            <div class="spinner-border text-primary" role="status"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header bg-white">
+                        <h6 class="mb-0"><i class="bi bi-pie-chart"></i> 診斷嚴重性分布</h6>
+                    </div>
+                    <div class="card-body" id="diagnosisBySeverity">
+                        <div class="loading">
+                            <div class="spinner-border text-primary" role="status"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Refresh Button -->
+    <button class="btn btn-primary btn-lg refresh-btn" onclick="loadData()" title="重新整理">
+        <i class="bi bi-arrow-clockwise"></i>
+    </button>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let currentHours = 24;
+
+        // Time range change handler
+        document.getElementById('timeRange').addEventListener('change', function(e) {
+            currentHours = parseInt(e.target.value);
+            loadData();
+        });
+
+        // Load all data
+        function loadData() {
+            loadStats();
+            loadDiagnosis();
+        }
+
+        // Load statistics
+        async function loadStats() {
+            try {
+                const response = await fetch(`/api/stats?hours=${currentHours}`);
+                const data = await response.json();
+
+                // Update stat cards
+                document.getElementById('totalAnomalies').textContent = data.anomalies.total.toLocaleString();
+                document.getElementById('totalDiagnoses').textContent = data.diagnoses.total.toLocaleString();
+
+                // Calculate critical issues
+                const critical = data.diagnoses.by_severity.find(s => s.severity === 'critical')?.count || 0;
+                const high = data.diagnoses.by_severity.find(s => s.severity === 'high')?.count || 0;
+                document.getElementById('criticalIssues').textContent = (critical + high).toLocaleString();
+
+                // Display anomaly by container
+                displayAnomalyByContainer(data.anomalies.by_container);
+
+                // Display diagnosis by severity
+                displayDiagnosisBySeverity(data.diagnoses.by_severity);
+            } catch (error) {
+                console.error('Error loading stats:', error);
+            }
+        }
+
+        // Load diagnosis reports
+        async function loadDiagnosis() {
+            try {
+                const response = await fetch(`/api/diagnosis?hours=${currentHours}`);
+                const reports = await response.json();
+
+                const container = document.getElementById('diagnosisContainer');
+
+                if (reports.length === 0) {
+                    container.innerHTML = '<p class="text-muted text-center">暫無診斷報告</p>';
+                    return;
+                }
+
+                container.innerHTML = reports.map(report => `
+                    <div class="card diagnosis-card mb-3">
+                        <div class="card-body">
+                            <div class="d-flex justify-content-between align-items-start mb-2">
+                                <h6 class="card-title mb-0">
+                                    <i class="bi bi-exclamation-triangle-fill"></i>
+                                    ${escapeHtml(report.summary)}
+                                </h6>
+                                <span class="severity-badge severity-${report.severity}">
+                                    ${report.severity.toUpperCase()}
+                                </span>
+                            </div>
+                            <p class="text-muted small mb-2">
+                                <i class="bi bi-clock"></i> ${formatTimestamp(report.timestamp)}
+                                <span class="ms-3"><i class="bi bi-hash"></i> ${report.diagnosis_id}</span>
+                            </p>
+                            <div class="mb-3">
+                                <strong>根因分析:</strong>
+                                <p class="mb-1">${escapeHtml(report.root_cause.description)}</p>
+                                <small class="text-muted">
+                                    分類: ${report.root_cause.category} |
+                                    信心度: ${(report.root_cause.confidence * 100).toFixed(1)}%
+                                </small>
+                            </div>
+                            <div>
+                                <strong>修復建議:</strong>
+                                ${report.recommended_actions.map((action, idx) => `
+                                    <div class="action-item">
+                                        <strong>${idx + 1}. ${action.action.replace(/_/g, ' ')}</strong>
+                                        <p class="mb-0 small">${escapeHtml(action.description)}</p>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                    </div>
+                `).join('');
+            } catch (error) {
+                console.error('Error loading diagnosis:', error);
+                document.getElementById('diagnosisContainer').innerHTML =
+                    '<p class="text-danger">載入失敗，請重試</p>';
+            }
+        }
+
+        // Display anomaly by container
+        function displayAnomalyByContainer(data) {
+            const container = document.getElementById('anomalyByContainer');
+            if (data.length === 0) {
+                container.innerHTML = '<p class="text-muted">無數據</p>';
+                return;
+            }
+
+            container.innerHTML = data.map(item => `
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <span>${item.container}</span>
+                    <span>
+                        <span class="badge bg-danger">${item.count}</span>
+                        <small class="text-muted ms-2">avg: ${parseFloat(item.avg_score).toFixed(2)}</small>
+                    </span>
+                </div>
+            `).join('');
+        }
+
+        // Display diagnosis by severity
+        function displayDiagnosisBySeverity(data) {
+            const container = document.getElementById('diagnosisBySeverity');
+            if (data.length === 0) {
+                container.innerHTML = '<p class="text-muted">無數據</p>';
+                return;
+            }
+
+            container.innerHTML = data.map(item => `
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <span class="severity-badge severity-${item.severity}">${item.severity}</span>
+                    <span class="badge bg-secondary">${item.count}</span>
+                </div>
+            `).join('');
+        }
+
+        // Utility functions
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function formatTimestamp(timestamp) {
+            const date = new Date(timestamp);
+            return date.toLocaleString('zh-TW', {
+                year: 'numeric',
+                month: '2-digit',
+                day: '2-digit',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+        }
+
+        // Auto refresh every 30 seconds
+        setInterval(loadData, 30000);
+
+        // Initial load
+        loadData();
+    </script>
+</body>
+</html>
