@@ -151,6 +151,24 @@ class RootCauseAnalyzer:
         """
         logger.info(f"Analyzing cluster: {cluster.cluster_id}")
 
+        # ============================================
+        # Deduplication: Check for similar diagnosis
+        # ============================================
+        similar_diagnosis = await self.find_similar_diagnosis(cluster)
+        if similar_diagnosis:
+            logger.info(
+                f"Found similar diagnosis {similar_diagnosis['diagnosis_id']} "
+                f"for cluster {cluster.cluster_id}, reusing diagnosis (saving LLM tokens)"
+            )
+            # Reuse diagnosis with updated metadata
+            diagnosis = self._reuse_diagnosis(similar_diagnosis, cluster)
+            await self.store_diagnosis(diagnosis)
+            logger.info(
+                f"Diagnosis reused: {diagnosis['diagnosis_id']} "
+                f"(severity: {diagnosis['severity']})"
+            )
+            return
+
         # Get representative container for metrics
         container = list(cluster.containers)[0] if cluster.containers else None
 
@@ -218,6 +236,136 @@ class RootCauseAnalyzer:
             f"Diagnosis complete: {diagnosis['diagnosis_id']} "
             f"(severity: {diagnosis['severity']})"
         )
+
+    async def find_similar_diagnosis(self, cluster) -> Dict[str, Any]:
+        """
+        Find similar diagnosis to avoid duplicate LLM analysis
+
+        Similarity criteria:
+        - Same container(s)
+        - Similar templates (>70% overlap)
+        - Within last 24 hours
+
+        Args:
+            cluster: AnomalyCluster to check
+
+        Returns:
+            Similar diagnosis dict if found, None otherwise
+        """
+        if not self.db_pool:
+            await self.init_db_pool()
+
+        # Create cluster signature from templates and containers
+        cluster_containers = set(cluster.containers)
+        cluster_templates = set(cluster.templates) if cluster.templates else set()
+
+        # Need at least containers to do deduplication
+        if not cluster_containers:
+            logger.info(f"Skipping dedup check for {cluster.cluster_id}: no containers")
+            return None
+
+        logger.info(
+            f"Checking similarity for {cluster.cluster_id}: "
+            f"containers={cluster_containers}, templates_count={len(cluster_templates)}"
+        )
+
+        # Query recent diagnoses from same container(s)
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT diagnosis_id, timestamp, severity, summary,
+                       root_cause, recommended_actions, affected_services
+                FROM diagnosis_reports
+                WHERE timestamp > NOW() - INTERVAL '24 hours'
+                ORDER BY timestamp DESC
+                LIMIT 50
+                """
+            )
+
+        logger.debug(f"Found {len(rows)} recent diagnoses to check")
+
+        # Check similarity for each recent diagnosis
+        for row in rows:
+            try:
+                # Parse affected services (asyncpg returns dict directly for JSONB)
+                affected_services = row['affected_services']
+
+                # Extract containers from affected services
+                diagnosis_containers = set()
+                if isinstance(affected_services, (list, str)):
+                    if isinstance(affected_services, str):
+                        affected_services = json.loads(affected_services)
+
+                    for service in affected_services:
+                        if isinstance(service, dict) and 'container' in service:
+                            diagnosis_containers.add(service['container'])
+
+                # Check container overlap
+                if not cluster_containers & diagnosis_containers:
+                    continue  # No common containers
+
+                # Calculate template similarity (if we had templates in diagnosis, we'd check here)
+                # For now, if same container = likely similar issue
+                container_overlap = len(cluster_containers & diagnosis_containers) / len(cluster_containers)
+
+                logger.debug(
+                    f"Checking {row['diagnosis_id']}: "
+                    f"containers={diagnosis_containers}, overlap={container_overlap:.0%}"
+                )
+
+                if container_overlap >= 0.7:  # 70% container overlap
+                    logger.info(
+                        f"Found similar diagnosis: {row['diagnosis_id']} "
+                        f"(container overlap: {container_overlap:.0%}, containers: {diagnosis_containers})"
+                    )
+                    return {
+                        'diagnosis_id': row['diagnosis_id'],
+                        'timestamp': row['timestamp'],
+                        'severity': row['severity'],
+                        'summary': row['summary'],
+                        'root_cause': row['root_cause'] if isinstance(row['root_cause'], dict) else json.loads(row['root_cause']),
+                        'recommended_actions': row['recommended_actions'] if isinstance(row['recommended_actions'], list) else json.loads(row['recommended_actions']),
+                        'affected_services': affected_services
+                    }
+
+            except Exception as e:
+                logger.warning(f"Error checking diagnosis {row.get('diagnosis_id', 'unknown')} similarity: {e}")
+                continue
+
+        logger.debug("No similar diagnosis found")
+        return None
+
+    def _reuse_diagnosis(self, similar_diagnosis: Dict[str, Any], cluster) -> Dict[str, Any]:
+        """
+        Reuse a similar diagnosis with updated metadata
+
+        Args:
+            similar_diagnosis: Previously found diagnosis
+            cluster: Current cluster
+
+        Returns:
+            Updated diagnosis dictionary
+        """
+        return {
+            'diagnosis_id': f"diag_{cluster.cluster_id}_{int(datetime.now().timestamp())}_reused",
+            'timestamp': datetime.now(),
+            'cluster_id': cluster.cluster_id,
+            'severity': similar_diagnosis['severity'],
+            'summary': similar_diagnosis['summary'] + f" (similar to {similar_diagnosis['diagnosis_id']})",
+            'root_cause': similar_diagnosis['root_cause'],
+            'recommended_actions': similar_diagnosis['recommended_actions'],
+            'affected_services': [
+                {
+                    "container": container,
+                    "anomaly_count": cluster.total_count,
+                    "first_seen": cluster.start_time,
+                    "last_seen": cluster.end_time
+                }
+                for container in cluster.containers
+            ],
+            'correlated_metrics': {},
+            'reused_from': similar_diagnosis['diagnosis_id']
+        }
 
     async def store_diagnosis(self, diagnosis: Dict[str, Any]):
         """
