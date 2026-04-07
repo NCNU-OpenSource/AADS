@@ -237,6 +237,56 @@ services:
       - observability
     restart: unless-stopped
 
+  # ============================================
+  # Layer 2 Analyzer - 根因分析
+  # 用途：AI 驅動的根因分析和診斷
+  # ============================================
+  layer2-analyzer:
+    build: ./layer2-analyzer
+    container_name: layer2-analyzer
+    environment:
+      # Database
+      - DB_HOST=timescaledb
+      - DB_PORT=5432
+      - DB_NAME=logdb
+      - DB_USER=logdb
+      - DB_PASSWORD=${TIMESCALEDB_PASSWORD:-logdb_password}
+      # Consumer
+      - POLL_INTERVAL=30
+      - BATCH_SIZE=50
+      # Aggregator
+      - TIME_WINDOW_MINUTES=5
+      - MIN_CLUSTER_SIZE=2
+      # Metrics
+      - PROMETHEUS_URL=http://prometheus:9090
+      # LLM
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai_compatible}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://api.openai.com/v1}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - LLM_STRATEGY=${LLM_STRATEGY:-cascade}
+      # Ollama (optional)
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2:3b}
+      - OLLAMA_ENABLED=${OLLAMA_ENABLED:-false}
+      # Knowledge Base
+      - VECTOR_DB_PATH=/app/data/chromadb
+      # Layer 3: Remediation & Notifications
+      - AUTO_REMEDIATION_ENABLED=${AUTO_REMEDIATION_ENABLED:-false}
+      - SEVERITY_FILTER=${SEVERITY_FILTER:-medium}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL}
+      - WEBHOOK_URL=${WEBHOOK_URL}
+    volumes:
+      - layer2-data:/app/data
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+    networks:
+      - observability
+    restart: unless-stopped
+
 # ============================================
 # 持久化 Volumes
 # ============================================
@@ -248,6 +298,8 @@ volumes:
   grafana-data:
     driver: local
   timescaledb-data:
+    driver: local
+  layer2-data:
     driver: local
 
 # ============================================

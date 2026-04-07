@@ -1,0 +1,26 @@
+wing: ai_auto_debug_system
+rooms:
+- name: documentation
+  description: Files from docs/
+- name: prometheus
+  description: Files from prometheus/
+- name: logbert
+  description: Files from logbert/
+- name: layer0_storage
+  description: Files from layer0-storage/
+- name: layer1_filter
+  description: Files from layer1-filter/
+- name: layer3_remediation
+  description: Files from layer3-remediation/
+- name: layer2_analyzer
+  description: Files from layer2-analyzer/
+- name: grafana
+  description: Files from grafana/
+- name: layer0_collector
+  description: Files from layer0-collector/
+- name: backend
+  description: Files from models/
+- name: configuration
+  description: Files from config/
+- name: general
+  description: Files that don't fit other rooms

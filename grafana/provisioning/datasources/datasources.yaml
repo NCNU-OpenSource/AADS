@@ -42,3 +42,18 @@ datasources:
     jsonData:
       timeInterval: "15s"
       httpMethod: "POST"
+
+  # TimescaleDB - 診斷報告和日誌存儲
+  - name: TimescaleDB
+    type: postgres
+    access: proxy
+    url: timescaledb:5432
+    database: logdb
+    user: logdb
+    editable: true
+    jsonData:
+      sslmode: "disable"
+      postgresVersion: 1400
+      timescaledb: true
+    secureJsonData:
+      password: "logdb_password"

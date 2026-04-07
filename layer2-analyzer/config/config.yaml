@@ -1,0 +1,56 @@
+# Layer 2 Analyzer Configuration
+
+# Database
+db:
+  host: timescaledb
+  port: 5432
+  database: logdb
+  user: logdb
+  password: ${TIMESCALEDB_PASSWORD}
+
+# Anomaly Consumer
+consumer:
+  poll_interval: 30         # seconds between polls
+  batch_size: 50            # anomalies per batch
+
+# Aggregator
+aggregator:
+  time_window_minutes: 5    # time window for clustering
+  min_cluster_size: 2       # minimum anomalies to form cluster
+
+# Metrics
+metrics:
+  prometheus_url: http://prometheus:9090
+  context_minutes: 5        # minutes before/after anomaly for metrics
+
+# Knowledge Base
+knowledge_base:
+  db_path: /app/data/chromadb
+  embedding_model: all-MiniLM-L6-v2
+  collection_name: anomaly_cases
+
+# LLM
+llm:
+  # Strategy: cascade | primary_only | local_only
+  strategy: cascade
+
+  # Primary LLM (OpenAI-compatible)
+  primary:
+    provider: openai_compatible
+    base_url: ${LLM_BASE_URL:-https://api.openai.com/v1}
+    api_key: ${LLM_API_KEY}
+    model: ${LLM_MODEL:-gpt-4o-mini}
+    timeout: 60
+    max_tokens: 2048
+
+  # Local LLM (Ollama)
+  local:
+    provider: ollama
+    base_url: ${OLLAMA_BASE_URL:-http://ollama:11434}
+    model: ${OLLAMA_MODEL:-llama3.2:3b}
+    enabled: ${OLLAMA_ENABLED:-false}
+
+# Logging
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

@@ -3,6 +3,8 @@
   "projects": [
     "Loki",
     "Docker",
-    "Prometheus"
+    "Prometheus",
+    "Grafana",
+    "Alloy"
   ]
 }
