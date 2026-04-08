@@ -37,7 +37,7 @@ async def get_diagnosis_reports(hours=24):
         rows = await conn.fetch(
             """
             SELECT diagnosis_id, timestamp, severity, summary,
-                   root_cause, recommended_actions
+                   root_cause, recommended_actions, action_plan
             FROM diagnosis_reports
             WHERE timestamp > NOW() - INTERVAL '%s hours'
             ORDER BY timestamp DESC
@@ -47,13 +47,19 @@ async def get_diagnosis_reports(hours=24):
 
         reports = []
         for row in rows:
+            # Handle action_plan (can be None for old records)
+            action_plan = None
+            if row['action_plan'] is not None:
+                action_plan = json.loads(row['action_plan']) if isinstance(row['action_plan'], str) else row['action_plan']
+
             reports.append({
                 'diagnosis_id': row['diagnosis_id'],
                 'timestamp': row['timestamp'].isoformat(),
                 'severity': row['severity'],
                 'summary': row['summary'],
                 'root_cause': json.loads(row['root_cause']) if isinstance(row['root_cause'], str) else row['root_cause'],
-                'recommended_actions': json.loads(row['recommended_actions']) if isinstance(row['recommended_actions'], str) else row['recommended_actions']
+                'recommended_actions': json.loads(row['recommended_actions']) if isinstance(row['recommended_actions'], str) else row['recommended_actions'],
+                'action_plan': action_plan
             })
 
         return reports

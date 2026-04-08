@@ -617,6 +617,31 @@
                         `分類: ${report.root_cause.category} | ` :
                         '';
 
+                    // ClaudeStylePlan high-level description (if available)
+                    let planDescriptionHtml = '';
+                    if (report.action_plan && report.action_plan.goal) {
+                        planDescriptionHtml = `
+                            <div class="mb-3 p-3 border-start border-primary border-3 bg-light">
+                                <div class="mb-2">
+                                    <strong><i class="bi bi-bullseye"></i> 修復目標：</strong>
+                                    <p class="mb-1">${escapeHtml(report.action_plan.goal)}</p>
+                                </div>
+                                ${report.action_plan.context_analysis ? `
+                                    <div class="mb-2">
+                                        <strong><i class="bi bi-diagram-3"></i> 狀況分析：</strong>
+                                        <p class="mb-1 text-muted">${escapeHtml(report.action_plan.context_analysis)}</p>
+                                    </div>
+                                ` : ''}
+                                ${report.action_plan.proposed_approach ? `
+                                    <div>
+                                        <strong><i class="bi bi-lightbulb"></i> 修復策略：</strong>
+                                        <p class="mb-0 text-muted">${escapeHtml(report.action_plan.proposed_approach)}</p>
+                                    </div>
+                                ` : ''}
+                            </div>
+                        `;
+                    }
+
                     return `
                         <div class="card diagnosis-card mb-3">
                             <div class="card-body">
@@ -641,8 +666,9 @@
                                         信心度: ${(confidence * 100).toFixed(1)}%
                                     </small>
                                 </div>
+                                ${planDescriptionHtml}
                                 <div>
-                                    <strong>修復計畫:</strong>
+                                    <strong>執行步驟:</strong>
                                     ${actionsHtml}
                                 </div>
                             </div>
@@ -671,11 +697,11 @@
             if (isNewFormat) {
                 return renderClaudeStyleActions(actions);
             } else {
-                // Old format fallback
+                // Old format fallback - very simple display
                 return actions.map((action, idx) => `
                     <div class="action-item">
-                        <strong>${idx + 1}. ${action.action.replace(/_/g, ' ')}</strong>
-                        <p class="mb-0 small">${escapeHtml(action.description)}</p>
+                        <strong>${idx + 1}. ${escapeHtml(action.description || action.title || 'Unknown action')}</strong>
+                        ${action.action_type ? `<p class="mb-0 small">Type: ${action.action_type}</p>` : ''}
                     </div>
                 `).join('');
             }
