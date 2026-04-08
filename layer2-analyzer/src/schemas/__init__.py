@@ -1,6 +1,23 @@
 """
-Schemas for Layer 2 Agent structured outputs
-"""
-from schemas.action_plan import ActionStep, ActionPlan
+Layer 2 Output Schemas
 
-__all__ = ["ActionStep", "ActionPlan"]
+Primary: ClaudeStylePlan (Claude Code Plan Mode style)
+Legacy: ActionPlan, ActionStep (backward compatibility)
+"""
+from schemas.action_plan import (
+    # New Claude Style Plan
+    StepCommand,
+    ExecutionStep,
+    ClaudeStylePlan,
+    # Legacy (deprecated but kept for backward compatibility)
+    ActionStep,
+    ActionPlan,
+)
+
+__all__ = [
+    "StepCommand",
+    "ExecutionStep",
+    "ClaudeStylePlan",
+    "ActionStep",
+    "ActionPlan",
+]
