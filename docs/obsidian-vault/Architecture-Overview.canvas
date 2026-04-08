@@ -339,6 +339,36 @@
       "height": 180,
       "color": "6",
       "text": "## External LLM\n**外部 AI 服務**\n\n### OpenAI API\n- GPT-4 / GPT-3.5\n\n### Ollama\n- 本地部署\n- llama / mistral"
+    },
+    {
+      "id": "node_ingester_01",
+      "type": "text",
+      "x": 1040,
+      "y": 820,
+      "width": 200,
+      "height": 160,
+      "color": "3",
+      "text": "## Ingester\n**異常接收器**\n- Port: 8000\n- FastAPI\n- PostgreSQL 寫入\n\n📁 `layer1-filter/ingester/`"
+    },
+    {
+      "id": "node_l2webhook01",
+      "type": "text",
+      "x": 1300,
+      "y": 1100,
+      "width": 200,
+      "height": 180,
+      "color": "2",
+      "text": "## Layer 2 Webhook\n**即時分析觸發**\n- Port: 8080\n- `/api/webhooks/anomaly`\n- Background processing\n\n📁 `layer2-analyzer/src/main.py`"
+    },
+    {
+      "id": "node_fanout_001",
+      "type": "text",
+      "x": 850,
+      "y": 950,
+      "width": 350,
+      "height": 120,
+      "color": "6",
+      "text": "## Fan-out Architecture\n**Alloy HTTP Receiver (Port 9999)**\n\nLogBERT → POST :9999 → 同時轉發:\n- Ingester :8000 (DB 留存)\n- Layer 2 Webhook :8080 (即時分析)"
     }
   ],
   "edges": [

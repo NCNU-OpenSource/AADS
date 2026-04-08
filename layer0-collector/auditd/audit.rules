@@ -1,0 +1,238 @@
+# ============================================
+# ADDS Audit Rules - 完整命令執行監控
+# 參考：Neo23x0/auditd - https://github.com/Neo23x0/auditd
+# 參考：audit.rules(7) - https://man7.org/linux/man-pages/man7/audit.rules.7.html
+# ============================================
+
+# ============================================
+# 基礎設定
+# ============================================
+
+# 刪除所有現有規則
+-D
+
+# 設定 buffer size (8192)
+-b 8192
+
+# 設定失敗模式 (0=silent 1=printk 2=panic)
+-f 1
+
+# ============================================
+# 自我審計（監控 Audit 系統本身）
+# ============================================
+
+# 監控 Audit 日誌檔案
+-w /var/log/audit/ -p wa -k audit_log
+
+# 監控 Audit 配置檔案
+-w /etc/audit/ -p wa -k audit_config
+-w /etc/libaudit.conf -p wa -k audit_config
+-w /etc/audisp/ -p wa -k audit_config
+
+# 監控 Audit 工具
+-w /sbin/auditctl -p x -k audit_tools
+-w /sbin/auditd -p x -k audit_tools
+
+# ============================================
+# 系統呼叫監控（命令執行）
+# ============================================
+
+# 監控所有命令執行（execve system call）
+# 這是核心功能：記錄所有程式執行
+-a always,exit -F arch=b64 -S execve -k exec
+-a always,exit -F arch=b32 -S execve -k exec
+
+# ============================================
+# 使用者與群組管理
+# ============================================
+
+# 監控 passwd/shadow 檔案變更
+-w /etc/passwd -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/security/opasswd -p wa -k identity
+
+# 監控 PAM 配置
+-w /etc/pam.d/ -p wa -k pam
+-w /etc/security/limits.conf -p wa -k pam
+-w /etc/security/limits.d/ -p wa -k pam
+
+# ============================================
+# 網路配置監控
+# ============================================
+
+# 監控 hostname 和 domain 變更
+-a always,exit -F arch=b64 -S sethostname -S setdomainname -k network_modifications
+-a always,exit -F arch=b32 -S sethostname -S setdomainname -k network_modifications
+
+# 監控網路配置檔案
+-w /etc/hosts -p wa -k network_modifications
+-w /etc/network/ -p wa -k network_modifications
+-w /etc/netplan/ -p wa -k network_modifications
+-w /etc/sysconfig/network -p wa -k network_modifications
+
+# ============================================
+# SSH 配置監控
+# ============================================
+
+# 監控 SSH 配置檔案
+-w /etc/ssh/sshd_config -p wa -k sshd
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd
+
+# 監控 SSH 金鑰
+-w /home/ -p wa -k ssh_keys
+-w /root/.ssh -p wa -k ssh_keys
+
+# ============================================
+# Sudo 與權限提升
+# ============================================
+
+# 監控 sudoers 檔案
+-w /etc/sudoers -p wa -k sudo
+-w /etc/sudoers.d/ -p wa -k sudo
+
+# 監控 sudo 命令執行
+-w /usr/bin/sudo -p x -k priv_esc
+-w /usr/bin/su -p x -k priv_esc
+
+# 監控 setuid 程式執行
+-a always,exit -F arch=b64 -S setuid -S setreuid -S setresuid -k priv_esc
+-a always,exit -F arch=b32 -S setuid -S setreuid -S setresuid -k priv_esc
+
+# ============================================
+# 核心模組監控
+# ============================================
+
+# 監控核心模組載入/卸載
+-w /sbin/insmod -p x -k modules
+-w /sbin/rmmod -p x -k modules
+-w /sbin/modprobe -p x -k modules
+-a always,exit -F arch=b64 -S init_module -S delete_module -k modules
+-a always,exit -F arch=b32 -S init_module -S delete_module -k modules
+
+# ============================================
+# 系統配置檔案監控
+# ============================================
+
+# 監控系統配置目錄
+-w /etc/crontab -p wa -k cron
+-w /etc/cron.d/ -p wa -k cron
+-w /etc/cron.daily/ -p wa -k cron
+-w /etc/cron.hourly/ -p wa -k cron
+-w /etc/cron.monthly/ -p wa -k cron
+-w /etc/cron.weekly/ -p wa -k cron
+-w /var/spool/cron/ -p wa -k cron
+
+# 監控 systemd 服務
+-w /etc/systemd/ -p wa -k systemd
+-w /lib/systemd/ -p wa -k systemd
+
+# ============================================
+# 敏感工具使用監控
+# ============================================
+
+# 網路工具
+-w /usr/bin/wget -p x -k susp_activity
+-w /usr/bin/curl -p x -k susp_activity
+-w /usr/bin/nc -p x -k susp_activity
+-w /usr/bin/netcat -p x -k susp_activity
+-w /usr/bin/ncat -p x -k susp_activity
+-w /usr/bin/nmap -p x -k susp_activity
+
+# 封包擷取工具
+-w /usr/bin/tcpdump -p x -k susp_activity
+-w /usr/bin/tshark -p x -k susp_activity
+-w /usr/bin/wireshark -p x -k susp_activity
+
+# Shell 執行
+-w /bin/bash -p x -k shell
+-w /bin/sh -p x -k shell
+-w /bin/dash -p x -k shell
+-w /bin/zsh -p x -k shell
+
+# 壓縮工具（資料外洩）
+-w /usr/bin/zip -p x -k data_exfil
+-w /usr/bin/gzip -p x -k data_exfil
+-w /usr/bin/tar -p x -k data_exfil
+-w /usr/bin/bzip2 -p x -k data_exfil
+
+# ============================================
+# Docker 監控
+# ============================================
+
+-w /usr/bin/docker -p x -k docker
+-w /usr/bin/dockerd -p x -k docker
+-w /var/lib/docker -p wa -k docker
+-w /etc/docker -p wa -k docker
+
+# ============================================
+# 套件管理監控
+# ============================================
+
+# Debian/Ubuntu
+-w /usr/bin/apt -p x -k package_mgmt
+-w /usr/bin/apt-get -p x -k package_mgmt
+-w /usr/bin/dpkg -p x -k package_mgmt
+
+# RHEL/CentOS
+-w /usr/bin/yum -p x -k package_mgmt
+-w /usr/bin/dnf -p x -k package_mgmt
+-w /usr/bin/rpm -p x -k package_mgmt
+
+# Python
+-w /usr/bin/pip -p x -k package_mgmt
+-w /usr/bin/pip3 -p x -k package_mgmt
+
+# ============================================
+# 檔案權限變更監控
+# ============================================
+
+# 監控檔案權限變更
+-a always,exit -F arch=b64 -S chmod -S fchmod -S fchmodat -k perm_mod
+-a always,exit -F arch=b32 -S chmod -S fchmod -S fchmodat -k perm_mod
+
+# 監控檔案擁有者變更
+-a always,exit -F arch=b64 -S chown -S fchown -S fchownat -S lchown -k perm_mod
+-a always,exit -F arch=b32 -S chown -S fchown -S fchownat -S lchown -k perm_mod
+
+# ============================================
+# 檔案刪除監控
+# ============================================
+
+# 監控檔案刪除（unlink, rename）
+-a always,exit -F arch=b64 -S unlink -S unlinkat -S rename -S renameat -k delete
+-a always,exit -F arch=b32 -S unlink -S unlinkat -S rename -S renameat -k delete
+
+# ============================================
+# 時間變更監控
+# ============================================
+
+# 監控系統時間變更
+-a always,exit -F arch=b64 -S adjtimex -S settimeofday -S clock_settime -k time_change
+-a always,exit -F arch=b32 -S adjtimex -S settimeofday -S clock_settime -k time_change
+
+# ============================================
+# Mount 操作監控
+# ============================================
+
+# 監控檔案系統 mount
+-a always,exit -F arch=b64 -S mount -S umount2 -k mounts
+-a always,exit -F arch=b32 -S mount -S umount2 -k mounts
+
+# ============================================
+# 最後設定：鎖定規則
+# ============================================
+
+# 鎖定規則，防止被修改（需要重啟才能更改）
+# 注意：啟用後只能透過重啟系統來修改規則
+# -e 2
+
+# ============================================
+# 部署說明：
+# ============================================
+# 1. 複製此檔案到 /etc/audit/rules.d/adds.rules
+# 2. 重新載入規則：sudo augenrules --load
+# 3. 或直接重啟：sudo service auditd restart
+# 4. 檢查規則：sudo auditctl -l
+# 5. 測試：執行一個命令，然後檢查 ausearch -k exec

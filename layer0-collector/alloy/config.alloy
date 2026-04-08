@@ -1,118 +1,39 @@
 // ============================================
-// Grafana Alloy Configuration
-// 收集：Docker 日誌 + Systemd Journal
+// ADDS Grafana Alloy Configuration
+// 架構：事件驅動日誌收集 + 定時指標拉取
 // ============================================
 
 // ============================================
-// 第一部分：Docker 容器日誌收集
+// PIPELINE 1a: Logs Collection (Event-Driven)
+// 機制：loki.source.file (tail) → loki.write (WAL)
 // ============================================
 
-// 1. Docker 容器自動發現
-// 作用：連接 Docker daemon，自動發現所有運行中的容器
-discovery.docker "containers" {
-  host             = "unix:///var/run/docker.sock"
-  refresh_interval = "5s"    // 每 5 秒更新容器列表
-}
-
-// 2. 標籤重新映射
-// 作用：從 Docker metadata 提取有意義的標籤
-discovery.relabel "docker_containers" {
-  targets = discovery.docker.containers.targets
-
-  // 規則 0: 排除 logbert 容器（避免自我參照）
-  rule {
-    source_labels = ["__meta_docker_container_name"]
-    regex         = "/logbert"
-    action        = "drop"
-  }
-
-  // 規則 1: 提取容器名稱（移除開頭的 /）
-  rule {
-    source_labels = ["__meta_docker_container_name"]
-    regex         = "/(.*)"
-    target_label  = "container"
-  }
-
-  // 規則 2: 提取 image 名稱
-  rule {
-    source_labels = ["__meta_docker_container_image"]
-    target_label  = "image"
-  }
-
-  // 規則 3: 提取容器 ID（前 12 碼）
-  rule {
-    source_labels = ["__meta_docker_container_id"]
-    regex         = "(.{12}).*"
-    target_label  = "container_id"
-  }
-
-  // 規則 4: Docker Compose 專案名（如果有）
-  rule {
-    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
-    target_label  = "compose_project"
-  }
-
-  // 規則 5: Docker Compose 服務名（如果有）
-  rule {
-    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
-    target_label  = "compose_service"
-  }
-}
-
-// 3. Docker 日誌來源
-// 作用：從發現的容器讀取日誌
-loki.source.docker "docker_logs" {
-  host       = "unix:///var/run/docker.sock"
-  targets    = discovery.relabel.docker_containers.output
-  labels     = {"source" = "docker"}
-  forward_to = [loki.process.docker_logs.receiver]
-}
-
-// 4. Docker 日誌處理管線
-// 作用：解析 JSON 格式、添加標籤
-loki.process "docker_logs" {
-  // Stage 1: Docker JSON 日誌解析
-  stage.docker {}
-
-  // Stage 2: 時間戳處理
-  stage.timestamp {
-    source = "time"
-    format = "RFC3339Nano"
-  }
-
-  // Stage 3: 添加 job 標籤
-  stage.static_labels {
-    values = {
-      job = "docker",
-    }
-  }
-
-  forward_to = [loki.write.loki.receiver]
-}
-
 // ============================================
-// 第二部分：Systemd Journal 日誌收集
+// 1a-1: Audit Log Collection (事件驅動 tail)
 // ============================================
 
-// 5. Journal 日誌來源
-// 作用：讀取系統 journal（所有 systemd 服務日誌）
-loki.source.journal "system_logs" {
-  path = "/var/log/journal"
-  labels = {
-    source = "journal",
-    job    = "systemd",
-  }
-  forward_to = [loki.process.journal_logs.receiver]
+loki.source.file "audit_logs" {
+  targets = [
+    {
+      __path__ = "/var/log/audit/audit.log",
+      job      = "audit",
+      host     = constants.hostname,
+    },
+  ]
+
+  forward_to = [loki.process.audit_logs.receiver]
 }
 
-// 6. Journal 日誌處理管線
-loki.process "journal_logs" {
-  // 從 journal 欄位提取標籤
+loki.process "audit_logs" {
+  // Stage 1: Extract audit fields
+  stage.regex {
+    expression = "type=(?P<audit_type>\\w+)"
+  }
+
+  // Stage 2: Add labels
   stage.labels {
     values = {
-      unit     = "__journal__systemd_unit",
-      hostname = "__journal__hostname",
-      priority = "__journal_priority_keyword",
+      audit_type = "audit_type",
     }
   }
 
@@ -120,26 +41,221 @@ loki.process "journal_logs" {
 }
 
 // ============================================
-// 第三部分：輸出設定
+// 1a-2: System Log Collection (/var/log/syslog)
 // ============================================
 
-// 7. 寫入 Loki（使用 tenant ID "raw" 儲存原始日誌）
+loki.source.file "syslog" {
+  targets = [
+    {
+      __path__ = "/var/log/syslog",
+      job      = "syslog",
+      host     = constants.hostname,
+    },
+  ]
+
+  forward_to = [loki.write.loki.receiver]
+}
+
+// ============================================
+// 1a-3: Auth Log Collection (/var/log/auth.log)
+// ============================================
+
+loki.source.file "auth_log" {
+  targets = [
+    {
+      __path__ = "/var/log/auth.log",
+      job      = "auth",
+      host     = constants.hostname,
+    },
+  ]
+
+  forward_to = [loki.write.loki.receiver]
+}
+
+// ============================================
+// 1a-4: Kern Log Collection (/var/log/kern.log)
+// ============================================
+
+loki.source.file "kern_log" {
+  targets = [
+    {
+      __path__ = "/var/log/kern.log",
+      job      = "kern",
+      host     = constants.hostname,
+    },
+  ]
+
+  forward_to = [loki.write.loki.receiver]
+}
+
+// ============================================
+// 1a-5: Loki Write Endpoint (啟用 WAL)
+// ============================================
+
 loki.write "loki" {
   endpoint {
     url = "http://loki:3100/loki/api/v1/push"
 
-    // 多租戶模式：原始日誌使用 tenant "raw"
+    // 使用 tenant "raw" 儲存原始日誌
     headers = {
       "X-Scope-OrgID" = "raw",
     }
   }
+
+  // 啟用 WAL（Write-Ahead Log）防止網路斷線時資料遺失
+  wal {
+    enabled = true
+  }
 }
 
 // ============================================
-// 第四部分：Logging 設定
+// PIPELINE 1b: Metrics Collection (Polling)
+// 機制：prometheus.exporter → prometheus.scrape (60s) → prometheus.remote_write (WAL)
+// ============================================
+
+// ============================================
+// 1b-1: Unix System Metrics Exporter
+// ============================================
+
+prometheus.exporter.unix "system" {
+  // 啟用所有 collectors
+  enable_collectors = [
+    "cpu",
+    "loadavg",
+    "meminfo",
+    "diskstats",
+    "filesystem",
+    "netdev",
+    "netstat",
+    "vmstat",
+  ]
+}
+
+// ============================================
+// 1b-2: Process Metrics Exporter
+// [重要] 必須設定 matcher 來抓取所有程序
+// ============================================
+
+prometheus.exporter.process "all_processes" {
+  // 設定使用 host /proc 而非容器 /proc
+  procfs_path = "/host/proc"
+
+  // 設定 matcher 抓取所有程序
+  matcher {
+    name    = "{{.Comm}}"
+    cmdline = [".+"]
+  }
+
+  // 追蹤所有程序
+  track_children = true
+}
+
+// ============================================
+// 1b-3: Prometheus Scrape (60s interval)
+// ============================================
+
+prometheus.scrape "metrics" {
+  targets = prometheus.exporter.unix.system.targets + prometheus.exporter.process.all_processes.targets
+
+  // 設定採集頻率為 60 秒（對齊雲端標準）
+  scrape_interval = "60s"
+  scrape_timeout  = "10s"
+
+  forward_to = [prometheus.remote_write.prometheus.receiver]
+}
+
+// ============================================
+// 1b-4: Prometheus Remote Write (啟用 WAL)
+// ============================================
+
+prometheus.remote_write "prometheus" {
+  endpoint {
+    url = "http://prometheus:9090/api/v1/write"
+
+    // 可選：基本認證
+    // basic_auth {
+    //   username = "prometheus"
+    //   password = env("PROMETHEUS_PASSWORD")
+    // }
+  }
+
+  // WAL is enabled by default in prometheus.remote_write
+}
+
+// ============================================
+// PIPELINE 2: Fan-out (Event-Driven Routing)
+// 接收 LogBERT 異常，同時發送到 PostgreSQL 與 LLM
+// ============================================
+
+// ============================================
+// 2-1: HTTP API Receiver (接收 LogBERT 輸入)
+// ============================================
+
+loki.source.api "logbert_anomalies" {
+  http {
+    // 監聽 port 9999
+    listen_address = "0.0.0.0"
+    listen_port    = 9999
+  }
+
+  // 接收後立即轉發（Fan-out）
+  forward_to = [
+    loki.write.postgres_ingester.receiver,
+    loki.write.llm_webhook.receiver,
+  ]
+
+  // 添加標籤
+  labels = {
+    source = "logbert",
+    type   = "anomaly",
+  }
+}
+
+// ============================================
+// 2-2: Sink A - PostgreSQL Ingester
+// ============================================
+
+loki.write "postgres_ingester" {
+  endpoint {
+    url = "http://ingester:8000/api/anomalies"
+
+    // HTTP headers
+    headers = {
+      "Content-Type" = "application/json",
+    }
+  }
+
+  // 啟用 WAL（確保不遺失異常資料）
+  wal {
+    enabled = true
+  }
+}
+
+// ============================================
+// 2-3: Sink B - LLM Webhook
+// ============================================
+
+loki.write "llm_webhook" {
+  endpoint {
+    url = "http://layer2-analyzer:8080/api/webhooks/anomaly"
+
+    // HTTP headers
+    headers = {
+      "Content-Type" = "application/json",
+    }
+  }
+
+  // 啟用 WAL
+  wal {
+    enabled = true
+  }
+}
+
+// ============================================
+// Logging Configuration
 // ============================================
 
 logging {
-  level  = "info"      // debug, info, warn, error
-  format = "logfmt"    // logfmt 或 json
+  level  = "info"
+  format = "logfmt"
 }

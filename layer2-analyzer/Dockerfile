@@ -12,5 +12,8 @@ COPY src/ ./
 # Create data directory for ChromaDB
 RUN mkdir -p /app/data/chromadb
 
+# Expose webhook port
+EXPOSE 8080
+
 # Run analyzer
 CMD ["python", "-u", "main.py"]

@@ -11,6 +11,7 @@ Orchestrates the complete AI auto-debug pipeline:
 7. Generate remediation suggestions (Layer 3)
 8. Send notifications (Layer 3)
 9. Store diagnosis reports
+10. Expose webhook for event-driven anomaly ingestion
 """
 import os
 import asyncio
@@ -19,6 +20,9 @@ import logging
 from typing import List, Dict, Any
 from datetime import datetime
 import asyncpg
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+import uvicorn
 
 from anomaly_consumer import AnomalyConsumer
 from raw_log_fetcher import RawLogFetcher
@@ -452,10 +456,107 @@ class RootCauseAnalyzer:
             self.knowledge_base.persist()
 
 
+# ============================================
+# FastAPI Webhook for Event-Driven Ingestion
+# ============================================
+
+app = FastAPI(title="Layer 2 Analyzer API")
+
+# Global analyzer instance
+analyzer_instance: RootCauseAnalyzer = None
+
+
+class AnomalyWebhookPayload(BaseModel):
+    """Webhook payload from Alloy"""
+    timestamp: str
+    service: str
+    log_message: str
+    logbert_anomaly_score: float
+    level: str = "INFO"
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize analyzer on startup"""
+    global analyzer_instance
+    analyzer_instance = RootCauseAnalyzer()
+    await analyzer_instance.init_db_pool()
+    logger.info("FastAPI webhook server started")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    if analyzer_instance:
+        await analyzer_instance.close_db_pool()
+        analyzer_instance.knowledge_base.persist()
+    logger.info("FastAPI webhook server stopped")
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "service": "layer2-analyzer"}
+
+
+@app.post("/api/webhooks/anomaly")
+async def receive_anomaly_webhook(
+    payload: AnomalyWebhookPayload,
+    background_tasks: BackgroundTasks
+):
+    """
+    Webhook endpoint to receive anomaly from Alloy fan-out
+    Triggers immediate analysis
+    """
+    if not analyzer_instance:
+        raise HTTPException(status_code=503, detail="Analyzer not initialized")
+
+    logger.info(f"Received webhook: {payload.service} - score {payload.logbert_anomaly_score}")
+
+    # Convert to anomaly dict format
+    anomaly = {
+        'timestamp': datetime.fromisoformat(payload.timestamp),
+        'service': payload.service,
+        'log_message': payload.log_message,
+        'logbert_anomaly_score': payload.logbert_anomaly_score,
+        'level': payload.level,
+    }
+
+    # Process in background to avoid blocking webhook response
+    background_tasks.add_task(analyzer_instance.process_anomaly_batch, [anomaly])
+
+    return {
+        "status": "accepted",
+        "message": "Anomaly queued for analysis",
+        "timestamp": payload.timestamp
+    }
+
+
+async def run_analyzer():
+    """Run analyzer consumer loop"""
+    await analyzer_instance.run()
+
+
+async def run_api_server():
+    """Run FastAPI server"""
+    config = uvicorn.Config(
+        app,
+        host="0.0.0.0",
+        port=8080,
+        log_level="info"
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
 async def main():
-    """Main entry point"""
-    analyzer = RootCauseAnalyzer()
-    await analyzer.run()
+    """Main entry point - run both analyzer and API server"""
+    # Create tasks for both services
+    analyzer_task = asyncio.create_task(run_analyzer())
+    api_task = asyncio.create_task(run_api_server())
+
+    # Wait for both
+    await asyncio.gather(analyzer_task, api_task)
 
 
 if __name__ == '__main__':

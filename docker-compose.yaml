@@ -45,6 +45,7 @@ services:
       - '--storage.tsdb.path=/prometheus'
       - '--storage.tsdb.retention.time=30d'    # 保留 30 天
       - '--web.enable-lifecycle'                # 允許 reload 設定
+      - '--web.enable-remote-write-receiver'    # 啟用 remote write endpoint
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
       interval: 10s
@@ -117,6 +118,8 @@ services:
       - /var/log/journal:/var/log/journal:ro            # systemd journal
       - /run/log/journal:/run/log/journal:ro            # journal (volatile)
       - /etc/machine-id:/etc/machine-id:ro              # machine ID
+      - /var/log:/var/log:ro                            # System logs (for loki.source.file)
+      - /proc:/host/proc:ro                             # Process info (for prometheus.exporter.process)
     command:
       - run
       - /etc/alloy/config.alloy
@@ -201,6 +204,33 @@ services:
     restart: unless-stopped
 
   # ============================================
+  # Ingester - PostgreSQL Anomaly Ingester
+  # 用途：接收 Alloy Fan-out 的異常資料並寫入 PostgreSQL
+  # ============================================
+  ingester:
+    build: ./layer1-filter/ingester
+    container_name: ingester
+    ports:
+      - "8000:8000"               # FastAPI endpoint
+    environment:
+      - DB_HOST=timescaledb
+      - DB_PORT=5432
+      - DB_NAME=logdb
+      - DB_USER=logdb
+      - DB_PASSWORD=${TIMESCALEDB_PASSWORD:-logdb_password}
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    networks:
+      - observability
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================
   # TimescaleDB - Layer 0 持久化存儲
   # 用途：永久存儲 RAW log 和異常 log
   # ============================================
@@ -215,8 +245,7 @@ services:
       - POSTGRES_DB=logdb
       - TIMESCALEDB_TELEMETRY=off
     volumes:
-      - ./layer0-storage/timescaledb/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
-      - ./layer0-storage/timescaledb/retention.sql:/docker-entrypoint-initdb.d/02-retention.sql:ro
+      - ./layer0-storage/timescaledb/migrations:/docker-entrypoint-initdb.d:ro
       - timescaledb-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U logdb"]
@@ -259,6 +288,8 @@ services:
   layer2-analyzer:
     build: ./layer2-analyzer
     container_name: layer2-analyzer
+    ports:
+      - "8080:8080"           # Layer 2 Webhook API
     environment:
       # Database
       - DB_HOST=timescaledb
