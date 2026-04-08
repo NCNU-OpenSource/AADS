@@ -4,14 +4,19 @@ LangGraph Agent for Layer 2 Root Cause Analysis
 Implements a ReAct (Reasoning + Acting) loop where the Agent can:
 1. Investigate anomalies by calling tools (query_loki, query_prometheus, execute_diagnostic_command)
 2. Reason about collected information
-3. Generate structured ActionPlan output
+3. Generate structured ClaudeStylePlan output (TODO List format)
 
 Graph Structure:
     investigator_node → tools_node → investigator_node (loop)
                       ↓
                   planner_node → END
 
-Related: Phase 4.4
+Design Philosophy (ADR-004):
+- Layer 2 (Planner Agent): Thinks and plans, outputs JSON blueprint
+- Layer 3 (Dashboard): Renders and approves, HITL gates on requires_approval=True
+- Layer 4 (Executor Agent): Executes strictly within JSON contract
+
+Related: Phase 4.4, ADR-004 Claude Style Plan Design
 """
 import os
 import logging
@@ -23,7 +28,7 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
 from agent.tools import AGENT_TOOLS
-from schemas.action_plan import ActionPlan
+from schemas.action_plan import ClaudeStylePlan, ExecutionStep, StepCommand
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +47,7 @@ class AgentState(TypedDict):
         iteration: Current iteration count (prevents infinite loops)
     """
     messages: Annotated[list, add_messages]
-    action_plan: ActionPlan | None
+    action_plan: ClaudeStylePlan | None
     iteration: int
 
 
@@ -130,31 +135,41 @@ def planner_node(state: AgentState) -> dict:
         base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
         temperature=0.1  # Lower temperature for more deterministic output
     )
-    structured_llm = llm.with_structured_output(ActionPlan)
+    structured_llm = llm.with_structured_output(ClaudeStylePlan)
 
     # Build final prompt for planning
     planning_prompt = """
-Based on the investigation above, generate a comprehensive action plan.
+You are now in Plan Mode. Generate a comprehensive remediation plan in TODO List format.
 
-Your output MUST include:
-1. root_cause: A clear, concise description of the root cause
-2. confidence_score: Your confidence level (0.0 to 1.0)
-3. actions: List of ordered action steps
+## Required Output Structure:
 
-For each action step:
+1. **goal**: One sentence summarizing the fix objective
+2. **context_analysis**: Analysis of current system state and root cause
+3. **proposed_approach**: High-level remediation strategy
+
+4. **execution_steps**: Ordered TODO List with phases:
+   - **Explore**: Information gathering steps (read-only)
+   - **Execute**: Remediation steps (may modify state)
+   - **Verify**: Validation steps (confirm fix worked)
+
+For each step:
 - step_id: Sequential number starting from 1
-- description: What this step does
-- action_type: One of "query", "verify", or "k8s_exec"
-- target: Target system/service
-- command: Actual command to run
-- is_destructive: true if this modifies system state (default: false)
+- title: Short action title (e.g., "重啟 nginx 容器")
+- phase: One of "Explore", "Execute", "Verify"
+- explanation: Why this step is necessary
+- requires_approval: True for any Execute step that modifies system state
+- commands: List of {tool_name, target, command}
 
-Example action types:
-- "query": Read-only queries (Loki, Prometheus, logs)
-- "verify": Validation checks (health endpoints, connectivity)
-- "k8s_exec": System commands (restart, reload, scale)
+## Rules:
+- All "Execute" phase steps with system modifications MUST have requires_approval=True
+- Group related steps under the same phase
+- Provide clear explanations for each step
 
-Only mark is_destructive=true for commands that MODIFY state.
+Example command tools:
+- query_loki: Read logs from Loki
+- query_prometheus: Read metrics from Prometheus
+- k8s_exec: Execute Kubernetes commands (kubectl)
+- bash: Execute shell commands in containers
 """
 
     # Generate action plan
@@ -168,10 +183,13 @@ Only mark is_destructive=true for commands that MODIFY state.
     except Exception as e:
         logger.error(f"[Planner] Error generating action plan: {e}")
         # Fallback: Generate safe action plan
-        fallback_plan = ActionPlan(
+        fallback_plan = ClaudeStylePlan(
+            goal="Unable to determine fix objective due to planning error",
+            context_analysis="Planning error occurred, unable to analyze system state",
+            proposed_approach="Manual investigation required",
+            execution_steps=[],
             root_cause="Unable to determine root cause due to planning error",
-            confidence_score=0.0,
-            actions=[]
+            confidence_score=0.0
         )
         return {"action_plan": fallback_plan}
 
@@ -245,7 +263,7 @@ def create_agent_graph() -> StateGraph:
 # ============================================================
 # Convenience function
 # ============================================================
-async def run_agent_analysis(initial_prompt: str) -> ActionPlan:
+async def run_agent_analysis(initial_prompt: str) -> ClaudeStylePlan:
     """
     Run the agent analysis with an initial prompt
 
@@ -253,7 +271,7 @@ async def run_agent_analysis(initial_prompt: str) -> ActionPlan:
         initial_prompt: Initial investigation prompt (e.g., Map-Reduce summary)
 
     Returns:
-        ActionPlan generated by the agent
+        ClaudeStylePlan generated by the agent
     """
     graph = create_agent_graph()
 
@@ -269,10 +287,13 @@ async def run_agent_analysis(initial_prompt: str) -> ActionPlan:
     action_plan = result.get("action_plan")
     if not action_plan:
         logger.warning("[Agent] No action plan generated, using fallback")
-        action_plan = ActionPlan(
+        action_plan = ClaudeStylePlan(
+            goal="Analysis completed without generating action plan",
+            context_analysis="Unable to analyze system state",
+            proposed_approach="Manual investigation required",
+            execution_steps=[],
             root_cause="Analysis completed without generating action plan",
-            confidence_score=0.0,
-            actions=[]
+            confidence_score=0.0
         )
 
     return action_plan

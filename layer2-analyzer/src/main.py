@@ -40,7 +40,7 @@ from notification_hub import NotificationHub
 # New: Map-Reduce and Agent imports
 from aggregator.map_reduce import deduplicate_and_summarize, format_summary_for_prompt
 from agent.graph import run_agent_analysis
-from schemas.action_plan import ActionPlan
+from schemas.action_plan import ClaudeStylePlan
 
 logging.basicConfig(
     level=logging.INFO,
@@ -247,18 +247,18 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
                 f"actions={len(action_plan.actions)}"
             )
 
-            # Convert ActionPlan to diagnosis format for compatibility with Layer 3
+            # Convert ClaudeStylePlan to diagnosis format for compatibility with Layer 3
             diagnosis = {
                 'diagnosis_id': f"diag_{cluster.cluster_id}_{int(datetime.now().timestamp())}",
                 'timestamp': datetime.now(),
                 'cluster_id': cluster.cluster_id,
                 'severity': summary['severity'],
-                'summary': action_plan.root_cause,
+                'summary': action_plan.goal,  # Use goal as summary
                 'root_cause': {
                     'description': action_plan.root_cause,
                     'confidence': action_plan.confidence_score
                 },
-                'action_plan': action_plan.dict(),  # Store full ActionPlan
+                'action_plan': action_plan.model_dump(),  # Store full ClaudeStylePlan
                 'affected_services': [
                     {
                         "container": container,
@@ -271,13 +271,20 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
                 'recommended_actions': [
                     {
                         'step_id': step.step_id,
-                        'description': step.description,
+                        'title': step.title,
+                        'phase': step.phase,
+                        'explanation': step.explanation,
+                        'requires_approval': step.requires_approval,
+                        'status': step.status,
+                        'commands': [cmd.model_dump() for cmd in step.commands],
+                        # Backward compatibility fields
                         'action_type': step.action_type,
                         'target': step.target,
                         'command': step.command,
-                        'is_destructive': step.is_destructive
+                        'is_destructive': step.is_destructive,
+                        'description': step.title  # Alias for old UI
                     }
-                    for step in action_plan.actions
+                    for step in action_plan.execution_steps
                 ],
                 'correlated_metrics': {}
             }
