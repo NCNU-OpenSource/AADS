@@ -46,3 +46,7 @@ temp/
 
 # Conversation memories (local only)
 .conversations/
+
+# Obsidian vault - synced via Remotely Save plugin instead of git
+# This avoids merge conflicts when editing on multiple devices
+docs/obsidian-vault/
