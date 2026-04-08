@@ -89,7 +89,34 @@ loki.source.file "kern_log" {
 }
 
 // ============================================
-// 1a-5: Loki Write Endpoint (啟用 WAL)
+// 1a-5: Docker Container Logs Collection
+// ============================================
+
+// Discover all Docker containers
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+loki.source.docker "docker_logs" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.docker.containers.targets
+  forward_to = [loki.process.docker_logs.receiver]
+}
+
+loki.process "docker_logs" {
+  // Add source label
+  stage.static_labels {
+    values = {
+      source = "docker",
+      job = "docker",
+    }
+  }
+
+  forward_to = [loki.write.loki.receiver]
+}
+
+// ============================================
+// 1a-6: Loki Write Endpoint (啟用 WAL)
 // ============================================
 
 loki.write "loki" {
@@ -155,7 +182,10 @@ prometheus.exporter.process "all_processes" {
 // ============================================
 
 prometheus.scrape "metrics" {
-  targets = prometheus.exporter.unix.system.targets + prometheus.exporter.process.all_processes.targets
+  targets = concat(
+    prometheus.exporter.unix.system.targets,
+    prometheus.exporter.process.all_processes.targets,
+  )
 
   // 設定採集頻率為 60 秒（對齊雲端標準）
   scrape_interval = "60s"

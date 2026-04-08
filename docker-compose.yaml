@@ -316,6 +316,7 @@ services:
       - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2:3b}
       - OLLAMA_ENABLED=${OLLAMA_ENABLED:-false}
       # Knowledge Base
+      - ENABLE_KNOWLEDGE_BASE=${ENABLE_KNOWLEDGE_BASE:-false}
       - VECTOR_DB_PATH=/app/data/chromadb
       # Layer 3: Remediation & Notifications
       - AUTO_REMEDIATION_ENABLED=${AUTO_REMEDIATION_ENABLED:-false}
