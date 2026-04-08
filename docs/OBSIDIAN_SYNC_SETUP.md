@@ -10,7 +10,7 @@
 ### 2. MinIO 連線設定
 ```
 Endpoint: https://s3.tfbs.site
-Bucket: obsidian-sync
+Bucket: obsidian-aads
 Region: us-east-1
 Access Key: bs10081
 Status: 已配置
@@ -25,6 +25,64 @@ Status: 已配置
   - `.trash/`
 
 ## 🚀 使用步驟
+
+### CLI 環境手動同步（推薦 - 當前主機）
+
+**無需 GUI！直接在命令列同步：**
+
+```bash
+# 方法 1: 使用 alias（重新載入 shell 後）
+source ~/.zshrc  # 或 source ~/.bashrc
+sync-obsidian
+
+# 方法 2: 直接執行
+python3 ~/.claude/skills/sync-obsidian
+
+# 方法 3: 在 Claude Code 中
+/sync-obsidian
+```
+
+**同步流程**:
+1. ✓ 自動讀取 Remotely Save 配置
+2. ✓ 連接到 MinIO (https://s3.tfbs.site)
+3. ✓ 掃描 docs/obsidian-vault/ 目錄
+4. ✓ 上傳所有 .md 和 .canvas 文件
+5. ✓ 跳過 .obsidian/ 配置和 .trash/ 文件
+6. ✓ 顯示上傳統計
+
+**輸出範例**:
+```
+✓ Connected to: https://s3.tfbs.site
+✓ Bucket: obsidian-aads
+
+📁 Syncing: docs/obsidian-vault
+
+✓ ADR/ADR-001-Metrics-Collection-Frequency.md
+✓ Services/FastAPI Ingester.md
+...
+
+============================================================
+📊 Sync Summary
+============================================================
+✓ Uploaded:  40 files
+⊘ Skipped:   6 files
+📦 Size:     178,205 bytes (174.0 KB)
+❌ Errors:   0
+============================================================
+
+✅ Sync complete!
+🔗 View at: https://console.tfbs.site
+```
+
+**何時使用**:
+- ✏️ 修改文檔後
+- 📝 添加新筆記後
+- 🗑️ 刪除文件後
+- 💾 定期備份
+
+---
+
+### GUI 環境同步（其他設備）
 
 ### 首次同步（當前主機）
 
@@ -45,7 +103,7 @@ Status: 已配置
 
 4. **驗證同步**
    - 前往 https://console.tfbs.site
-   - 登入後檢查 `obsidian-sync` bucket
+   - 登入後檢查 `obsidian-aads` bucket
    - 應該看到所有 .md 和 .canvas 文件
 
 ### 在其他設備同步
@@ -61,7 +119,7 @@ Status: 已配置
    ```
    Service: S3
    Endpoint: https://s3.tfbs.site
-   Bucket: obsidian-sync
+   Bucket: obsidian-aads
    Access Key: bs10081
    Secret Key: (你的密碼)
    Region: us-east-1
@@ -163,7 +221,7 @@ Obsidian → Settings → Remotely Save → View logs
 ### 重置同步
 
 如果需要完全重置：
-1. 在 MinIO console 清空 `obsidian-sync` bucket
+1. 在 MinIO console 清空 `obsidian-aads` bucket
 2. Obsidian → Remotely Save → Settings → "Reset local records"
 3. 重新執行同步
 
