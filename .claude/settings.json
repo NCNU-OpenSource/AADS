@@ -1,8 +1,4 @@
 {
-  "enabledPlugins": {
-    "obsidian@obsidian-skills": true,
-    "obsidian-visual-skills@axton-obsidian-visual-skills": true
-  },
   "hooks": {
     "PostToolUse": [
       {
@@ -37,5 +33,10 @@
         ]
       }
     ]
+  },
+  "enabledPlugins": {
+    "obsidian@obsidian-skills": true,
+    "obsidian-visual-skills@axton-obsidian-visual-skills": true,
+    "frontend-design@claude-plugins-official": true
   }
 }
