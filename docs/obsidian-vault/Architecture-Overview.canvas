@@ -46,7 +46,7 @@
       "x": -50,
       "y": 300,
       "width": 1500,
-      "height": 400,
+      "height": 440,
       "color": "4",
       "label": "Layer 0 - Data Collection & Storage"
     },
@@ -56,9 +56,9 @@
       "x": 0,
       "y": 350,
       "width": 220,
-      "height": 140,
+      "height": 180,
       "color": "4",
-      "text": "## Alloy\n**日誌收集器**\n- Docker logs\n- Systemd logs\n\n📁 `layer0-collector/alloy/`"
+      "text": "## Alloy\n**遙測收集器**\n- Docker logs (tail)\n- System logs (/var/log)\n- Process metrics (/proc)\n- WAL 容錯\n- Fan-out :9999\n\n📁 `layer0-collector/alloy/`"
     },
     {
       "id": "node_loki_00001",
@@ -66,9 +66,9 @@
       "x": 260,
       "y": 350,
       "width": 220,
-      "height": 140,
+      "height": 180,
       "color": "4",
-      "text": "## Loki\n**日誌聚合**\n- Port: 3100\n- 31 天保留\n- Multi-tenant\n\n📁 `layer0-collector/loki/`"
+      "text": "## Loki\n**日誌聚合系統**\n- Port: 3100\n- Multi-tenant (raw)\n- LogQL 查詢\n- 31 天保留\n\n📁 `layer0-collector/loki/`"
     },
     {
       "id": "node_archiver_01",
@@ -76,9 +76,9 @@
       "x": 520,
       "y": 350,
       "width": 220,
-      "height": 140,
+      "height": 180,
       "color": "4",
-      "text": "## Log Archiver\n**日誌同步**\n- Loki → TimescaleDB\n- 永久存儲\n\n📁 `layer0-storage/sync/`"
+      "text": "## Log Archiver\n**RAW 日誌同步**\n- Loki → TimescaleDB\n- raw_logs 表\n- 60 秒輪詢\n- 批次 1000 條\n\n📁 `layer0-storage/sync/`"
     },
     {
       "id": "node_timescale01",
@@ -86,25 +86,25 @@
       "x": 780,
       "y": 350,
       "width": 220,
-      "height": 140,
+      "height": 180,
       "color": "4",
-      "text": "## TimescaleDB\n**時序資料庫**\n- Port: 5432\n- Hypertable\n- 永久存儲\n\n📁 `layer0-storage/timescaledb/`"
+      "text": "## TimescaleDB\n**時序資料庫**\n- Port: 5432\n- Hypertables\n- 7 天自動壓縮\n- 90 天自動清理\n\n📁 `layer0-storage/timescaledb/`"
     },
     {
       "id": "node_promethe01",
       "type": "text",
       "x": 0,
-      "y": 520,
+      "y": 560,
       "width": 220,
       "height": 140,
       "color": "4",
-      "text": "## Prometheus\n**指標監控**\n- Port: 9090\n- CPU/Memory\n- 容器指標\n\n📁 `prometheus/`"
+      "text": "## Prometheus\n**指標監控**\n- Port: 9090\n- Remote Write API\n- 60s 採集頻率\n\n📁 `prometheus/`"
     },
     {
       "id": "node_cadvisor01",
       "type": "text",
       "x": 260,
-      "y": 520,
+      "y": 560,
       "width": 220,
       "height": 140,
       "color": "4",
@@ -114,7 +114,7 @@
       "id": "node_dcgm_0001",
       "type": "text",
       "x": 520,
-      "y": 520,
+      "y": 560,
       "width": 220,
       "height": 140,
       "color": "4",
@@ -124,7 +124,7 @@
       "id": "group_layer1_001",
       "type": "group",
       "x": -50,
-      "y": 770,
+      "y": 810,
       "width": 1500,
       "height": 280,
       "color": "2",
@@ -134,27 +134,27 @@
       "id": "node_layer1_001",
       "type": "text",
       "x": 0,
-      "y": 820,
+      "y": 860,
       "width": 280,
       "height": 180,
       "color": "2",
-      "text": "## Layer 1 Filter\n**異常過濾服務**\n- 從 Loki 拉取日誌\n- Pipeline 處理\n- 閾值: 0.5\n\n📁 `layer1-filter/src/`"
+      "text": "## Layer 1 Filter\n**異常過濾服務**\n- 從 Loki 拉取日誌\n- 10s 輪詢間隔\n- Pipeline 處理\n- 閾值: 0.5\n\n📁 `layer1-filter/src/`"
     },
     {
       "id": "node_logbert_01",
       "type": "text",
       "x": 320,
-      "y": 820,
+      "y": 860,
       "width": 280,
       "height": 180,
       "color": "2",
-      "text": "## LogBERT\n**BERT 異常檢測**\n- Transformer 模型\n- 異常分數計算\n- Batch 處理\n\n📁 `logbert/src/anomaly_detector.py`"
+      "text": "## LogBERT\n**BERT 異常檢測**\n- Transformer 模型\n- Drain3 正規化\n- 異常分數計算\n- POST to Alloy :9999\n\n📁 `logbert/src/anomaly_detector.py`"
     },
     {
       "id": "node_anomalydb1",
       "type": "text",
       "x": 640,
-      "y": 820,
+      "y": 860,
       "width": 280,
       "height": 180,
       "color": "2",
@@ -164,7 +164,7 @@
       "id": "group_layer2_001",
       "type": "group",
       "x": -50,
-      "y": 1120,
+      "y": 1180,
       "width": 1500,
       "height": 500,
       "color": "3",
@@ -174,27 +174,27 @@
       "id": "node_consumer_01",
       "type": "text",
       "x": 0,
-      "y": 1170,
+      "y": 1230,
       "width": 220,
       "height": 140,
       "color": "3",
-      "text": "## Anomaly Consumer\n**異常消費者**\n- 從 PostgreSQL 讀取\n- 批次處理\n\n📁 `layer2-analyzer/src/`"
+      "text": "## Anomaly Consumer\n**異常消費者**\n- 從 PostgreSQL 讀取\n- 30s 輪詢間隔\n- 批次處理 (50)\n\n📁 `layer2-analyzer/src/`"
     },
     {
       "id": "node_aggregat01",
       "type": "text",
       "x": 260,
-      "y": 1170,
+      "y": 1230,
       "width": 220,
       "height": 140,
       "color": "3",
-      "text": "## Aggregator\n**異常聚類**\n- 時間窗口\n- 模式識別\n- 去重處理\n\n📁 `root_cause_analyzer/`"
+      "text": "## Aggregator\n**異常聚類**\n- 5 分鐘時間窗口\n- 模式識別\n- 去重處理\n\n📁 `root_cause_analyzer/`"
     },
     {
       "id": "node_correlat01",
       "type": "text",
       "x": 520,
-      "y": 1170,
+      "y": 1230,
       "width": 220,
       "height": 140,
       "color": "3",
@@ -204,7 +204,7 @@
       "id": "node_knowledg01",
       "type": "text",
       "x": 780,
-      "y": 1170,
+      "y": 1230,
       "width": 220,
       "height": 140,
       "color": "3",
@@ -214,7 +214,7 @@
       "id": "node_llmreaso01",
       "type": "text",
       "x": 0,
-      "y": 1340,
+      "y": 1400,
       "width": 280,
       "height": 160,
       "color": "3",
@@ -224,17 +224,17 @@
       "id": "node_rawfetch01",
       "type": "text",
       "x": 320,
-      "y": 1340,
+      "y": 1400,
       "width": 220,
       "height": 160,
       "color": "3",
-      "text": "## Raw Log Fetcher\n**原始日誌獲取**\n- 上下文補充\n- 時間範圍查詢\n\n📁 `layer2-analyzer/src/`"
+      "text": "## Raw Log Fetcher\n**原始日誌獲取**\n- 上下文補充\n- 前後 5 分鐘\n- 時間範圍查詢\n\n📁 `layer2-analyzer/src/`"
     },
     {
       "id": "node_suggesti01",
       "type": "text",
       "x": 580,
-      "y": 1340,
+      "y": 1400,
       "width": 220,
       "height": 160,
       "color": "3",
@@ -244,7 +244,7 @@
       "id": "node_notifica01",
       "type": "text",
       "x": 840,
-      "y": 1340,
+      "y": 1400,
       "width": 220,
       "height": 160,
       "color": "3",
@@ -254,7 +254,7 @@
       "id": "node_diagnost01",
       "type": "text",
       "x": 1100,
-      "y": 1240,
+      "y": 1300,
       "width": 280,
       "height": 180,
       "color": "3",
@@ -264,7 +264,7 @@
       "id": "group_layer3_001",
       "type": "group",
       "x": -50,
-      "y": 1690,
+      "y": 1750,
       "width": 1500,
       "height": 280,
       "color": "1",
@@ -274,17 +274,17 @@
       "id": "node_slack_001",
       "type": "text",
       "x": 0,
-      "y": 1740,
+      "y": 1800,
       "width": 280,
       "height": 180,
       "color": "1",
-      "text": "## Slack\n**Slack 通知**\n- Webhook 整合\n- 嚴重性過濾\n- 格式化訊息\n- Channel 配置"
+      "text": "## Slack\n**Slack 通知**\n- Webhook 整合\n- 嚴重性過濾 (medium+)\n- 格式化訊息\n- Channel 配置"
     },
     {
       "id": "node_webhook_01",
       "type": "text",
       "x": 320,
-      "y": 1740,
+      "y": 1800,
       "width": 280,
       "height": 180,
       "color": "1",
@@ -294,7 +294,7 @@
       "id": "node_remediat01",
       "type": "text",
       "x": 640,
-      "y": 1740,
+      "y": 1800,
       "width": 300,
       "height": 180,
       "color": "1",
@@ -324,7 +324,7 @@
       "id": "node_docker_001",
       "type": "text",
       "x": 1100,
-      "y": 770,
+      "y": 810,
       "width": 280,
       "height": 180,
       "color": "4",
@@ -334,7 +334,7 @@
       "id": "node_llm_ext_01",
       "type": "text",
       "x": 1100,
-      "y": 1690,
+      "y": 1750,
       "width": 280,
       "height": 180,
       "color": "6",
@@ -344,31 +344,31 @@
       "id": "node_ingester_01",
       "type": "text",
       "x": 1040,
-      "y": 820,
+      "y": 860,
       "width": 200,
-      "height": 160,
-      "color": "3",
-      "text": "## Ingester\n**異常接收器**\n- Port: 8000\n- FastAPI\n- PostgreSQL 寫入\n\n📁 `layer1-filter/ingester/`"
+      "height": 180,
+      "color": "2",
+      "text": "## Ingester\n**異常接收器**\n- Port: 8000\n- FastAPI\n- PostgreSQL 寫入\n- Fan-out Sink A\n\n📁 `layer1-filter/ingester/`"
     },
     {
       "id": "node_l2webhook01",
       "type": "text",
-      "x": 1300,
+      "x": 1100,
       "y": 1100,
-      "width": 200,
+      "width": 280,
       "height": 180,
-      "color": "2",
-      "text": "## Layer 2 Webhook\n**即時分析觸發**\n- Port: 8080\n- `/api/webhooks/anomaly`\n- Background processing\n\n📁 `layer2-analyzer/src/main.py`"
+      "color": "3",
+      "text": "## Layer 2 Webhook\n**即時分析觸發器**\n- Port: 8080\n- `/api/webhooks/anomaly`\n- Background tasks\n- Dual-mode (polling + webhook)\n- Fan-out Sink B\n\n📁 `layer2-analyzer/src/main.py`"
     },
     {
       "id": "node_fanout_001",
       "type": "text",
-      "x": 850,
-      "y": 950,
-      "width": 350,
-      "height": 120,
+      "x": 650,
+      "y": 1000,
+      "width": 380,
+      "height": 140,
       "color": "6",
-      "text": "## Fan-out Architecture\n**Alloy HTTP Receiver (Port 9999)**\n\nLogBERT → POST :9999 → 同時轉發:\n- Ingester :8000 (DB 留存)\n- Layer 2 Webhook :8080 (即時分析)"
+      "text": "## Fan-out Architecture\n**Alloy HTTP Receiver (Port 9999)**\n\nLogBERT → POST :9999 → loki.source.api → 同時轉發:\n- Sink A: Ingester :8000 (PostgreSQL 寫入)\n- Sink B: Layer 2 Webhook :8080 (LLM 即時分析)"
     }
   ],
   "edges": [
@@ -625,9 +625,9 @@
     {
       "id": "edge_llm_extern",
       "fromNode": "node_llmreaso01",
-      "fromSide": "bottom",
+      "fromSide": "right",
       "toNode": "node_llm_ext_01",
-      "toSide": "top",
+      "toSide": "left",
       "toEnd": "arrow",
       "fromEnd": "arrow",
       "color": "6",
@@ -642,6 +642,56 @@
       "toEnd": "arrow",
       "color": "5",
       "label": "display"
+    },
+    {
+      "id": "edge_bert_fanout",
+      "fromNode": "node_logbert_01",
+      "fromSide": "bottom",
+      "toNode": "node_fanout_001",
+      "toSide": "top",
+      "toEnd": "arrow",
+      "color": "2",
+      "label": "POST :9999"
+    },
+    {
+      "id": "edge_fanout_ingest",
+      "fromNode": "node_fanout_001",
+      "fromSide": "left",
+      "toNode": "node_ingester_01",
+      "toSide": "bottom",
+      "toEnd": "arrow",
+      "color": "2",
+      "label": "Sink A"
+    },
+    {
+      "id": "edge_fanout_webhook",
+      "fromNode": "node_fanout_001",
+      "fromSide": "right",
+      "toNode": "node_l2webhook01",
+      "toSide": "top",
+      "toEnd": "arrow",
+      "color": "3",
+      "label": "Sink B"
+    },
+    {
+      "id": "edge_ingest_anomdb",
+      "fromNode": "node_ingester_01",
+      "fromSide": "left",
+      "toNode": "node_anomalydb1",
+      "toSide": "right",
+      "toEnd": "arrow",
+      "color": "2",
+      "label": "write DB"
+    },
+    {
+      "id": "edge_webhook_consumer",
+      "fromNode": "node_l2webhook01",
+      "fromSide": "left",
+      "toNode": "node_consumer_01",
+      "toSide": "right",
+      "toEnd": "arrow",
+      "color": "3",
+      "label": "trigger analysis"
     }
   ]
 }
