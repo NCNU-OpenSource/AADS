@@ -58,6 +58,107 @@
             right: 30px;
             z-index: 1000;
         }
+
+        /* ActionStep Styles */
+        .action-step {
+            background: white;
+            border: 1px solid #dee2e6;
+            border-left: 4px solid #17a2b8;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            padding: 16px;
+            transition: box-shadow 0.2s;
+        }
+        .action-step:hover {
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+        .action-step.destructive {
+            border-left-color: #dc3545;
+            background: rgba(220, 53, 69, 0.05);
+        }
+        .action-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        .step-number {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 28px;
+            height: 28px;
+            background: #667eea;
+            color: white;
+            border-radius: 50%;
+            font-weight: bold;
+            font-size: 0.9rem;
+            flex-shrink: 0;
+        }
+        .action-type-badge {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .action-type-query { background: #d1ecf1; color: #0c5460; }
+        .action-type-verify { background: #e9ecef; color: #495057; }
+        .action-type-k8s_exec { background: #e2d5f3; color: #4a1f7c; }
+        .action-description {
+            font-weight: 500;
+            flex-grow: 1;
+        }
+        .action-details {
+            margin-left: 38px;
+            margin-bottom: 12px;
+        }
+        .detail-row {
+            margin-bottom: 8px;
+        }
+        .detail-row .label {
+            color: #6c757d;
+            font-size: 0.875rem;
+            font-weight: 600;
+            display: inline-block;
+            width: 70px;
+        }
+        .detail-row code.target {
+            background: #e9ecef;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.875rem;
+        }
+        .detail-row pre.command {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 12px;
+            border-radius: 4px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 0.85rem;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+            margin: 8px 0 0 0;
+        }
+        .destructive-warning {
+            color: #dc3545;
+            font-weight: 500;
+            margin-top: 8px;
+            padding: 8px 12px;
+            background: rgba(220, 53, 69, 0.1);
+            border-radius: 4px;
+            font-size: 0.875rem;
+        }
+        .action-buttons {
+            margin-left: 38px;
+            display: flex;
+            gap: 8px;
+        }
+        .chart-container {
+            position: relative;
+            height: 300px;
+        }
     </style>
 </head>
 <body>
@@ -115,6 +216,34 @@
             </div>
         </div>
 
+        <!-- Charts Row -->
+        <div class="row mb-4">
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header bg-white">
+                        <h6 class="mb-0"><i class="bi bi-graph-up"></i> 異常趨勢（過去 {{ currentHours }}小時）</h6>
+                    </div>
+                    <div class="card-body">
+                        <div class="chart-container">
+                            <canvas id="anomalyTimelineChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="card">
+                    <div class="card-header bg-white">
+                        <h6 class="mb-0"><i class="bi bi-pie-chart-fill"></i> 診斷嚴重程度分布</h6>
+                    </div>
+                    <div class="card-body">
+                        <div class="chart-container">
+                            <canvas id="severityChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- Diagnosis Reports -->
         <div class="row">
             <div class="col-12">
@@ -167,15 +296,199 @@
         <i class="bi bi-arrow-clockwise"></i>
     </button>
 
+    <!-- Toast Container -->
+    <div class="toast-container position-fixed bottom-0 end-0 p-3" style="z-index: 1100;">
+        <div id="toastNotification" class="toast" role="alert" aria-live="assertive" aria-atomic="true">
+            <div class="toast-header">
+                <i class="bi bi-info-circle-fill me-2" id="toastIcon"></i>
+                <strong class="me-auto" id="toastTitle">通知</strong>
+                <button type="button" class="btn-close" data-bs-dismiss="toast" aria-label="Close"></button>
+            </div>
+            <div class="toast-body" id="toastBody"></div>
+        </div>
+    </div>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <script>
         let currentHours = 24;
+        let anomalyChart = null;
+        let severityChart = null;
+
+        // Toast notification function
+        function showToast(type, title, message) {
+            const toastEl = document.getElementById('toastNotification');
+            const toast = new bootstrap.Toast(toastEl);
+
+            // Set icon and color based on type
+            const iconEl = document.getElementById('toastIcon');
+            const headerEl = toastEl.querySelector('.toast-header');
+
+            // Remove old classes
+            headerEl.classList.remove('bg-success', 'bg-danger', 'bg-warning', 'bg-info', 'text-white');
+            iconEl.className = 'me-2';
+
+            switch(type) {
+                case 'success':
+                    headerEl.classList.add('bg-success', 'text-white');
+                    iconEl.classList.add('bi', 'bi-check-circle-fill');
+                    break;
+                case 'error':
+                    headerEl.classList.add('bg-danger', 'text-white');
+                    iconEl.classList.add('bi', 'bi-exclamation-circle-fill');
+                    break;
+                case 'warning':
+                    headerEl.classList.add('bg-warning');
+                    iconEl.classList.add('bi', 'bi-exclamation-triangle-fill');
+                    break;
+                case 'info':
+                default:
+                    headerEl.classList.add('bg-info', 'text-white');
+                    iconEl.classList.add('bi', 'bi-info-circle-fill');
+                    break;
+            }
+
+            document.getElementById('toastTitle').textContent = title;
+            document.getElementById('toastBody').textContent = message;
+            toast.show();
+        }
 
         // Time range change handler
         document.getElementById('timeRange').addEventListener('change', function(e) {
             currentHours = parseInt(e.target.value);
             loadData();
         });
+
+        // Load all data
+        function loadData() {
+            loadStats();
+            loadDiagnosis();
+            loadTimeline();
+        }
+
+        // Load timeline data and render chart
+        async function loadTimeline() {
+            try {
+                const response = await fetch(`/api/stats/timeline?hours=${currentHours}`);
+                const data = await response.json();
+                renderTimelineChart(data);
+            } catch (error) {
+                console.error('Error loading timeline:', error);
+            }
+        }
+
+        // Render anomaly timeline chart
+        function renderTimelineChart(data) {
+            const ctx = document.getElementById('anomalyTimelineChart').getContext('2d');
+
+            // Destroy existing chart
+            if (anomalyChart) {
+                anomalyChart.destroy();
+            }
+
+            const labels = data.map(d => {
+                const date = new Date(d.timestamp);
+                return date.toLocaleString('zh-TW', {
+                    month: '2-digit',
+                    day: '2-digit',
+                    hour: '2-digit',
+                    minute: '2-digit'
+                });
+            });
+            const counts = data.map(d => d.count);
+
+            anomalyChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: '異常數量',
+                        data: counts,
+                        borderColor: '#667eea',
+                        backgroundColor: 'rgba(102, 126, 234, 0.1)',
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: false
+                        }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            ticks: {
+                                precision: 0
+                            }
+                        },
+                        x: {
+                            ticks: {
+                                maxRotation: 45,
+                                minRotation: 45
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Render severity distribution chart
+        function renderSeverityChart(data) {
+            const ctx = document.getElementById('severityChart').getContext('2d');
+
+            // Destroy existing chart
+            if (severityChart) {
+                severityChart.destroy();
+            }
+
+            const severityOrder = ['critical', 'high', 'medium', 'low'];
+            const colors = {
+                'critical': '#dc3545',
+                'high': '#fd7e14',
+                'medium': '#ffc107',
+                'low': '#28a745'
+            };
+
+            // Sort data and prepare
+            const sortedData = severityOrder.map(severity => {
+                const item = data.find(d => d.severity === severity);
+                return {
+                    severity: severity,
+                    count: item ? item.count : 0
+                };
+            });
+
+            const labels = sortedData.map(d => d.severity.toUpperCase());
+            const counts = sortedData.map(d => d.count);
+            const backgroundColors = sortedData.map(d => colors[d.severity]);
+
+            severityChart = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: counts,
+                        backgroundColor: backgroundColors,
+                        borderWidth: 2,
+                        borderColor: '#fff'
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'bottom'
+                        }
+                    }
+                }
+            });
+        }
 
         // Load all data
         function loadData() {
@@ -203,6 +516,9 @@
 
                 // Display diagnosis by severity
                 displayDiagnosisBySeverity(data.diagnoses.by_severity);
+
+                // Render severity chart
+                renderSeverityChart(data.diagnoses.by_severity);
             } catch (error) {
                 console.error('Error loading stats:', error);
             }
@@ -221,48 +537,150 @@
                     return;
                 }
 
-                container.innerHTML = reports.map(report => `
-                    <div class="card diagnosis-card mb-3">
-                        <div class="card-body">
-                            <div class="d-flex justify-content-between align-items-start mb-2">
-                                <h6 class="card-title mb-0">
-                                    <i class="bi bi-exclamation-triangle-fill"></i>
-                                    ${escapeHtml(report.summary)}
-                                </h6>
-                                <span class="severity-badge severity-${report.severity}">
-                                    ${report.severity.toUpperCase()}
-                                </span>
-                            </div>
-                            <p class="text-muted small mb-2">
-                                <i class="bi bi-clock"></i> ${formatTimestamp(report.timestamp)}
-                                <span class="ms-3"><i class="bi bi-hash"></i> ${report.diagnosis_id}</span>
-                            </p>
-                            <div class="mb-3">
-                                <strong>根因分析:</strong>
-                                <p class="mb-1">${escapeHtml(report.root_cause.description)}</p>
-                                <small class="text-muted">
-                                    分類: ${report.root_cause.category} |
-                                    信心度: ${(report.root_cause.confidence * 100).toFixed(1)}%
-                                </small>
-                            </div>
-                            <div>
-                                <strong>修復建議:</strong>
-                                ${report.recommended_actions.map((action, idx) => `
-                                    <div class="action-item">
-                                        <strong>${idx + 1}. ${action.action.replace(/_/g, ' ')}</strong>
-                                        <p class="mb-0 small">${escapeHtml(action.description)}</p>
-                                    </div>
-                                `).join('')}
+                container.innerHTML = reports.map(report => {
+                    const actionsHtml = renderActions(report.recommended_actions);
+
+                    return `
+                        <div class="card diagnosis-card mb-3">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between align-items-start mb-2">
+                                    <h6 class="card-title mb-0">
+                                        <i class="bi bi-exclamation-triangle-fill"></i>
+                                        ${escapeHtml(report.summary)}
+                                    </h6>
+                                    <span class="severity-badge severity-${report.severity}">
+                                        ${report.severity.toUpperCase()}
+                                    </span>
+                                </div>
+                                <p class="text-muted small mb-2">
+                                    <i class="bi bi-clock"></i> ${formatTimestamp(report.timestamp)}
+                                    <span class="ms-3"><i class="bi bi-hash"></i> ${report.diagnosis_id}</span>
+                                </p>
+                                <div class="mb-3">
+                                    <strong>根因分析:</strong>
+                                    <p class="mb-1">${escapeHtml(report.root_cause.description)}</p>
+                                    <small class="text-muted">
+                                        分類: ${report.root_cause.category} |
+                                        信心度: ${(report.root_cause.confidence * 100).toFixed(1)}%
+                                    </small>
+                                </div>
+                                <div>
+                                    <strong>修復建議:</strong>
+                                    ${actionsHtml}
+                                </div>
                             </div>
                         </div>
-                    </div>
-                `).join('');
+                    `;
+                }).join('');
+
+                // Attach event listeners to buttons
+                attachActionButtonListeners();
             } catch (error) {
                 console.error('Error loading diagnosis:', error);
                 document.getElementById('diagnosisContainer').innerHTML =
                     '<p class="text-danger">載入失敗，請重試</p>';
             }
         }
+
+        // Render actions (supports both old and new format)
+        function renderActions(actions) {
+            if (!actions || actions.length === 0) {
+                return '<p class="text-muted">無建議動作</p>';
+            }
+
+            // Check if new format (has step_id field)
+            const isNewFormat = actions[0].hasOwnProperty('step_id');
+
+            if (isNewFormat) {
+                return actions.map(action => renderActionStep(action)).join('');
+            } else {
+                // Old format fallback
+                return actions.map((action, idx) => `
+                    <div class="action-item">
+                        <strong>${idx + 1}. ${action.action.replace(/_/g, ' ')}</strong>
+                        <p class="mb-0 small">${escapeHtml(action.description)}</p>
+                    </div>
+                `).join('');
+            }
+        }
+
+        // Render new ActionStep format
+        function renderActionStep(action) {
+            const isDestructive = action.is_destructive || false;
+            const destructiveClass = isDestructive ? 'destructive' : '';
+            const destructiveWarning = isDestructive ? `
+                <div class="destructive-warning">
+                    <i class="bi bi-exclamation-triangle-fill"></i>
+                    此操作會修改系統狀態，需謹慎執行
+                </div>
+            ` : '';
+
+            return `
+                <div class="action-step ${destructiveClass}" data-step-id="${action.step_id}">
+                    <div class="action-header">
+                        <span class="step-number">${action.step_id}</span>
+                        <span class="action-type-badge action-type-${action.action_type}">${action.action_type}</span>
+                        <span class="action-description">${escapeHtml(action.description)}</span>
+                    </div>
+                    <div class="action-details">
+                        <div class="detail-row">
+                            <span class="label">Target:</span>
+                            <code class="target">${escapeHtml(action.target)}</code>
+                        </div>
+                        <div class="detail-row">
+                            <span class="label">Command:</span>
+                            <pre class="command">${escapeHtml(action.command)}</pre>
+                        </div>
+                        ${destructiveWarning}
+                    </div>
+                    <div class="action-buttons">
+                        <button class="btn btn-sm ${isDestructive ? 'btn-danger' : 'btn-primary'} execute-btn"
+                                data-step-id="${action.step_id}"
+                                data-destructive="${isDestructive}">
+                            <i class="bi bi-play-fill"></i> 執行
+                        </button>
+                        <button class="btn btn-sm btn-outline-secondary skip-btn"
+                                data-step-id="${action.step_id}">
+                            <i class="bi bi-skip-forward-fill"></i> 跳過
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Attach event listeners to action buttons
+        function attachActionButtonListeners() {
+            // Execute buttons
+            document.querySelectorAll('.execute-btn').forEach(btn => {
+                btn.addEventListener('click', function() {
+                    const stepId = this.getAttribute('data-step-id');
+                    const isDestructive = this.getAttribute('data-destructive') === 'true';
+                    handleExecute(stepId, isDestructive);
+                });
+            });
+
+            // Skip buttons
+            document.querySelectorAll('.skip-btn').forEach(btn => {
+                btn.addEventListener('click', function() {
+                    const stepId = this.getAttribute('data-step-id');
+                    handleSkip(stepId);
+                });
+            });
+        }
+
+        // Handle execute button click
+        function handleExecute(stepId, isDestructive) {
+            const title = isDestructive ? '破壞性操作' : '執行動作';
+            const message = `Step ${stepId} 的執行功能尚未實作。此為 UI 展示版本。`;
+            showToast('info', title, message);
+        }
+
+        // Handle skip button click
+        function handleSkip(stepId) {
+            showToast('info', '跳過動作', `Step ${stepId} 已跳過。功能尚未實作。`);
+        }
+
+        // Load diagnosis reports
 
         // Display anomaly by container
         function displayAnomalyByContainer(data) {

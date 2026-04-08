@@ -2,7 +2,7 @@
 Simple Dashboard for AI Auto-Debug System
 Display anomalies and diagnosis reports
 """
-from flask import Flask, render_template, jsonify
+from flask import Flask, render_template, jsonify, request
 import asyncpg
 import asyncio
 import os
@@ -136,6 +136,32 @@ async def get_diagnosis_stats(hours=24):
         await conn.close()
 
 
+async def get_anomaly_timeline(hours=24):
+    """Get hourly anomaly counts for timeline chart"""
+    conn = await get_db_connection()
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT
+                time_bucket('1 hour', time) AS bucket,
+                COUNT(*) as count
+            FROM anomaly_logs
+            WHERE time > NOW() - INTERVAL '%s hours'
+            GROUP BY bucket
+            ORDER BY bucket
+            """ % hours
+        )
+        return [
+            {
+                'timestamp': row['bucket'].isoformat(),
+                'count': row['count']
+            }
+            for row in rows
+        ]
+    finally:
+        await conn.close()
+
+
 @app.route('/')
 def index():
     """Main dashboard page"""
@@ -171,6 +197,16 @@ def api_stats():
     })
 
 
+@app.route('/api/stats/timeline')
+def api_stats_timeline():
+    """API endpoint for hourly anomaly timeline"""
+    hours = int(request.args.get('hours', 24))
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    timeline = loop.run_until_complete(get_anomaly_timeline(hours))
+    loop.close()
+    return jsonify(timeline)
+
+
 if __name__ == '__main__':
-    from flask import request
     app.run(host='0.0.0.0', port=5000, debug=True)
