@@ -37,6 +37,11 @@ from llm.ollama import OllamaClient
 from suggestion_generator import SuggestionGenerator
 from notification_hub import NotificationHub
 
+# New: Map-Reduce and Agent imports
+from aggregator.map_reduce import deduplicate_and_summarize, format_summary_for_prompt
+from agent.graph import run_agent_analysis
+from schemas.action_plan import ActionPlan
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -72,9 +77,17 @@ class RootCauseAnalyzer:
         self.metrics_correlator = MetricsCorrelator(
             prometheus_url=os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
         )
-        self.knowledge_base = KnowledgeBase(
-            db_path=os.getenv("VECTOR_DB_PATH", "/app/data/chromadb")
-        )
+
+        # Knowledge Base (optional - disabled if ENABLE_KNOWLEDGE_BASE=false)
+        enable_kb = os.getenv("ENABLE_KNOWLEDGE_BASE", "false").lower() == "true"
+        if enable_kb:
+            logger.info("Knowledge Base enabled, initializing...")
+            self.knowledge_base = KnowledgeBase(
+                db_path=os.getenv("VECTOR_DB_PATH", "/app/data/chromadb")
+            )
+        else:
+            logger.info("Knowledge Base disabled (ENABLE_KNOWLEDGE_BASE=false)")
+            self.knowledge_base = None
 
         # Initialize LLM client
         llm_strategy = os.getenv("LLM_STRATEGY", "cascade")
@@ -177,56 +190,133 @@ class RootCauseAnalyzer:
             )
             return
 
-        # Get representative container for metrics
-        container = list(cluster.containers)[0] if cluster.containers else None
+        # ============================================================
+        # NEW: Map-Reduce aggregation from ALL containers
+        # ============================================================
+        logger.info(f"Aggregating data from {len(cluster.containers)} containers...")
 
-        # Step 1: Correlate metrics
-        metrics_context = {}
-        if container:
-            try:
-                metrics_context = await self.metrics_correlator.correlate_metrics(
-                    anomaly_time=cluster.start_time,
-                    container=container,
-                    context_minutes=5
-                )
-            except Exception as e:
-                logger.error(f"Error correlating metrics: {e}")
+        cluster_data = {
+            'containers': cluster.containers,
+            'anomalies': cluster.anomalies,
+            'start_time': cluster.start_time,
+            'end_time': cluster.end_time,
+            'templates': cluster.templates
+        }
 
-        # Step 2: Fetch RAW log context
-        raw_logs = []
-        if container:
-            try:
-                raw_logs = await self.raw_log_fetcher.fetch_context_logs(
-                    timestamp=cluster.start_time,
-                    container=container,
-                    before_minutes=5,
-                    after_minutes=5,
-                    limit=100
-                )
-            except Exception as e:
-                logger.error(f"Error fetching raw logs: {e}")
+        # Aggregate and deduplicate data from all containers
+        summary = deduplicate_and_summarize(cluster_data)
+        summary_text = format_summary_for_prompt(summary)
 
-        # Step 3: Search knowledge base
-        # Create query from templates
-        query_text = "\n".join(list(cluster.templates)[:5])
-        similar_cases = self.knowledge_base.search_similar_cases(
-            query=query_text,
-            n_results=3,
-            min_effectiveness=0.5
+        logger.info(
+            f"Map-Reduce complete: {len(summary['template_summary'])} templates, "
+            f"severity={summary['severity']}"
         )
 
-        # Step 4: LLM root cause analysis
-        diagnosis = await self.reasoner.analyze(
-            cluster=cluster,
-            metrics_context=metrics_context,
-            similar_cases=similar_cases,
-            raw_logs=raw_logs
-        )
+        # ============================================================
+        # NEW: LangGraph Agent investigation
+        # ============================================================
+        logger.info("Starting Agent investigation...")
 
-        # Step 5-6: Layer 3 - Generate suggestions and send notifications
+        # Build initial prompt with Map-Reduce summary
+        initial_prompt = f"""
+You are an expert SRE investigating system anomalies.
+
+{summary_text}
+
+Your task:
+1. Investigate the anomalies using available tools (query_loki, query_prometheus, execute_diagnostic_command)
+2. Gather additional context as needed
+3. Determine the root cause
+4. When ready, signal that you have enough information to generate an action plan
+
+Available tools:
+- query_loki(query, start_time, end_time): Query logs using LogQL
+- query_prometheus(promql): Query metrics using PromQL
+- execute_diagnostic_command(command): Execute read-only Linux diagnostic commands
+
+Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
+"""
+
+        try:
+            # Run Agent analysis
+            action_plan: ActionPlan = await run_agent_analysis(initial_prompt)
+
+            logger.info(
+                f"Agent analysis complete: root_cause={action_plan.root_cause[:100]}..., "
+                f"confidence={action_plan.confidence_score}, "
+                f"actions={len(action_plan.actions)}"
+            )
+
+            # Convert ActionPlan to diagnosis format for compatibility with Layer 3
+            diagnosis = {
+                'diagnosis_id': f"diag_{cluster.cluster_id}_{int(datetime.now().timestamp())}",
+                'timestamp': datetime.now(),
+                'cluster_id': cluster.cluster_id,
+                'severity': summary['severity'],
+                'summary': action_plan.root_cause,
+                'root_cause': {
+                    'description': action_plan.root_cause,
+                    'confidence': action_plan.confidence_score
+                },
+                'action_plan': action_plan.dict(),  # Store full ActionPlan
+                'affected_services': [
+                    {
+                        "container": container,
+                        "anomaly_count": cluster.total_count,
+                        "first_seen": cluster.start_time,
+                        "last_seen": cluster.end_time
+                    }
+                    for container in cluster.containers
+                ],
+                'recommended_actions': [
+                    {
+                        'step_id': step.step_id,
+                        'description': step.description,
+                        'action_type': step.action_type,
+                        'target': step.target,
+                        'command': step.command,
+                        'is_destructive': step.is_destructive
+                    }
+                    for step in action_plan.actions
+                ],
+                'correlated_metrics': {}
+            }
+
+        except Exception as e:
+            logger.error(f"Error in Agent analysis: {e}", exc_info=True)
+            # Fallback to safe diagnosis
+            diagnosis = {
+                'diagnosis_id': f"diag_{cluster.cluster_id}_{int(datetime.now().timestamp())}_fallback",
+                'timestamp': datetime.now(),
+                'cluster_id': cluster.cluster_id,
+                'severity': summary['severity'],
+                'summary': f"Anomalies detected but Agent analysis failed: {str(e)}",
+                'root_cause': {
+                    'description': 'Unable to determine root cause due to Agent error',
+                    'confidence': 0.0
+                },
+                'action_plan': None,
+                'affected_services': [
+                    {
+                        "container": container,
+                        "anomaly_count": cluster.total_count,
+                        "first_seen": cluster.start_time,
+                        "last_seen": cluster.end_time
+                    }
+                    for container in cluster.containers
+                ],
+                'recommended_actions': [],
+                'correlated_metrics': {}
+            }
+
+        # ============================================================
+        # Layer 3: Generate suggestions and send notifications
+        # ============================================================
         await self._run_layer3(diagnosis)
 
-        # Step 7: Store diagnosis
+        # ============================================================
+        # Store diagnosis
+        # ============================================================
         await self.store_diagnosis(diagnosis)
 
         logger.info(
@@ -453,7 +543,8 @@ class RootCauseAnalyzer:
             await self.consumer.run_forever()
         finally:
             await self.close_db_pool()
-            self.knowledge_base.persist()
+            if self.knowledge_base:
+                self.knowledge_base.persist()
 
 
 # ============================================
@@ -489,7 +580,8 @@ async def shutdown_event():
     """Cleanup on shutdown"""
     if analyzer_instance:
         await analyzer_instance.close_db_pool()
-        analyzer_instance.knowledge_base.persist()
+        if analyzer_instance.knowledge_base:
+            analyzer_instance.knowledge_base.persist()
     logger.info("FastAPI webhook server stopped")
 
 
@@ -551,12 +643,24 @@ async def run_api_server():
 
 async def main():
     """Main entry point - run both analyzer and API server"""
+    global analyzer_instance
+
+    # Initialize analyzer instance
+    analyzer_instance = RootCauseAnalyzer()
+    await analyzer_instance.init_db_pool()
+    logger.info("Analyzer instance initialized")
+
     # Create tasks for both services
     analyzer_task = asyncio.create_task(run_analyzer())
     api_task = asyncio.create_task(run_api_server())
 
     # Wait for both
-    await asyncio.gather(analyzer_task, api_task)
+    try:
+        await asyncio.gather(analyzer_task, api_task)
+    finally:
+        await analyzer_instance.close_db_pool()
+        if analyzer_instance.knowledge_base:
+            analyzer_instance.knowledge_base.persist()
 
 
 if __name__ == '__main__':
