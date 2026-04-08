@@ -2,5 +2,40 @@
   "enabledPlugins": {
     "obsidian@obsidian-skills": true,
     "obsidian-visual-skills@axton-obsidian-visual-skills": true
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/bs10081/Developer/ai-auto-debug-system/.claude/hooks/post-edit-sync.sh",
+            "statusMessage": "Checking Obsidian sync..."
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/bs10081/Developer/ai-auto-debug-system/.claude/hooks/post-edit-sync.sh",
+            "statusMessage": "Checking Obsidian sync..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/bs10081/Developer/ai-auto-debug-system/.claude/hooks/stop-drift-check.sh",
+            "statusMessage": "Running architecture drift check..."
+          }
+        ]
+      }
+    ]
   }
 }
