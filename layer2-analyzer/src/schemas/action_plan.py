@@ -26,18 +26,23 @@ class StepCommand(BaseModel):
     Low-level command within an execution step
 
     Represents the actual command that Layer 4 Executor Agent will run.
+
+    Available tools:
+    - query_loki: Query Loki logs using LogQL
+    - query_prometheus: Query Prometheus metrics using PromQL
+    - execute_diagnostic_command: Run whitelisted read-only shell commands
     """
     tool_name: str = Field(
         ...,
-        description="Tool to use: query_loki, query_prometheus, k8s_exec, bash"
+        description="Tool to use: query_loki, query_prometheus, execute_diagnostic_command"
     )
     target: str = Field(
         ...,
-        description="Target system/service: Loki, nginx-pod, prometheus"
+        description="Target system/service/container"
     )
     command: str = Field(
         ...,
-        description="Actual command or query to execute"
+        description="Actual LogQL query, PromQL query, or shell command"
     )
 
     class Config:

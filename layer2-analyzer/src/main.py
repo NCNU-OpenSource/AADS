@@ -242,9 +242,9 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
             action_plan: ActionPlan = await run_agent_analysis(initial_prompt)
 
             logger.info(
-                f"Agent analysis complete: root_cause={action_plan.root_cause[:100]}..., "
+                f"Agent analysis complete: goal={action_plan.goal[:100]}..., "
                 f"confidence={action_plan.confidence_score}, "
-                f"actions={len(action_plan.actions)}"
+                f"steps={len(action_plan.execution_steps)}"
             )
 
             # Convert ClaudeStylePlan to diagnosis format for compatibility with Layer 3
@@ -368,7 +368,7 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
             rows = await conn.fetch(
                 """
                 SELECT diagnosis_id, timestamp, severity, summary,
-                       root_cause, recommended_actions, affected_services
+                       root_cause, recommended_actions, affected_services, action_plan
                 FROM diagnosis_reports
                 WHERE timestamp > NOW() - INTERVAL '24 hours'
                 ORDER BY timestamp DESC
@@ -418,6 +418,7 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
                         'severity': row['severity'],
                         'summary': row['summary'],
                         'root_cause': row['root_cause'] if isinstance(row['root_cause'], dict) else json.loads(row['root_cause']),
+                        'action_plan': row['action_plan'] if row['action_plan'] else None,
                         'recommended_actions': row['recommended_actions'] if isinstance(row['recommended_actions'], list) else json.loads(row['recommended_actions']),
                         'affected_services': affected_services
                     }
@@ -453,6 +454,7 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
             'severity': similar_diagnosis['severity'],
             'summary': clean_summary,  # Use clean summary without suffixes
             'root_cause': similar_diagnosis['root_cause'],
+            'action_plan': similar_diagnosis.get('action_plan'),  # Copy ClaudeStylePlan
             'recommended_actions': similar_diagnosis['recommended_actions'],
             'affected_services': [
                 {
@@ -516,12 +518,24 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
             raise TypeError(f"Type {type(obj)} not serializable")
 
         async with self.db_pool.acquire() as conn:
+            # Handle action_plan: ensure it's JSON string, not double-encoded
+            action_plan_value = diagnosis.get('action_plan')
+            if action_plan_value is not None:
+                if isinstance(action_plan_value, str):
+                    # Already a string, use as-is (don't double-encode)
+                    action_plan_json = action_plan_value
+                else:
+                    # Dict or other object, serialize to JSON
+                    action_plan_json = json.dumps(action_plan_value, default=json_serial)
+            else:
+                action_plan_json = None
+
             await conn.execute(
                 """
                 INSERT INTO diagnosis_reports
                 (diagnosis_id, timestamp, severity, summary, root_cause,
-                 affected_services, correlated_metrics, recommended_actions)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 affected_services, correlated_metrics, recommended_actions, action_plan)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 """,
                 diagnosis['diagnosis_id'],
                 diagnosis['timestamp'],
@@ -530,7 +544,8 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
                 json.dumps(diagnosis.get('root_cause', {}), default=json_serial),
                 json.dumps(diagnosis.get('affected_services', []), default=json_serial),
                 json.dumps(diagnosis.get('correlated_metrics', {}), default=json_serial),
-                json.dumps(diagnosis.get('recommended_actions', []), default=json_serial)
+                json.dumps(diagnosis.get('recommended_actions', []), default=json_serial),
+                action_plan_json
             )
 
         logger.info(f"Stored diagnosis: {diagnosis['diagnosis_id']}")

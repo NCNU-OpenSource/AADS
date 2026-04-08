@@ -154,7 +154,7 @@ You are now in Plan Mode. Generate a comprehensive remediation plan in TODO List
 
 For each step:
 - step_id: Sequential number starting from 1
-- title: Short action title (e.g., "重啟 nginx 容器")
+- title: Short action title (e.g., "查詢 nginx 錯誤日誌")
 - phase: One of "Explore", "Execute", "Verify"
 - explanation: Why this step is necessary
 - requires_approval: True for any Execute step that modifies system state
@@ -165,18 +165,19 @@ For each step:
 - Group related steps under the same phase
 - Provide clear explanations for each step
 
-Example command tools:
-- query_loki: Read logs from Loki
-- query_prometheus: Read metrics from Prometheus
-- k8s_exec: Execute Kubernetes commands (kubectl)
-- bash: Execute shell commands in containers
+## Available Tools (IMPORTANT: only use these):
+- query_loki: Query Loki logs using LogQL syntax (e.g., {container="nginx"} |= "error")
+- query_prometheus: Query Prometheus metrics using PromQL (e.g., container_memory_usage_bytes{container="nginx"})
+- execute_diagnostic_command: Run whitelisted read-only shell commands (e.g., docker ps, df -h, curl localhost)
+
+NOTE: We do NOT have k8s_exec or direct kubectl access. For remediation actions, describe what needs to be done and mark requires_approval=True so a human can execute it.
 """
 
     # Generate action plan
     try:
         action_plan = structured_llm.invoke(messages + [HumanMessage(content=planning_prompt)])
-        logger.info(f"[Planner] Action plan generated: {action_plan.root_cause[:100]}...")
-        logger.info(f"[Planner] Confidence: {action_plan.confidence_score}, Actions: {len(action_plan.actions)}")
+        logger.info(f"[Planner] Action plan generated: {action_plan.goal[:100]}...")
+        logger.info(f"[Planner] Confidence: {action_plan.confidence_score}, Steps: {len(action_plan.execution_steps)}")
 
         return {"action_plan": action_plan}
 
