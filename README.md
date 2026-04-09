@@ -18,7 +18,7 @@
 
 ## 系統概述
 
-完整的四層 AI 自動除錯系統，參考 [Metoro.io](https://metoro.io) 的產品理念，整合日誌收集、異常檢測、根因分析和修復建議。
+完整的四層 AI 自動除錯系統，核心架構設計來自 BlueT（https://github.com/bluet）的 Side Project，整合日誌收集、異常檢測、根因分析和修復建議。
 
 ### 核心功能
 
