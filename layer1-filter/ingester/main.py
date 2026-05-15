@@ -12,6 +12,8 @@ import os
 from datetime import datetime
 from typing import List, Optional
 
+import json
+
 import asyncpg
 from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
@@ -32,9 +34,9 @@ app = FastAPI(
 
 DB_HOST = os.getenv("DB_HOST", "timescaledb")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
-DB_NAME = os.getenv("DB_NAME", "adds")
+DB_USER = os.getenv("DB_USER", "logdb")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "logdb_password")
+DB_NAME = os.getenv("DB_NAME", "logdb")
 
 # Connection pool
 db_pool: Optional[asyncpg.Pool] = None
@@ -154,25 +156,28 @@ async def create_anomaly(log: AnomalyLog):
         async with db_pool.acquire() as conn:
             query = """
                 INSERT INTO anomaly_logs (
-                    timestamp,
+                    time,
+                    container,
                     service,
-                    log_message,
-                    logbert_anomaly_score,
-                    level,
-                    is_anomaly
+                    raw_message,
+                    anomaly_score,
+                    filter_stage,
+                    labels
                 )
-                VALUES ($1, $2, $3, $4, $5, $6)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING id
             """
 
+            labels = json.dumps({"level": log.level, "source": "ingester"})
             log_id = await conn.fetchval(
                 query,
                 log.timestamp,
                 log.service,
+                log.service,
                 log.log_message,
                 log.logbert_anomaly_score,
-                log.level,
-                log.is_anomaly,
+                "ingester",
+                labels,
             )
 
             return {
@@ -211,14 +216,15 @@ async def create_anomaly_batch(batch: AnomalyBatch):
             async with conn.transaction():
                 query = """
                     INSERT INTO anomaly_logs (
-                        timestamp,
+                        time,
+                        container,
                         service,
-                        log_message,
-                        logbert_anomaly_score,
-                        level,
-                        is_anomaly
+                        raw_message,
+                        anomaly_score,
+                        filter_stage,
+                        labels
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
                 """
 
                 # Prepare batch data
@@ -226,10 +232,11 @@ async def create_anomaly_batch(batch: AnomalyBatch):
                     (
                         log.timestamp,
                         log.service,
+                        log.service,
                         log.log_message,
                         log.logbert_anomaly_score,
-                        log.level,
-                        log.is_anomaly,
+                        "ingester",
+                        json.dumps({"level": log.level, "source": "ingester"}),
                     )
                     for log in batch.logs
                 ]
