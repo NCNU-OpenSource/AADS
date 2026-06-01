@@ -21,7 +21,10 @@ PREVIOUS_DIR="/var/lib/aads-agent/snapshots/mysql-previous-$(date +%Y%m%d%H%M%S)
 mkdir -p "$PREVIOUS_DIR"
 cp -a "$MYSQL_CONF" "$PREVIOUS_DIR/my.cnf" 2>/dev/null || true
 
-cp -a "$SNAPSHOT_DIR/my.cnf" "$MYSQL_CONF"
+# Apply known-good snapshot; restore root:root 0644 ownership expected by MySQL
+cp "$SNAPSHOT_DIR/my.cnf" "$MYSQL_CONF"
+chown root:root "$MYSQL_CONF"
+chmod 0644 "$MYSQL_CONF"
 
 # Validate restored config
 if ! (mysqld --validate-config >/dev/null 2>&1 || mariadbd --validate-config >/dev/null 2>&1); then
