@@ -5,9 +5,12 @@ Display anomalies and diagnosis reports
 from flask import Flask, render_template, jsonify, request
 import asyncpg
 import asyncio
+import hashlib
 import os
 import json
-from datetime import datetime, timedelta
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
 
@@ -17,6 +20,10 @@ DB_PORT = int(os.getenv('DB_PORT', '5432'))
 DB_NAME = os.getenv('DB_NAME', 'logdb')
 DB_USER = os.getenv('DB_USER', 'logdb')
 DB_PASSWORD = os.getenv('DB_PASSWORD', 'logdb_password')
+ADMIN_API_KEY = os.getenv('AADS_ADMIN_API_KEY', 'change-me-admin-key')
+APPROVAL_EXPIRY_MINUTES = int(os.getenv('APPROVAL_EXPIRY_MINUTES', '30'))
+SUPPORTED_EXECUTION_SCHEMA = '2.0'
+IDEMPOTENCY_TTL_MINUTES = int(os.getenv('AADS_IDEMPOTENCY_TTL_MINUTES', '30'))
 
 
 async def get_db_connection():
@@ -30,19 +37,98 @@ async def get_db_connection():
     )
 
 
-async def get_diagnosis_reports(hours=24):
-    """Get recent diagnosis reports"""
+def run_async(coro):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
+
+def normalize_admin_key(value):
+    key = (value or '').strip()
+    match = re.search(r'AADS_ADMIN_API_KEY\s*=\s*([^\s#]+)', key)
+    if match:
+        key = match.group(1)
+    if key.startswith('export '):
+        key = key[len('export '):].strip()
+    if key.startswith('AADS_ADMIN_API_KEY='):
+        key = key.split('=', 1)[1].strip()
+    return key.strip('"\'')
+
+
+def key_diagnostics(key):
+    if not key:
+        return {'present': False, 'length': 0, 'fingerprint': None}
+    return {
+        'present': True,
+        'length': len(key),
+        'fingerprint': hashlib.sha256(key.encode()).hexdigest()[:10],
+    }
+
+
+def require_admin():
+    key = normalize_admin_key(request.headers.get('X-Admin-API-Key'))
+    if key != ADMIN_API_KEY:
+        app.logger.warning(
+            "Admin auth failed: received=%s expected=%s",
+            key_diagnostics(key),
+            key_diagnostics(ADMIN_API_KEY),
+        )
+        return jsonify({
+            'error': 'unauthorized',
+            'received': key_diagnostics(key),
+            'expected': {
+                'present': bool(ADMIN_API_KEY),
+                'length': len(ADMIN_API_KEY),
+            },
+        }), 401
+    return None
+
+
+@app.route('/api/auth/check', methods=['POST'])
+def api_auth_check():
+    auth = require_admin()
+    if auth:
+        return auth
+    return jsonify({'status': 'ok', 'key': key_diagnostics(normalize_admin_key(request.headers.get('X-Admin-API-Key')))})
+
+
+def parse_jsonb(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
+
+
+RESOLVED_STATUSES = frozenset([
+    'final_verified', 'kb_imported', 'kb_skipped', 'kb_import_failed', 'rejected',
+])
+
+async def get_diagnosis_reports(hours=168):
+    """Get recent diagnosis reports.
+
+    Active/attention items are filtered by the hours window so the queue stays
+    focused on recent work.  Resolved items (Repair History) are always returned
+    regardless of age — audit trails should never disappear just because a
+    time-picker moved.
+    """
     conn = await get_db_connection()
     try:
+        resolved_list = ", ".join(f"'{s}'" for s in RESOLVED_STATUSES)
         rows = await conn.fetch(
-            """
+            f"""
             SELECT diagnosis_id, timestamp, severity, summary,
-                   root_cause, recommended_actions, action_plan
+                   root_cause, recommended_actions, action_plan,
+                   schema_version, plan_status
             FROM diagnosis_reports
-            WHERE timestamp > NOW() - INTERVAL '%s hours'
+            WHERE timestamp > NOW() - INTERVAL '{hours} hours'
+               OR plan_status IN ({resolved_list})
             ORDER BY timestamp DESC
-            LIMIT 50
-            """ % hours
+            LIMIT 200
+            """
         )
 
         reports = []
@@ -50,16 +136,18 @@ async def get_diagnosis_reports(hours=24):
             # Handle action_plan (can be None for old records)
             action_plan = None
             if row['action_plan'] is not None:
-                action_plan = json.loads(row['action_plan']) if isinstance(row['action_plan'], str) else row['action_plan']
+                action_plan = parse_jsonb(row['action_plan'])
 
             reports.append({
                 'diagnosis_id': row['diagnosis_id'],
                 'timestamp': row['timestamp'].isoformat(),
                 'severity': row['severity'],
                 'summary': row['summary'],
-                'root_cause': json.loads(row['root_cause']) if isinstance(row['root_cause'], str) else row['root_cause'],
-                'recommended_actions': json.loads(row['recommended_actions']) if isinstance(row['recommended_actions'], str) else row['recommended_actions'],
-                'action_plan': action_plan
+                'root_cause': parse_jsonb(row['root_cause']),
+                'recommended_actions': parse_jsonb(row['recommended_actions']),
+                'action_plan': action_plan,
+                'schema_version': row['schema_version'],
+                'plan_status': row['plan_status'],
             })
 
         return reports
@@ -67,16 +155,13 @@ async def get_diagnosis_reports(hours=24):
         await conn.close()
 
 
-async def get_anomaly_stats(hours=24):
-    """Get anomaly statistics"""
+async def get_anomaly_stats(hours=168):
+    """Get anomaly statistics for the given window."""
     conn = await get_db_connection()
     try:
-        # Total anomalies
         total = await conn.fetchval(
             "SELECT COUNT(*) FROM anomaly_logs WHERE time > NOW() - INTERVAL '%s hours'" % hours
         )
-
-        # By container
         by_container = await conn.fetch(
             """
             SELECT container, COUNT(*) as count,
@@ -88,8 +173,6 @@ async def get_anomaly_stats(hours=24):
             LIMIT 10
             """ % hours
         )
-
-        # By filter stage
         by_filter = await conn.fetch(
             """
             SELECT filter_stage, COUNT(*) as count
@@ -98,7 +181,6 @@ async def get_anomaly_stats(hours=24):
             GROUP BY filter_stage
             """ % hours
         )
-
         return {
             'total': total,
             'by_container': [dict(row) for row in by_container],
@@ -108,16 +190,21 @@ async def get_anomaly_stats(hours=24):
         await conn.close()
 
 
-async def get_diagnosis_stats(hours=24):
-    """Get diagnosis statistics"""
+async def get_diagnosis_stats(hours=168):
+    """Get diagnosis statistics.
+
+    Totals reflect the time window for the instrument rail.
+    Resolved (history) count is always all-time so History tab stays accurate.
+    """
     conn = await get_db_connection()
     try:
-        # By severity
+        resolved_list = ", ".join(f"'{s}'" for s in RESOLVED_STATUSES)
         by_severity = await conn.fetch(
-            """
+            f"""
             SELECT severity, COUNT(*) as count
             FROM diagnosis_reports
-            WHERE timestamp > NOW() - INTERVAL '%s hours'
+            WHERE timestamp > NOW() - INTERVAL '{hours} hours'
+               OR plan_status IN ({resolved_list})
             GROUP BY severity
             ORDER BY
                 CASE severity
@@ -126,14 +213,15 @@ async def get_diagnosis_stats(hours=24):
                     WHEN 'medium' THEN 3
                     WHEN 'low' THEN 4
                 END
-            """ % hours
+            """
         )
-
-        # Total
         total = await conn.fetchval(
-            "SELECT COUNT(*) FROM diagnosis_reports WHERE timestamp > NOW() - INTERVAL '%s hours'" % hours
+            f"""
+            SELECT COUNT(*) FROM diagnosis_reports
+            WHERE timestamp > NOW() - INTERVAL '{hours} hours'
+               OR plan_status IN ({resolved_list})
+            """
         )
-
         return {
             'total': total,
             'by_severity': [dict(row) for row in by_severity]
@@ -177,25 +265,17 @@ def index():
 @app.route('/api/diagnosis')
 def api_diagnosis():
     """API endpoint for diagnosis reports"""
-    hours = int(request.args.get('hours', 24))
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    reports = loop.run_until_complete(get_diagnosis_reports(hours))
-    loop.close()
+    hours = int(request.args.get("hours", 168))
+    reports = run_async(get_diagnosis_reports(hours))
     return jsonify(reports)
 
 
 @app.route('/api/stats')
 def api_stats():
     """API endpoint for statistics"""
-    hours = int(request.args.get('hours', 24))
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    anomaly_stats = loop.run_until_complete(get_anomaly_stats(hours))
-    diagnosis_stats = loop.run_until_complete(get_diagnosis_stats(hours))
-
-    loop.close()
+    hours = int(request.args.get("hours", 168))
+    anomaly_stats = run_async(get_anomaly_stats(hours))
+    diagnosis_stats = run_async(get_diagnosis_stats(hours))
 
     return jsonify({
         'anomalies': anomaly_stats,
@@ -206,12 +286,523 @@ def api_stats():
 @app.route('/api/stats/timeline')
 def api_stats_timeline():
     """API endpoint for hourly anomaly timeline"""
-    hours = int(request.args.get('hours', 24))
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    timeline = loop.run_until_complete(get_anomaly_timeline(hours))
-    loop.close()
+    hours = int(request.args.get("hours", 168))
+    timeline = run_async(get_anomaly_timeline(hours))
     return jsonify(timeline)
+
+
+@app.route('/api/agents/register', methods=['POST'])
+def api_register_agent():
+    auth = require_admin()
+    if auth:
+        return auth
+    payload = request.get_json(force=True)
+    result = run_async(register_agent(payload))
+    return jsonify(result)
+
+
+async def register_agent(payload):
+    conn = await get_db_connection()
+    try:
+        await conn.execute(
+            """
+            INSERT INTO agent_nodes
+            (node_id, environment, agent_version, base_url, supported_commands, status, last_seen, metadata)
+            VALUES ($1, $2, $3, $4, $5, 'registered', NOW(), $6)
+            ON CONFLICT (node_id) DO UPDATE SET
+                environment = EXCLUDED.environment,
+                agent_version = EXCLUDED.agent_version,
+                base_url = EXCLUDED.base_url,
+                supported_commands = EXCLUDED.supported_commands,
+                status = 'registered',
+                last_seen = NOW(),
+                metadata = EXCLUDED.metadata
+            """,
+            payload['node_id'],
+            payload.get('environment', 'test'),
+            payload.get('agent_version', 'unknown'),
+            payload['base_url'],
+            json.dumps(payload.get('supported_commands', [])),
+            json.dumps(payload.get('metadata', {})),
+        )
+        await audit(conn, 'agent.registered', 'admin', None, None, payload['node_id'], 'allowed', None, 'success', payload)
+        return {'status': 'registered', 'node_id': payload['node_id']}
+    finally:
+        await conn.close()
+
+
+@app.route('/api/agents')
+def api_agents():
+    return jsonify(run_async(list_agents()))
+
+
+async def list_agents():
+    conn = await get_db_connection()
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT node_id, environment, agent_version, base_url,
+                   supported_commands, status, last_seen
+            FROM agent_nodes
+            ORDER BY node_id
+            """
+        )
+        return [
+            {
+                'node_id': row['node_id'],
+                'environment': row['environment'],
+                'agent_version': row['agent_version'],
+                'base_url': row['base_url'],
+                'supported_commands': parse_jsonb(row['supported_commands']),
+                'status': row['status'],
+                'last_seen': row['last_seen'].isoformat(),
+            }
+            for row in rows
+        ]
+    finally:
+        await conn.close()
+
+
+@app.route('/api/agents/<node_id>/tasks', methods=['POST'])
+def api_queue_agent_task(node_id):
+    auth = require_admin()
+    if auth:
+        return auth
+    key = request.headers.get('Idempotency-Key')
+    if not key:
+        return jsonify({'error': 'Idempotency-Key header is required'}), 400
+    payload = request.get_json(silent=True) or {}
+    result, status_code = run_async(queue_agent_task(node_id, key, payload))
+    return jsonify(result), status_code
+
+
+async def queue_agent_task(node_id, idempotency_key, payload):
+    task_type = payload.get('task_type', 'rca')
+    conn = await get_db_connection()
+    try:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM idempotency_records WHERE expires_at <= NOW()")
+            existing = await conn.fetchrow(
+                """
+                SELECT r.task_id, t.node_id, t.task_type, t.status, t.result
+                FROM idempotency_records r
+                JOIN agent_tasks t ON t.task_id = r.task_id
+                WHERE r.idempotency_key = $1
+                  AND r.scope = 'agent_task'
+                  AND r.expires_at > NOW()
+                """,
+                idempotency_key,
+            )
+            if existing:
+                if existing['node_id'] != node_id or existing['task_type'] != task_type:
+                    return {'error': 'idempotency key already used for a different agent task'}, 400
+                return {
+                    'task_id': existing['task_id'],
+                    'node_id': existing['node_id'],
+                    'task_type': existing['task_type'],
+                    'status': existing['status'],
+                    'result': parse_jsonb(existing['result']),
+                }, 200
+
+            active = await conn.fetchrow(
+                """
+                SELECT r.task_id
+                FROM idempotency_records r
+                JOIN agent_tasks t ON t.task_id = r.task_id
+                WHERE r.scope = 'agent_task'
+                  AND t.node_id = $1
+                  AND t.task_type = $2
+                  AND r.expires_at > NOW()
+                LIMIT 1
+                """,
+                node_id,
+                task_type,
+            )
+            if active:
+                return {'error': 'agent task already has an active idempotency key', 'task_id': active['task_id']}, 409
+
+            node_exists = await conn.fetchval("SELECT TRUE FROM agent_nodes WHERE node_id = $1", node_id)
+            if not node_exists:
+                return {'error': 'agent not found'}, 404
+
+            task_id = f"task_{uuid.uuid4().hex}"
+            await conn.execute(
+                """
+                INSERT INTO agent_tasks
+                (task_id, node_id, task_type, idempotency_key, status, schema_version, result)
+                VALUES ($1, $2, $3, $4, 'queued', '1.0', '{}'::jsonb)
+                """,
+                task_id,
+                node_id,
+                task_type,
+                idempotency_key,
+            )
+            await conn.execute(
+                """
+                INSERT INTO idempotency_records
+                (idempotency_key, scope, task_id, expires_at, metadata)
+                VALUES ($1, 'agent_task', $2, NOW() + $3 * INTERVAL '1 minute', $4)
+                """,
+                idempotency_key,
+                task_id,
+                IDEMPOTENCY_TTL_MINUTES,
+                json.dumps({'node_id': node_id, 'task_type': task_type}),
+            )
+            await audit(conn, 'agent_task.queued', 'system-agent', None, None, node_id, 'allowed', idempotency_key, 'queued', {'task_id': task_id, 'task_type': task_type}, '1.0')
+            return {'task_id': task_id, 'node_id': node_id, 'task_type': task_type, 'status': 'queued'}, 202
+    finally:
+        await conn.close()
+
+
+@app.route('/api/plans/<plan_id>/approve', methods=['POST'])
+def api_approve_plan(plan_id):
+    auth = require_admin()
+    if auth:
+        return auth
+    payload = request.get_json(silent=True) or {}
+    result = run_async(approve_plan(plan_id, payload.get('reason')))
+    if isinstance(result, tuple):
+        return jsonify(result[0]), result[1]
+    return jsonify(result)
+
+
+@app.route('/api/plans/<plan_id>/reject', methods=['POST'])
+def api_reject_plan(plan_id):
+    auth = require_admin()
+    if auth:
+        return auth
+    payload = request.get_json(silent=True) or {}
+    result = run_async(reject_plan(plan_id, payload.get('reason')))
+    return jsonify(result)
+
+
+async def approve_plan(plan_id, reason=None):
+    conn = await get_db_connection()
+    try:
+        # Reject approval for non-executable plans (schema != 2.0).
+        # A schema 1.0 fallback has no catalog steps — the Knowledge Agent would
+        # block it anyway, but blocking here prevents the misleading 'approved' badge.
+        plan_row = await conn.fetchrow(
+            "SELECT schema_version, action_plan, plan_status FROM diagnosis_reports WHERE diagnosis_id = $1",
+            plan_id,
+        )
+        if not plan_row:
+            return {'error': 'plan not found'}, 404
+
+        # Block approve on terminal statuses — these plans are already done or closed.
+        TERMINAL_STATUSES = frozenset([
+            'final_verified', 'kb_imported', 'kb_skipped', 'kb_import_failed',
+            'rejected', 'blocked', 'execution_failed', 'execution_failed_unknown_state',
+        ])
+        if plan_row['plan_status'] in TERMINAL_STATUSES:
+            return {'error': f'cannot approve — plan is already in terminal state: {plan_row["plan_status"]}'}, 409
+
+        plan_dict = parse_jsonb(plan_row['action_plan']) or {}
+        effective_schema = plan_dict.get('schema_version') or plan_row['schema_version'] or '1.0'
+        if effective_schema != SUPPORTED_EXECUTION_SCHEMA:
+            await audit(conn, 'policy.blocked', 'admin', plan_id, None, None,
+                        'unsupported_schema', None, 'blocked', {}, effective_schema)
+            return {'error': 'cannot approve — plan has no executable steps (schema != 2.0)'}, 400
+
+        approved_until = datetime.now(timezone.utc) + timedelta(minutes=APPROVAL_EXPIRY_MINUTES)
+        await conn.execute(
+            """
+            INSERT INTO plan_approvals (plan_id, actor, decision, approved_until, reason)
+            VALUES ($1, 'admin', 'approved', $2, $3)
+            """,
+            plan_id,
+            approved_until,
+            reason,
+        )
+        await conn.execute("UPDATE diagnosis_reports SET plan_status = 'approved' WHERE diagnosis_id = $1", plan_id)
+        await audit(conn, 'plan.approved', 'admin', plan_id, None, None, 'allowed', None, 'approved', {'approved_until': approved_until.isoformat(), 'reason': reason})
+        return {'status': 'approved', 'plan_id': plan_id, 'approved_until': approved_until.isoformat()}
+    finally:
+        await conn.close()
+
+
+async def reject_plan(plan_id, reason=None):
+    conn = await get_db_connection()
+    try:
+        await conn.execute(
+            """
+            INSERT INTO plan_approvals (plan_id, actor, decision, reason)
+            VALUES ($1, 'admin', 'rejected', $2)
+            """,
+            plan_id,
+            reason,
+        )
+        await conn.execute("UPDATE diagnosis_reports SET plan_status = 'rejected' WHERE diagnosis_id = $1", plan_id)
+        await audit(conn, 'plan.rejected', 'admin', plan_id, None, None, 'blocked', None, 'rejected', {'reason': reason})
+        return {'status': 'rejected', 'plan_id': plan_id}
+    finally:
+        await conn.close()
+
+
+@app.route('/api/plans/<plan_id>/execute', methods=['POST'])
+def api_execute_plan(plan_id):
+    auth = require_admin()
+    if auth:
+        return auth
+    key = request.headers.get('Idempotency-Key')
+    if not key:
+        return jsonify({'error': 'Idempotency-Key header is required'}), 400
+    result, status_code = run_async(queue_execution(plan_id, key))
+    return jsonify(result), status_code
+
+
+async def queue_execution(plan_id, idempotency_key):
+    conn = await get_db_connection()
+    try:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM idempotency_records WHERE expires_at <= NOW()")
+            existing_record = await conn.fetchrow(
+                """
+                SELECT r.plan_id, r.execution_id, e.status, e.result
+                FROM idempotency_records r
+                JOIN plan_executions e ON e.execution_id = r.execution_id
+                WHERE r.idempotency_key = $1
+                  AND r.scope = 'plan_execute'
+                  AND r.expires_at > NOW()
+                """,
+                idempotency_key,
+            )
+            if existing_record:
+                if existing_record['plan_id'] != plan_id:
+                    return {'error': 'idempotency key already used for a different plan'}, 400
+                return {
+                    'execution_id': existing_record['execution_id'],
+                    'plan_id': existing_record['plan_id'],
+                    'status': existing_record['status'],
+                    'result': parse_jsonb(existing_record['result']),
+                }, 200
+
+            active_plan_record = await conn.fetchrow(
+                """
+                SELECT idempotency_key, execution_id
+                FROM idempotency_records
+                WHERE scope = 'plan_execute'
+                  AND plan_id = $1
+                  AND expires_at > NOW()
+                LIMIT 1
+                """,
+                plan_id,
+            )
+            if active_plan_record:
+                return {
+                    'error': 'plan already has an active execution idempotency key',
+                    'execution_id': active_plan_record['execution_id'],
+                }, 409
+
+            diagnosis = await conn.fetchrow(
+                "SELECT action_plan, schema_version FROM diagnosis_reports WHERE diagnosis_id = $1",
+                plan_id,
+            )
+            if not diagnosis:
+                return {'error': 'plan not found'}, 404
+
+            plan = parse_jsonb(diagnosis['action_plan']) or {}
+            if plan.get('schema_version', diagnosis['schema_version']) != SUPPORTED_EXECUTION_SCHEMA:
+                await audit(conn, 'policy.blocked', 'admin', plan_id, None, None, 'unsupported_schema', idempotency_key, 'blocked', {}, SUPPORTED_EXECUTION_SCHEMA)
+                return {'error': 'unsupported schema'}, 400
+
+            target_node_id = first_target_node(plan)
+            if not await approval_valid(conn, plan_id) and not plan_auto_allowed(plan):
+                await audit(conn, 'policy.blocked', 'admin', plan_id, None, target_node_id, 'approval_required', idempotency_key, 'blocked', {}, SUPPORTED_EXECUTION_SCHEMA)
+                return {'error': 'approval required or expired'}, 403
+
+            execution_id = f"exec_{uuid.uuid4().hex}"
+            await conn.execute(
+                """
+                INSERT INTO plan_executions
+                (execution_id, plan_id, idempotency_key, status, target_node_id, schema_version)
+                VALUES ($1, $2, $3, 'queued', $4, $5)
+                """,
+                execution_id,
+                plan_id,
+                idempotency_key,
+                target_node_id,
+                SUPPORTED_EXECUTION_SCHEMA,
+            )
+            await conn.execute(
+                """
+                INSERT INTO idempotency_records
+                (idempotency_key, scope, plan_id, execution_id, expires_at, metadata)
+                VALUES ($1, 'plan_execute', $2, $3,
+                        NOW() + $4 * INTERVAL '1 minute', $5)
+                """,
+                idempotency_key,
+                plan_id,
+                execution_id,
+                IDEMPOTENCY_TTL_MINUTES,
+                json.dumps({'requested_by': 'admin'}),
+            )
+            await conn.execute("UPDATE diagnosis_reports SET plan_status = 'queued' WHERE diagnosis_id = $1", plan_id)
+            await audit(conn, 'execution.queued', 'admin', plan_id, None, target_node_id, 'allowed', idempotency_key, 'queued', {'execution_id': execution_id}, SUPPORTED_EXECUTION_SCHEMA)
+            return {'execution_id': execution_id, 'plan_id': plan_id, 'status': 'queued'}, 202
+    finally:
+        await conn.close()
+
+
+@app.route('/api/plans/<plan_id>/execution')
+def api_plan_execution(plan_id):
+    return jsonify(run_async(get_plan_execution(plan_id)))
+
+
+async def get_plan_execution(plan_id):
+    conn = await get_db_connection()
+    try:
+        executions = await conn.fetch(
+            """
+            SELECT execution_id, plan_id, idempotency_key, status, target_node_id,
+                   requested_at, started_at, finished_at, retry_count, result
+            FROM plan_executions
+            WHERE plan_id = $1
+            ORDER BY requested_at DESC
+            """,
+            plan_id,
+        )
+        steps = await conn.fetch(
+            """
+            SELECT execution_id, step_id, status, command_id, target_node_id,
+                   retry_count, started_at, finished_at, result
+            FROM execution_steps
+            WHERE execution_id = ANY($1::text[])
+            ORDER BY execution_id, step_id
+            """,
+            [row['execution_id'] for row in executions],
+        )
+        by_execution = {}
+        for row in steps:
+            by_execution.setdefault(row['execution_id'], []).append({
+                'step_id': row['step_id'],
+                'status': row['status'],
+                'command_id': row['command_id'],
+                'target_node_id': row['target_node_id'],
+                'retry_count': row['retry_count'],
+                'started_at': row['started_at'].isoformat() if row['started_at'] else None,
+                'finished_at': row['finished_at'].isoformat() if row['finished_at'] else None,
+                'result': parse_jsonb(row['result']),
+            })
+        return [
+            {
+                'execution_id': row['execution_id'],
+                'plan_id': row['plan_id'],
+                'idempotency_key': row['idempotency_key'],
+                'status': row['status'],
+                'target_node_id': row['target_node_id'],
+                'requested_at': row['requested_at'].isoformat(),
+                'started_at': row['started_at'].isoformat() if row['started_at'] else None,
+                'finished_at': row['finished_at'].isoformat() if row['finished_at'] else None,
+                'retry_count': row['retry_count'],
+                'result': parse_jsonb(row['result']),
+                'steps': by_execution.get(row['execution_id'], []),
+            }
+            for row in executions
+        ]
+    finally:
+        await conn.close()
+
+
+@app.route('/api/plans/<plan_id>/approval')
+def api_plan_approval(plan_id):
+    """Latest approval decision for a plan (read-only; powers the 30-min countdown)."""
+    return jsonify(run_async(get_latest_approval(plan_id)))
+
+
+async def get_latest_approval(plan_id):
+    conn = await get_db_connection()
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT decision, approved_until, reason, actor, created_at
+            FROM plan_approvals
+            WHERE plan_id = $1
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            plan_id,
+        )
+        if not row:
+            return {}
+        return {
+            'decision': row['decision'],
+            'approved_until': row['approved_until'].isoformat() if row['approved_until'] else None,
+            'reason': row['reason'],
+            'actor': row['actor'],
+            'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+        }
+    finally:
+        await conn.close()
+
+
+async def approval_valid(conn, plan_id):
+    row = await conn.fetchrow(
+        """
+        SELECT decision, approved_until
+        FROM plan_approvals
+        WHERE plan_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        plan_id,
+    )
+    if not row or row['decision'] != 'approved' or not row['approved_until']:
+        return False
+    approved_until = row['approved_until']
+    if approved_until.tzinfo is None:
+        approved_until = approved_until.replace(tzinfo=timezone.utc)
+    return approved_until > datetime.now(timezone.utc)
+
+
+def plan_auto_allowed(plan):
+    if plan.get('schema_version') == SUPPORTED_EXECUTION_SCHEMA:
+        policy = plan.get('environment_policy') or {}
+        return (
+            plan.get('risk_level') == 'low'
+            and bool(plan.get('steps'))
+            and policy.get('environment') == 'test'
+            and policy.get('auto_execute_allowed') is True
+        )
+    for step in plan.get('execution_steps', []):
+        if step.get('phase') != 'Execute':
+            continue
+        for command in step.get('commands', []):
+            policy = command.get('environment_policy') or {}
+            if not (policy.get('environment') == 'test' and policy.get('auto_execute_allowed') is True):
+                return False
+    return True
+
+
+def first_target_node(plan):
+    if plan.get('schema_version') == SUPPORTED_EXECUTION_SCHEMA:
+        return plan.get('target_node_id')
+    for step in plan.get('execution_steps', []):
+        for command in step.get('commands', []):
+            if command.get('target_node_id'):
+                return command['target_node_id']
+    return None
+
+
+async def audit(conn, event_type, actor, plan_id, step_id, node_id, policy_decision, idempotency_key, result, metadata, schema_version=SUPPORTED_EXECUTION_SCHEMA):
+    await conn.execute(
+        """
+        INSERT INTO audit_events
+        (actor, event_type, plan_id, step_id, node_id, schema_version,
+         policy_decision, idempotency_key, result, metadata)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        """,
+        actor,
+        event_type,
+        plan_id,
+        step_id,
+        node_id,
+        schema_version,
+        policy_decision,
+        idempotency_key,
+        result,
+        json.dumps(metadata),
+    )
 
 
 if __name__ == '__main__':

@@ -24,6 +24,9 @@ logbert/output/*.json
 
 # Docker
 .env
+.env.lab
+.aads-lab-token
+.aads-lab-admin-key
 
 # IDE
 .vscode/

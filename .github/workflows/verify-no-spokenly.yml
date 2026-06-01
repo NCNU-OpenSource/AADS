@@ -1,0 +1,13 @@
+name: Verify No Spokenly
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  verify-no-spokenly:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify active Spokenly references are absent
+        run: scripts/verify-no-spokenly.sh

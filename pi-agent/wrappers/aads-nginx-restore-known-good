@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SNAPSHOT_DIR="${AADS_NGINX_SNAPSHOT_DIR:-/var/lib/aads-agent/snapshots/nginx}"
+PREVIOUS_DIR="/var/lib/aads-agent/snapshots/nginx-previous-$(date +%Y%m%d%H%M%S)"
+
+if [[ ! -f "$SNAPSHOT_DIR/nginx.conf" || ! -d "$SNAPSHOT_DIR/sites-enabled" ]]; then
+  echo "blocked: no_snapshot" >&2
+  exit 42
+fi
+
+mkdir -p "$PREVIOUS_DIR"
+cp -a /etc/nginx/nginx.conf "$PREVIOUS_DIR/nginx.conf"
+if [[ -d /etc/nginx/sites-enabled ]]; then
+  cp -a /etc/nginx/sites-enabled "$PREVIOUS_DIR/sites-enabled"
+fi
+
+cp -a "$SNAPSHOT_DIR/nginx.conf" /etc/nginx/nginx.conf
+rm -rf /etc/nginx/sites-enabled
+cp -a "$SNAPSHOT_DIR/sites-enabled" /etc/nginx/sites-enabled
+
+if ! nginx -t; then
+  cp -a "$PREVIOUS_DIR/nginx.conf" /etc/nginx/nginx.conf
+  rm -rf /etc/nginx/sites-enabled
+  cp -a "$PREVIOUS_DIR/sites-enabled" /etc/nginx/sites-enabled
+  exit 43
+fi
+
+if ! systemctl reload nginx; then
+  cp -a "$PREVIOUS_DIR/nginx.conf" /etc/nginx/nginx.conf
+  rm -rf /etc/nginx/sites-enabled
+  cp -a "$PREVIOUS_DIR/sites-enabled" /etc/nginx/sites-enabled
+  systemctl reload nginx || true
+  exit 44
+fi
