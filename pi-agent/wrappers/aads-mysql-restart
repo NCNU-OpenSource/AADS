@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Support both MySQL and MariaDB service names
+if systemctl cat mysql >/dev/null 2>&1; then
+  systemctl restart mysql
+  systemctl is-active --quiet mysql
+else
+  systemctl restart mariadb
+  systemctl is-active --quiet mariadb
+fi
+echo "restarted=true"

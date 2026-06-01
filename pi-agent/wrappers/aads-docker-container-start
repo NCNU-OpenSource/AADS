@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONTAINER="${1:-}"
+
+if [[ -z "$CONTAINER" ]]; then
+  echo "blocked: missing_container_name" >&2
+  exit 42
+fi
+
+IFS=',' read -ra ALLOWED <<< "${AADS_DOCKER_ALLOWED_CONTAINERS:-}"
+
+valid=false
+for c in "${ALLOWED[@]}"; do
+  [[ "${c// /}" == "$CONTAINER" ]] && valid=true && break
+done
+
+if [[ "$valid" == "false" ]]; then
+  echo "blocked: container_not_allowed" >&2
+  exit 42
+fi
+
+docker start "$CONTAINER"
+echo "started=true container=$CONTAINER"

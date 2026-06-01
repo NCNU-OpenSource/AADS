@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+systemctl restart redis-server 2>/dev/null || systemctl restart redis
+systemctl is-active --quiet redis-server 2>/dev/null || systemctl is-active --quiet redis
+echo "restarted=true"

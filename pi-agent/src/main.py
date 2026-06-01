@@ -23,9 +23,17 @@ PG_SNAPSHOT_DIR = Path(os.getenv("AADS_PG_SNAPSHOT_DIR", "/var/lib/aads-agent/sn
 TOKEN = os.getenv("AADS_AGENT_TOKEN", "")
 ALLOWED_JOURNAL_UNITS = {
     unit.strip()
-    for unit in os.getenv("AADS_ALLOWED_JOURNAL_UNITS", "nginx,aads-agent,postgresql").split(",")
+    for unit in os.getenv(
+        "AADS_ALLOWED_JOURNAL_UNITS", "nginx,aads-agent,postgresql,redis,redis-server,mysql,mariadb,docker"
+    ).split(",")
     if unit.strip()
 }
+# Docker containers allowed for restart/start actions (comma-separated)
+DOCKER_ALLOWED_CONTAINERS: List[str] = [
+    c.strip()
+    for c in os.getenv("AADS_DOCKER_ALLOWED_CONTAINERS", "").split(",")
+    if c.strip()
+]
 
 WRAPPERS = {
     "nginx.start": "/usr/local/sbin/aads-nginx-start",
@@ -38,6 +46,21 @@ WRAPPERS = {
     "postgresql.config_test": "/usr/local/sbin/aads-postgresql-config-test",
     "postgresql.ensure_config_snapshot": "/usr/local/sbin/aads-postgresql-ensure-config-snapshot",
     "postgresql.restore_known_good_config": "/usr/local/sbin/aads-postgresql-restore-config",
+    # Redis
+    "redis.restart": "/usr/local/sbin/aads-redis-restart",
+    "redis.reload": "/usr/local/sbin/aads-redis-reload",
+    "redis.config_test": "/usr/local/sbin/aads-redis-config-test",
+    "redis.ensure_config_snapshot": "/usr/local/sbin/aads-redis-ensure-config-snapshot",
+    "redis.restore_known_good_config": "/usr/local/sbin/aads-redis-restore-config",
+    # Docker
+    "docker.container_restart": "/usr/local/sbin/aads-docker-container-restart",
+    "docker.container_start": "/usr/local/sbin/aads-docker-container-start",
+    # MySQL / MariaDB
+    "mysql.restart": "/usr/local/sbin/aads-mysql-restart",
+    "mysql.reload": "/usr/local/sbin/aads-mysql-reload",
+    "mysql.config_test": "/usr/local/sbin/aads-mysql-config-test",
+    "mysql.ensure_config_snapshot": "/usr/local/sbin/aads-mysql-ensure-config-snapshot",
+    "mysql.restore_known_good_config": "/usr/local/sbin/aads-mysql-restore-config",
 }
 
 CATALOG: Dict[str, Dict[str, Any]] = {
@@ -222,6 +245,213 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         "retry_policy": {"max_attempts": 1},
         "sudo_wrapper": WRAPPERS["postgresql.restore_known_good_config"],
     },
+    # ── Redis ─────────────────────────────────────────────────
+    "redis.status": {
+        "command_id": "redis.status",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "probe",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 10,
+        "risk_level": "low",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 3},
+        "sudo_wrapper": None,
+    },
+    "redis.ping": {
+        "command_id": "redis.ping",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "probe",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 10,
+        "risk_level": "low",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 3},
+        "sudo_wrapper": None,
+    },
+    "redis.config_test": {
+        "command_id": "redis.config_test",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "probe",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 15,
+        "risk_level": "low",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 3},
+        "sudo_wrapper": WRAPPERS["redis.config_test"],
+    },
+    "redis.ensure_config_snapshot": {
+        "command_id": "redis.ensure_config_snapshot",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "action",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 30,
+        "risk_level": "low",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 2},
+        "sudo_wrapper": WRAPPERS["redis.ensure_config_snapshot"],
+    },
+    "redis.restart": {
+        "command_id": "redis.restart",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "action",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 30,
+        "risk_level": "low",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 2},
+        "sudo_wrapper": WRAPPERS["redis.restart"],
+    },
+    "redis.reload": {
+        "command_id": "redis.reload",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "action",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 30,
+        "risk_level": "low",
+        "idempotent": False,
+        "retry_policy": {"max_attempts": 1},
+        "sudo_wrapper": WRAPPERS["redis.reload"],
+    },
+    "redis.restore_known_good_config": {
+        "command_id": "redis.restore_known_good_config",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "action",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 60,
+        "risk_level": "medium",
+        "idempotent": False,
+        "retry_policy": {"max_attempts": 1},
+        "sudo_wrapper": WRAPPERS["redis.restore_known_good_config"],
+    },
+    # ── Docker Container ──────────────────────────────────────
+    "docker.container_status": {
+        "command_id": "docker.container_status",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "probe",
+        "args_schema": {"container": "string"},
+        "arg_allowlist": {"container": DOCKER_ALLOWED_CONTAINERS},
+        "timeout_seconds": 10,
+        "risk_level": "low",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 3},
+        "sudo_wrapper": None,
+    },
+    "docker.container_restart": {
+        "command_id": "docker.container_restart",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "action",
+        "args_schema": {"container": "string"},
+        "arg_allowlist": {"container": DOCKER_ALLOWED_CONTAINERS},
+        "timeout_seconds": 60,
+        "risk_level": "medium",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 2},
+        "sudo_wrapper": WRAPPERS["docker.container_restart"],
+    },
+    "docker.container_start": {
+        "command_id": "docker.container_start",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "action",
+        "args_schema": {"container": "string"},
+        "arg_allowlist": {"container": DOCKER_ALLOWED_CONTAINERS},
+        "timeout_seconds": 60,
+        "risk_level": "medium",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 2},
+        "sudo_wrapper": WRAPPERS["docker.container_start"],
+    },
+    # ── MySQL / MariaDB ───────────────────────────────────────
+    "mysql.status": {
+        "command_id": "mysql.status",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "probe",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 10,
+        "risk_level": "low",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 3},
+        "sudo_wrapper": None,
+    },
+    "mysql.connection_test": {
+        "command_id": "mysql.connection_test",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "probe",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 10,
+        "risk_level": "low",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 3},
+        "sudo_wrapper": None,
+    },
+    "mysql.config_test": {
+        "command_id": "mysql.config_test",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "probe",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 15,
+        "risk_level": "low",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 3},
+        "sudo_wrapper": WRAPPERS["mysql.config_test"],
+    },
+    "mysql.ensure_config_snapshot": {
+        "command_id": "mysql.ensure_config_snapshot",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "action",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 30,
+        "risk_level": "low",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 2},
+        "sudo_wrapper": WRAPPERS["mysql.ensure_config_snapshot"],
+    },
+    "mysql.restart": {
+        "command_id": "mysql.restart",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "action",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 60,
+        "risk_level": "medium",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 2},
+        "sudo_wrapper": WRAPPERS["mysql.restart"],
+    },
+    "mysql.reload": {
+        "command_id": "mysql.reload",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "action",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 30,
+        "risk_level": "low",
+        "idempotent": False,
+        "retry_policy": {"max_attempts": 1},
+        "sudo_wrapper": WRAPPERS["mysql.reload"],
+    },
+    "mysql.restore_known_good_config": {
+        "command_id": "mysql.restore_known_good_config",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "action",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 60,
+        "risk_level": "medium",
+        "idempotent": False,
+        "retry_policy": {"max_attempts": 1},
+        "sudo_wrapper": WRAPPERS["mysql.restore_known_good_config"],
+    },
 }
 
 
@@ -330,6 +560,13 @@ def validate_args(meta: Dict[str, Any], args: Dict[str, Any]):
             raise HTTPException(status_code=400, detail={"status": "blocked", "reason": "url_not_allowed"})
         if expected_status not in meta["arg_allowlist"]["expected_status"]:
             raise HTTPException(status_code=400, detail={"status": "blocked", "reason": "status_not_allowed"})
+    elif meta["command_id"] in ("docker.container_restart", "docker.container_start", "docker.container_status"):
+        container = args.get("container", "")
+        allowed = meta["arg_allowlist"].get("container", [])
+        if not container:
+            raise HTTPException(status_code=400, detail={"status": "blocked", "reason": "missing_container_name"})
+        if container not in allowed:
+            raise HTTPException(status_code=400, detail={"status": "blocked", "reason": "container_not_allowed"})
     elif args:
         raise HTTPException(status_code=400, detail={"status": "blocked", "reason": "args_not_allowed"})
 
@@ -340,16 +577,34 @@ def run_command(meta: Dict[str, Any], args: Dict[str, Any]):
         return nginx_status(meta["timeout_seconds"])
     if command_id == "nginx.http_check":
         return nginx_http_check(args, meta["timeout_seconds"])
-    if command_id in ("nginx.config_test", "postgresql.config_test"):
+    if command_id in ("nginx.config_test", "postgresql.config_test", "redis.config_test", "mysql.config_test"):
         return exec_cmd(["sudo", "-n", meta["sudo_wrapper"]], meta["timeout_seconds"], retryable=True)
     if command_id == "system.journal_tail":
         unit = args.get("unit", "nginx")
         lines = str(int(args.get("lines", 80)))
         return exec_cmd(["journalctl", "-u", unit, "-n", lines, "--no-pager"], meta["timeout_seconds"], retryable=True)
+    # Service status probes
     if command_id == "postgresql.status":
         return service_status("postgresql", meta["timeout_seconds"])
     if command_id == "postgresql.connection_test":
         return postgresql_connection_test(meta["timeout_seconds"])
+    if command_id == "redis.status":
+        svc = "redis-server" if _service_exists("redis-server") else "redis"
+        return service_status(svc, meta["timeout_seconds"])
+    if command_id == "redis.ping":
+        return redis_ping(meta["timeout_seconds"])
+    if command_id == "mysql.status":
+        svc = "mysql" if _service_exists("mysql") else "mariadb"
+        return service_status(svc, meta["timeout_seconds"])
+    if command_id == "mysql.connection_test":
+        return mysql_connection_test(meta["timeout_seconds"])
+    # Docker container probes/actions (pass container name as argument to wrapper)
+    if command_id == "docker.container_status":
+        container = args.get("container", "")
+        return docker_container_status(container, meta["timeout_seconds"])
+    if command_id in ("docker.container_restart", "docker.container_start"):
+        container = args.get("container", "")
+        return exec_cmd(["sudo", "-n", meta["sudo_wrapper"], container], meta["timeout_seconds"], retryable=False)
 
     wrapper = meta["sudo_wrapper"]
     return exec_cmd(["sudo", "-n", wrapper], meta["timeout_seconds"], retryable=False)
@@ -486,6 +741,82 @@ def postgresql_connection_test(timeout: int):
             "retryable": not accepting,
         }
         if not accepting:
+            raise HTTPException(status_code=500, detail=payload)
+        return payload
+    except subprocess.TimeoutExpired as e:
+        raise HTTPException(status_code=504, detail={"status": "timeout", "stdout": e.stdout, "stderr": e.stderr, "retryable": True})
+
+
+def _service_exists(service: str) -> bool:
+    try:
+        r = subprocess.run(["systemctl", "cat", service], capture_output=True, timeout=5, check=False)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def redis_ping(timeout: int):
+    try:
+        completed = subprocess.run(
+            ["redis-cli", "ping"], capture_output=True, text=True, timeout=timeout, check=False,
+        )
+        pong = completed.stdout.strip() == "PONG"
+        payload = {
+            "status": "success" if pong else "failed",
+            "returncode": completed.returncode,
+            "stdout": completed.stdout[-4000:],
+            "stderr": completed.stderr[-4000:],
+            "checks": {"pong": pong},
+            "retryable": not pong,
+        }
+        if not pong:
+            raise HTTPException(status_code=500, detail=payload)
+        return payload
+    except subprocess.TimeoutExpired as e:
+        raise HTTPException(status_code=504, detail={"status": "timeout", "stdout": e.stdout, "stderr": e.stderr, "retryable": True})
+
+
+def mysql_connection_test(timeout: int):
+    try:
+        completed = subprocess.run(
+            ["mysqladmin", "-u", "root", "--connect-timeout=5", "ping"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+        ok = completed.returncode == 0
+        payload = {
+            "status": "success" if ok else "failed",
+            "returncode": completed.returncode,
+            "stdout": completed.stdout[-4000:],
+            "stderr": completed.stderr[-4000:],
+            "checks": {"accepting_connections": ok},
+            "retryable": not ok,
+        }
+        if not ok:
+            raise HTTPException(status_code=500, detail=payload)
+        return payload
+    except subprocess.TimeoutExpired as e:
+        raise HTTPException(status_code=504, detail={"status": "timeout", "stdout": e.stdout, "stderr": e.stderr, "retryable": True})
+
+
+def docker_container_status(container: str, timeout: int):
+    try:
+        completed = subprocess.run(
+            ["docker", "inspect", "--format", "{{.State.Status}}", container],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+        state = completed.stdout.strip()
+        running = state == "running"
+        payload = {
+            "status": "success" if running else "failed",
+            "returncode": completed.returncode,
+            "container": container,
+            "state": state or "unknown",
+            "stdout": completed.stdout[-4000:],
+            "stderr": completed.stderr[-4000:],
+            "checks": {"running": running},
+            "retryable": not running,
+        }
+        if not running:
             raise HTTPException(status_code=500, detail=payload)
         return payload
     except subprocess.TimeoutExpired as e:

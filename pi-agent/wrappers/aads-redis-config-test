@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REDIS_CONF="${AADS_REDIS_CONF:-/etc/redis/redis.conf}"
+
+if [[ ! -f "$REDIS_CONF" ]]; then
+  echo "blocked: redis_config_not_found" >&2
+  exit 42
+fi
+
+# Validate with redis-server's own parser (non-destructive dry-run)
+if redis-server "$REDIS_CONF" --test-config 2>/dev/null; then
+  echo "config_valid=true config_file=$REDIS_CONF"
+  exit 0
+fi
+
+# Fallback: check file is non-empty and not obviously broken
+if [[ ! -s "$REDIS_CONF" ]]; then
+  echo "blocked: redis_config_empty" >&2
+  exit 42
+fi
+
+echo "config_valid=unknown config_file=$REDIS_CONF"

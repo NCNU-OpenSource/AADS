@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SNAPSHOT_DIR="${AADS_REDIS_SNAPSHOT_DIR:-/var/lib/aads-agent/snapshots/redis}"
+REDIS_CONF="${AADS_REDIS_CONF:-/etc/redis/redis.conf}"
+
+if [[ ! -f "$SNAPSHOT_DIR/redis.conf" ]]; then
+  echo "blocked: no_snapshot" >&2
+  exit 42
+fi
+
+# Back up current (broken) config
+PREVIOUS_DIR="/var/lib/aads-agent/snapshots/redis-previous-$(date +%Y%m%d%H%M%S)"
+mkdir -p "$PREVIOUS_DIR"
+cp -a "$REDIS_CONF" "$PREVIOUS_DIR/redis.conf" 2>/dev/null || true
+
+# Apply known-good snapshot
+cp -a "$SNAPSHOT_DIR/redis.conf" "$REDIS_CONF"
+
+# Restart to pick up new config; roll back on failure
+if ! (systemctl restart redis-server 2>/dev/null || systemctl restart redis); then
+  cp -a "$PREVIOUS_DIR/redis.conf" "$REDIS_CONF" 2>/dev/null || true
+  systemctl restart redis-server 2>/dev/null || systemctl restart redis || true
+  echo "blocked: restart_failed_after_restore" >&2
+  exit 43
+fi
+
+echo "config_restored=true"

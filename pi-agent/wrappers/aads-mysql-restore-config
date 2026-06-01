@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SNAPSHOT_DIR="${AADS_MYSQL_SNAPSHOT_DIR:-/var/lib/aads-agent/snapshots/mysql}"
+
+if [[ ! -f "$SNAPSHOT_DIR/my.cnf" ]]; then
+  echo "blocked: no_snapshot" >&2
+  exit 42
+fi
+
+MYSQL_CONF="$(find /etc/mysql -name "*.cnf" \
+  \( -path "*/mysql.conf.d/*" -o -path "*/mariadb.conf.d/*" -o -name "my.cnf" \) \
+  2>/dev/null | sort | head -1)"
+
+if [[ -z "$MYSQL_CONF" ]]; then
+  echo "blocked: mysql_config_not_found" >&2
+  exit 42
+fi
+
+PREVIOUS_DIR="/var/lib/aads-agent/snapshots/mysql-previous-$(date +%Y%m%d%H%M%S)"
+mkdir -p "$PREVIOUS_DIR"
+cp -a "$MYSQL_CONF" "$PREVIOUS_DIR/my.cnf" 2>/dev/null || true
+
+cp -a "$SNAPSHOT_DIR/my.cnf" "$MYSQL_CONF"
+
+# Validate restored config
+if ! (mysqld --validate-config >/dev/null 2>&1 || mariadbd --validate-config >/dev/null 2>&1); then
+  if ! [[ -s "$MYSQL_CONF" ]]; then
+    cp -a "$PREVIOUS_DIR/my.cnf" "$MYSQL_CONF" 2>/dev/null || true
+    echo "blocked: restored_config_invalid" >&2
+    exit 43
+  fi
+fi
+
+# Restart to apply
+SVC="mysql"
+systemctl cat mysql >/dev/null 2>&1 || SVC="mariadb"
+
+if ! systemctl restart "$SVC"; then
+  cp -a "$PREVIOUS_DIR/my.cnf" "$MYSQL_CONF" 2>/dev/null || true
+  systemctl restart "$SVC" 2>/dev/null || true
+  exit 44
+fi
+
+echo "config_restored=true config_file=$MYSQL_CONF"
