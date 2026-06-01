@@ -19,7 +19,7 @@ services:
       - loki-data:/loki       # 持久化儲存
     command: -config.file=/etc/loki/local-config.yaml
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:3100/ready || exit 1"]
+      test: ["CMD", "/usr/bin/loki", "-version"]
       interval: 10s
       timeout: 5s
       retries: 10          # Increased retries
@@ -92,6 +92,8 @@ services:
   dcgm-exporter:
     image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.8-3.6.0-ubuntu22.04
     container_name: dcgm-exporter
+    profiles:
+      - gpu
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -169,7 +171,7 @@ services:
       # Loki configuration
       - LOKI_URL=http://loki:3100
       - LOKI_TENANT=raw
-      - LOKI_QUERY={source="docker", container!="layer1-filter"}
+      - LOKI_QUERY=${LAYER1_LOKI_QUERY}
       - POLL_INTERVAL=10             # Poll every 10 seconds
 
       # Database configuration
@@ -182,18 +184,13 @@ services:
       # LogBERT configuration
       - ANOMALY_THRESHOLD=${ANOMALY_THRESHOLD:-0.5}
       - BATCH_SIZE=${BATCH_SIZE:-50}
+      - AADS_NODE_ID=${AADS_NODE_ID:-controller}
+      - ENABLE_PATTERN_FILTER=${ENABLE_PATTERN_FILTER:-true}
+      - ENABLE_LOGBERT_FILTER=${ENABLE_LOGBERT_FILTER:-true}
+      - INITIAL_LOOKBACK_SECONDS=${INITIAL_LOOKBACK_SECONDS:-300}
 
-      # GPU configuration
-      - NVIDIA_VISIBLE_DEVICES=all
     volumes:
       - ./logbert/models:/app/models  # Reuse LogBERT model files
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ['0']       # Use GPU 0
-              capabilities: [gpu]
     depends_on:
       loki:
         condition: service_started
@@ -225,7 +222,7 @@ services:
       - observability
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -270,6 +267,7 @@ services:
       - DB_NAME=logdb
       - DB_USER=logdb
       - DB_PASSWORD=${TIMESCALEDB_PASSWORD:-logdb_password}
+      - AADS_NODE_ID=${AADS_NODE_ID:-controller}
       - POLL_INTERVAL=60          # 每 60 秒拉取一次
       - BATCH_SIZE=1000           # 每次拉取最多 1000 條
     depends_on:
@@ -302,15 +300,19 @@ services:
       - BATCH_SIZE=50
       # Aggregator
       - TIME_WINDOW_MINUTES=5
-      - MIN_CLUSTER_SIZE=2
+      - MIN_CLUSTER_SIZE=${MIN_CLUSTER_SIZE:-1}
       # Metrics
       - PROMETHEUS_URL=http://prometheus:9090
       # LLM
       - LLM_PROVIDER=${LLM_PROVIDER:-openai_compatible}
-      - LLM_BASE_URL=${LLM_BASE_URL:-https://api.openai.com/v1}
-      - LLM_API_KEY=${LLM_API_KEY}
-      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - LLM_BASE_URL=http://litellm:4000/v1
+      - LLM_API_KEY=${LITELLM_MASTER_KEY:-sk-aads-dev}
+      - LLM_MODEL=${LITELLM_MODEL:-gpt-5.5}
       - LLM_STRATEGY=${LLM_STRATEGY:-cascade}
+      - AADS_DEFAULT_NODE_ID=${AADS_DEFAULT_NODE_ID:-target-ubuntu}
+      - AADS_NODE_ENVIRONMENT=${AADS_NODE_ENVIRONMENT:-test}
+      - AADS_FORCE_GATE_APPROVAL=${AADS_FORCE_GATE_APPROVAL:-false}
+      - ENABLE_DIAGNOSIS_REUSE=${ENABLE_DIAGNOSIS_REUSE:-false}
       # Ollama (optional)
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://ollama:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2:3b}
@@ -330,6 +332,51 @@ services:
         condition: service_healthy
       prometheus:
         condition: service_started
+      litellm:
+        condition: service_started
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # ============================================
+  # LiteLLM - OpenAI-compatible LLM gateway
+  # ============================================
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: litellm
+    ports:
+      - "4000:4000"
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-aads-dev}
+      - AADS_LITELLM_UPSTREAM_API_BASE=${AADS_LITELLM_UPSTREAM_API_BASE:-https://api.openai.com/v1}
+      - AADS_LITELLM_UPSTREAM_API_KEY=${AADS_LITELLM_UPSTREAM_API_KEY:-}
+      - LITELLM_LOG=INFO
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--host", "0.0.0.0", "--port", "4000"]
+    networks:
+      - observability
+    restart: unless-stopped
+
+  # ============================================
+  # Knowledge Agent - deterministic FixingPlan execution
+  # ============================================
+  layer4-executor:
+    build: ./layer4-executor
+    container_name: layer4-executor
+    environment:
+      - DB_HOST=timescaledb
+      - DB_PORT=5432
+      - DB_NAME=logdb
+      - DB_USER=logdb
+      - DB_PASSWORD=${TIMESCALEDB_PASSWORD:-logdb_password}
+      - PI_AGENT_TOKEN=${PI_AGENT_TOKEN}
+      - EXECUTOR_POLL_INTERVAL=${EXECUTOR_POLL_INTERVAL:-5}
+      - NODE_LOCK_TTL_SECONDS=${NODE_LOCK_TTL_SECONDS:-120}
+      - ENABLE_KNOWLEDGE_BASE=${ENABLE_KNOWLEDGE_BASE:-false}
+    depends_on:
+      timescaledb:
+        condition: service_healthy
     networks:
       - observability
     restart: unless-stopped
@@ -349,6 +396,8 @@ services:
       - DB_NAME=logdb
       - DB_USER=logdb
       - DB_PASSWORD=${TIMESCALEDB_PASSWORD:-logdb_password}
+      - AADS_ADMIN_API_KEY=${AADS_ADMIN_API_KEY:-change-me-admin-key}
+      - AADS_IDEMPOTENCY_TTL_MINUTES=${AADS_IDEMPOTENCY_TTL_MINUTES:-30}
     depends_on:
       timescaledb:
         condition: service_healthy

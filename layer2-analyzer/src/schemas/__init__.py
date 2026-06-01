@@ -1,11 +1,20 @@
 """
 Layer 2 Output Schemas
 
-Primary: ClaudeStylePlan (Claude Code Plan Mode style)
+Primary executable: FixingPlan (Three-Agent strict sequence)
+Legacy display: ClaudeStylePlan (Claude Code Plan Mode style)
 Legacy: ActionPlan, ActionStep (backward compatibility)
 """
 from schemas.action_plan import (
-    # New Claude Style Plan
+    # Executable v2 schemas
+    RootCauseEvidence,
+    RootCauseReport,
+    VerificationSpec,
+    PreExecutionSnapshot,
+    FixingPlanStep,
+    PlanSelfCheck,
+    FixingPlan,
+    # Legacy Claude Style Plan
     StepCommand,
     ExecutionStep,
     ClaudeStylePlan,
@@ -15,6 +24,13 @@ from schemas.action_plan import (
 )
 
 __all__ = [
+    "RootCauseEvidence",
+    "RootCauseReport",
+    "VerificationSpec",
+    "PreExecutionSnapshot",
+    "FixingPlanStep",
+    "PlanSelfCheck",
+    "FixingPlan",
     "StepCommand",
     "ExecutionStep",
     "ClaudeStylePlan",

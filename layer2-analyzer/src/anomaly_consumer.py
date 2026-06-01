@@ -116,8 +116,8 @@ class AnomalyConsumer:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT id, time, container, service, compose_project,
-                       raw_message, template, anomaly_score, filter_stage, labels
+                SELECT id, time, node_id, container, service, compose_project,
+                       raw_message, template, anomaly_score, filter_stage, labels, dedup_key
                 FROM anomaly_logs
                 WHERE id > $1
                 ORDER BY id ASC

@@ -9,8 +9,9 @@ Writes anomaly logs to the anomaly_logs table for:
 import asyncio
 import json
 import logging
+import hashlib
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncpg
 
 from filters.base import FilterResult
@@ -123,29 +124,42 @@ class AnomalyStore:
                     if isinstance(timestamp, str):
                         # Try parsing nanoseconds timestamp
                         try:
-                            timestamp = datetime.fromtimestamp(int(timestamp) / 1e9)
+                            timestamp = datetime.fromtimestamp(int(timestamp) / 1e9, tz=timezone.utc)
                         except (ValueError, OverflowError):
-                            timestamp = datetime.utcnow()
+                            timestamp = datetime.now(timezone.utc)
                     elif timestamp is None:
-                        timestamp = datetime.utcnow()
+                        timestamp = datetime.now(timezone.utc)
 
                     # Extract fields
                     container = log.get('labels', {}).get('container', log.get('container', ''))
                     service = log.get('labels', {}).get('compose_service', log.get('service', ''))
                     compose_project = log.get('labels', {}).get('compose_project', log.get('compose_project', ''))
+                    node_id = log.get('node_id') or log.get('labels', {}).get('node_id', 'controller')
                     raw_message = log.get('message', '')
-                    template = log.get('template', '')
+                    template = log.get('template') or self._template_from_message(raw_message)
+                    dedup_key = self._dedup_key(node_id, service or container, template, timestamp)
 
                     # Insert into database
-                    await conn.execute(
+                    status = await conn.execute(
                         """
                         INSERT INTO anomaly_logs
-                        (time, container, service, compose_project, raw_message, template,
-                         anomaly_score, filter_stage, labels)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                        ON CONFLICT DO NOTHING
+                        (time, node_id, container, service, compose_project, raw_message, template,
+                         anomaly_score, filter_stage, filter_metadata, labels, dedup_key,
+                         first_seen, last_seen)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $1, $1)
+                        ON CONFLICT (dedup_key) DO UPDATE SET
+                            occurrence_count = anomaly_logs.occurrence_count + 1,
+                            last_seen = GREATEST(anomaly_logs.last_seen, EXCLUDED.last_seen),
+                            anomaly_score = GREATEST(anomaly_logs.anomaly_score, EXCLUDED.anomaly_score),
+                            filter_stage = CASE
+                                WHEN anomaly_logs.filter_stage = EXCLUDED.filter_stage THEN anomaly_logs.filter_stage
+                                ELSE anomaly_logs.filter_stage || '+' || EXCLUDED.filter_stage
+                            END,
+                            filter_metadata = anomaly_logs.filter_metadata || EXCLUDED.filter_metadata,
+                            labels = anomaly_logs.labels || EXCLUDED.labels
                         """,
                         timestamp,
+                        node_id,
                         container,
                         service,
                         compose_project,
@@ -153,10 +167,15 @@ class AnomalyStore:
                         template,
                         result.anomaly_score,
                         result.filter_stage,
-                        json.dumps(log.get('labels', {}))
+                        json.dumps(result.metadata or {}),
+                        json.dumps(log.get('labels', {})),
+                        dedup_key,
                     )
 
-                    written_count += 1
+                    if status == "INSERT 0 1":
+                        written_count += 1
+                    else:
+                        duplicate_count += 1
 
                 except asyncpg.UniqueViolationError:
                     duplicate_count += 1
@@ -175,6 +194,19 @@ class AnomalyStore:
         )
 
         return written_count
+
+    def _template_from_message(self, message: str) -> str:
+        """Create a stable coarse template without introducing a parser dependency."""
+        import re
+
+        normalized = re.sub(r"\b\d+\b", "<num>", message or "")
+        normalized = re.sub(r"0x[0-9a-fA-F]+", "<hex>", normalized)
+        return normalized[:200]
+
+    def _dedup_key(self, node_id: str, service: str, template: str, timestamp: datetime) -> str:
+        minute_bucket = timestamp.replace(second=0, microsecond=0).isoformat()
+        raw_key = f"{node_id}|{service}|{template}|{minute_bucket}"
+        return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
     async def store_batch(self, results: List[FilterResult]) -> int:
         """Alias for store_anomalies for compatibility"""

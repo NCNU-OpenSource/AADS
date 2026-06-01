@@ -135,7 +135,7 @@ def planner_node(state: AgentState) -> dict:
         base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
         temperature=0.1  # Lower temperature for more deterministic output
     )
-    structured_llm = llm.with_structured_output(ClaudeStylePlan)
+    structured_llm = llm.with_structured_output(ClaudeStylePlan, method="function_calling")
 
     # Build final prompt for planning
     planning_prompt = """

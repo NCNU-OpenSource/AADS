@@ -8,7 +8,9 @@ ADDS FastAPI Ingester Service
 - 寫入 PostgreSQL anomaly_logs 表
 """
 
+import hashlib
 import os
+import re
 from datetime import datetime
 from typing import List, Optional
 
@@ -52,10 +54,14 @@ class AnomalyLog(BaseModel):
     """
 
     timestamp: datetime = Field(..., description="Log timestamp")
+    node_id: str = Field(default="controller", description="AADS node id")
     service: str = Field(..., description="Service name")
+    container: str = Field(default="", description="Container name")
     log_message: str = Field(..., description="Raw log message")
-    logbert_anomaly_score: float = Field(..., description="LogBERT anomaly score")
-    level: str = Field(default="INFO", description="Log level")
+    template: str = Field(default="", description="Normalized log template")
+    anomaly_score: float = Field(default=1.0, description="Canonical anomaly score")
+    logbert_anomaly_score: Optional[float] = Field(default=None, description="Legacy LogBERT anomaly score")
+    filter_stage: str = Field(default="ingester", description="Filter stage")
     is_anomaly: bool = Field(default=True, description="Is anomaly flag")
 
 
@@ -152,27 +158,34 @@ async def create_anomaly(log: AnomalyLog):
 
     try:
         async with db_pool.acquire() as conn:
+            template = log.template or _template_from_message(log.log_message)
+            score = log.logbert_anomaly_score if log.logbert_anomaly_score is not None else log.anomaly_score
+            dedup_key = _dedup_key(log.node_id, log.service or log.container, template, log.timestamp)
             query = """
                 INSERT INTO anomaly_logs (
-                    timestamp,
-                    service,
-                    log_message,
-                    logbert_anomaly_score,
-                    level,
-                    is_anomaly
+                    time, node_id, container, service, raw_message, template,
+                    anomaly_score, filter_stage, dedup_key, first_seen, last_seen
                 )
-                VALUES ($1, $2, $3, $4, $5, $6)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $1, $1)
+                ON CONFLICT (dedup_key) DO UPDATE SET
+                    occurrence_count = anomaly_logs.occurrence_count + 1,
+                    last_seen = GREATEST(anomaly_logs.last_seen, EXCLUDED.last_seen),
+                    anomaly_score = GREATEST(anomaly_logs.anomaly_score, EXCLUDED.anomaly_score),
+                    filter_stage = anomaly_logs.filter_stage || '+' || EXCLUDED.filter_stage
                 RETURNING id
             """
 
             log_id = await conn.fetchval(
                 query,
                 log.timestamp,
+                log.node_id,
+                log.container,
                 log.service,
                 log.log_message,
-                log.logbert_anomaly_score,
-                log.level,
-                log.is_anomaly,
+                template,
+                score,
+                log.filter_stage,
+                dedup_key,
             )
 
             return {
@@ -211,25 +224,34 @@ async def create_anomaly_batch(batch: AnomalyBatch):
             async with conn.transaction():
                 query = """
                     INSERT INTO anomaly_logs (
-                        timestamp,
-                        service,
-                        log_message,
-                        logbert_anomaly_score,
-                        level,
-                        is_anomaly
+                        time, node_id, container, service, raw_message, template,
+                        anomaly_score, filter_stage, dedup_key, first_seen, last_seen
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $1, $1)
+                    ON CONFLICT (dedup_key) DO UPDATE SET
+                        occurrence_count = anomaly_logs.occurrence_count + 1,
+                        last_seen = GREATEST(anomaly_logs.last_seen, EXCLUDED.last_seen),
+                        anomaly_score = GREATEST(anomaly_logs.anomaly_score, EXCLUDED.anomaly_score),
+                        filter_stage = anomaly_logs.filter_stage || '+' || EXCLUDED.filter_stage
                 """
 
                 # Prepare batch data
                 batch_data = [
                     (
                         log.timestamp,
+                        log.node_id,
+                        log.container,
                         log.service,
                         log.log_message,
-                        log.logbert_anomaly_score,
-                        log.level,
-                        log.is_anomaly,
+                        log.template or _template_from_message(log.log_message),
+                        log.logbert_anomaly_score if log.logbert_anomaly_score is not None else log.anomaly_score,
+                        log.filter_stage,
+                        _dedup_key(
+                            log.node_id,
+                            log.service or log.container,
+                            log.template or _template_from_message(log.log_message),
+                            log.timestamp,
+                        ),
                     )
                     for log in batch.logs
                 ]
@@ -247,6 +269,18 @@ async def create_anomaly_batch(batch: AnomalyBatch):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to insert batch anomaly logs: {str(e)}",
         )
+
+
+def _template_from_message(message: str) -> str:
+    normalized = re.sub(r"\b\d+\b", "<num>", message or "")
+    normalized = re.sub(r"0x[0-9a-fA-F]+", "<hex>", normalized)
+    return normalized[:200]
+
+
+def _dedup_key(node_id: str, service: str, template: str, timestamp: datetime) -> str:
+    minute_bucket = timestamp.replace(second=0, microsecond=0).isoformat()
+    raw_key = f"{node_id}|{service}|{template}|{minute_bucket}"
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
 # ============================================

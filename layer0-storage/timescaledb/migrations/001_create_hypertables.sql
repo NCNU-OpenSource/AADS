@@ -1,94 +1,21 @@
--- ============================================
--- ADDS TimescaleDB Migration 001
--- 目的：建立 Hypertables（時間分區表）
--- 參考：https://docs.timescale.com/use-timescale/latest/hypertables/
--- ============================================
-
--- ============================================
--- 1. 檢查 TimescaleDB 擴展
--- ============================================
+-- Compatibility migration: keep hypertables and indexes aligned with the
+-- canonical time column. Older versions referenced a non-existent timestamp
+-- column, which broke fresh initialization.
+--
+-- anomaly_logs intentionally remains a relational table in v1 so
+-- UNIQUE(dedup_key) can support Layer 1 first-write-wins deduplication.
 
 CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
 
--- ============================================
--- 2. 建立 raw_logs Hypertable
--- ============================================
+SELECT create_hypertable('raw_logs', 'time', chunk_time_interval => INTERVAL '1 day', if_not_exists => TRUE);
 
--- 如果表格已存在，先轉換為 Hypertable
-SELECT create_hypertable(
-    'raw_logs',
-    'timestamp',
-    chunk_time_interval => INTERVAL '1 day',
-    if_not_exists => TRUE
-);
+CREATE INDEX IF NOT EXISTS idx_raw_logs_time ON raw_logs(time DESC);
+CREATE INDEX IF NOT EXISTS idx_raw_logs_node_time ON raw_logs(node_id, time DESC);
+CREATE INDEX IF NOT EXISTS idx_raw_logs_service_time ON raw_logs(service, time DESC);
 
--- 建立索引以提升查詢效能
-CREATE INDEX IF NOT EXISTS idx_raw_logs_timestamp ON raw_logs (timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_raw_logs_service ON raw_logs (service, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_raw_logs_level ON raw_logs (level, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_anomaly_logs_time ON anomaly_logs(time DESC);
+CREATE INDEX IF NOT EXISTS idx_anomaly_logs_node_time ON anomaly_logs(node_id, time DESC);
+CREATE INDEX IF NOT EXISTS idx_anomaly_logs_service_time ON anomaly_logs(service, time DESC);
+CREATE INDEX IF NOT EXISTS idx_anomaly_logs_score ON anomaly_logs(anomaly_score DESC);
 
--- ============================================
--- 3. 建立 anomaly_logs Hypertable
--- ============================================
-
-SELECT create_hypertable(
-    'anomaly_logs',
-    'timestamp',
-    chunk_time_interval => INTERVAL '1 day',
-    if_not_exists => TRUE
-);
-
--- 建立索引
-CREATE INDEX IF NOT EXISTS idx_anomaly_logs_timestamp ON anomaly_logs (timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_anomaly_logs_service ON anomaly_logs (service, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_anomaly_logs_logbert_score ON anomaly_logs (logbert_anomaly_score DESC);
-
--- ============================================
--- 4. 建立 diagnosis_reports Hypertable
--- ============================================
-
-SELECT create_hypertable(
-    'diagnosis_reports',
-    'created_at',
-    chunk_time_interval => INTERVAL '1 day',
-    if_not_exists => TRUE
-);
-
--- 建立索引
-CREATE INDEX IF NOT EXISTS idx_diagnosis_reports_created_at ON diagnosis_reports (created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_diagnosis_reports_layer ON diagnosis_reports (layer, created_at DESC);
-
--- ============================================
--- 5. 建立 knowledge_cases Hypertable
--- ============================================
-
-SELECT create_hypertable(
-    'knowledge_cases',
-    'created_at',
-    chunk_time_interval => INTERVAL '7 days',
-    if_not_exists => TRUE
-);
-
--- 建立索引
-CREATE INDEX IF NOT EXISTS idx_knowledge_cases_created_at ON knowledge_cases (created_at DESC);
-
--- ============================================
--- 6. 顯示 Hypertables 資訊
--- ============================================
-
-SELECT * FROM timescaledb_information.hypertables;
-
--- ============================================
--- 註解說明：
--- ============================================
--- 1. chunk_time_interval 決定分區大小
---    - raw_logs / anomaly_logs: 1 天（高頻寫入）
---    - diagnosis_reports: 1 天（中頻寫入）
---    - knowledge_cases: 7 天（低頻寫入）
---
--- 2. 索引策略：
---    - 時間戳降序索引（最新資料優先）
---    - 複合索引（service + timestamp）加速過濾查詢
---
--- 3. 執行方式：
---    psql -U postgres -d adds -f 001_create_hypertables.sql
+SELECT hypertable_name FROM timescaledb_information.hypertables ORDER BY hypertable_name;

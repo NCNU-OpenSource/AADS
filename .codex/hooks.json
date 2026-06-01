@@ -1,0 +1,37 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/bs10081/Developer/AADS/.codex/hooks/post-edit-sync.sh",
+            "statusMessage": "Checking Obsidian sync..."
+          }
+        ],
+        "matcher": "Edit"
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/bs10081/Developer/AADS/.codex/hooks/post-edit-sync.sh",
+            "statusMessage": "Checking Obsidian sync..."
+          }
+        ],
+        "matcher": "Write"
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/bs10081/Developer/AADS/.codex/hooks/stop-drift-check.sh",
+            "statusMessage": "Running architecture drift check..."
+          }
+        ]
+      }
+    ]
+  }
+}

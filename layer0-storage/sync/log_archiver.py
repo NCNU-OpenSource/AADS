@@ -86,7 +86,7 @@ class LogArchiver:
         end_ns = int(end_time.timestamp() * 1e9)
 
         # LogQL query - get all logs from raw tenant
-        query = '{job="docker"}'
+        query = '{source=~"docker|target-nginx|target-syslog"}'
 
         url = f"{self.loki_url}/loki/api/v1/query_range"
         params = {
@@ -117,6 +117,7 @@ class LogArchiver:
                             timestamp_ns, message = entry
                             logs.append({
                                 'time': datetime.fromtimestamp(int(timestamp_ns) / 1e9),
+                                'node_id': labels.get('node_id', os.getenv('AADS_NODE_ID', 'controller')),
                                 'container': labels.get('container', ''),
                                 'service': labels.get('compose_service', ''),
                                 'compose_project': labels.get('compose_project', ''),
@@ -143,12 +144,12 @@ class LogArchiver:
             # Prepare data for batch insert
             await conn.executemany(
                 """
-                INSERT INTO raw_logs (time, container, service, compose_project, source, message, labels)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (time, container) DO NOTHING
+                INSERT INTO raw_logs (time, node_id, container, service, compose_project, source, message, labels)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 """,
                 [(
                     log['time'],
+                    log['node_id'],
                     log['container'],
                     log['service'],
                     log['compose_project'],

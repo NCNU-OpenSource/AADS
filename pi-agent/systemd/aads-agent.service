@@ -1,0 +1,20 @@
+[Unit]
+Description=AADS On-Device Agent
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+User=aads-agent
+Group=aads-agent
+EnvironmentFile=/etc/aads-agent/agent.env
+WorkingDirectory=/opt/aads-agent
+ExecStart=/bin/sh -c 'exec /opt/aads-agent/venv/bin/uvicorn main:app --host "${AADS_AGENT_HOST:-0.0.0.0}" --port "${AADS_AGENT_PORT:-8090}"'
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/etc/nginx /var/lib/aads-agent /var/log/nginx /run /tmp
+
+[Install]
+WantedBy=multi-user.target

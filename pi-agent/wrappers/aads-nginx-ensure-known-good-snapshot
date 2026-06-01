@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SNAPSHOT_DIR="${AADS_NGINX_SNAPSHOT_DIR:-/var/lib/aads-agent/snapshots/nginx}"
+
+mkdir -p "$SNAPSHOT_DIR"
+
+if nginx -t >/dev/null 2>&1; then
+  if [[ -f /etc/nginx/nginx.conf ]]; then
+    cp -a /etc/nginx/nginx.conf "$SNAPSHOT_DIR/nginx.conf"
+  fi
+  if [[ -d /etc/nginx/sites-enabled ]]; then
+    rm -rf "$SNAPSHOT_DIR/sites-enabled"
+    cp -a /etc/nginx/sites-enabled "$SNAPSHOT_DIR/sites-enabled"
+  fi
+  chown -R root:aads-agent "$SNAPSHOT_DIR"
+  find "$SNAPSHOT_DIR" -type d -exec chmod 0750 {} +
+  find "$SNAPSHOT_DIR" -type f -exec chmod 0640 {} +
+  echo "snapshot_refreshed=true"
+  exit 0
+fi
+
+if [[ -f "$SNAPSHOT_DIR/nginx.conf" && -d "$SNAPSHOT_DIR/sites-enabled" ]]; then
+  echo "snapshot_refreshed=false existing_snapshot=true"
+  exit 0
+fi
+
+echo "blocked: no_snapshot" >&2
+exit 42

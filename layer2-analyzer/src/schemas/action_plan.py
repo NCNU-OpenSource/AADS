@@ -13,12 +13,133 @@ Design Philosophy (ADR-004):
 
 Related: ADR-002 Structured Output Decision, ADR-004 Claude Style Plan Design
 """
-from typing import List, Literal, Optional
-from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Literal, Optional
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ============================================================
-# NEW: Claude Code Style Plan Schema
+# EXECUTABLE: Three-Agent FixingPlan v2 schema
+# ============================================================
+
+
+class RootCauseEvidence(BaseModel):
+    """Structured evidence emitted by the On-Device Agent RCA path."""
+
+    source: Literal["log", "metric", "probe", "trace", "audit"] = Field(
+        ...,
+        description="Evidence source type"
+    )
+    summary: str = Field(..., min_length=1, description="Short evidence summary")
+    references: List[str] = Field(default_factory=list, description="Log ids, metric names, or probe ids")
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RootCauseReport(BaseModel):
+    """On-Device Agent RCA output contract."""
+
+    schema_version: str = Field(default="1.0")
+    report_id: str = Field(..., min_length=1)
+    target_node_id: str = Field(..., min_length=1)
+    affected_service: str = Field(..., min_length=1)
+    root_cause: str = Field(..., min_length=1)
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    evidence: List[RootCauseEvidence] = Field(default_factory=list)
+    recommended_capabilities: List[str] = Field(default_factory=list)
+
+
+class VerificationSpec(BaseModel):
+    """
+    Deterministic verification contract.
+
+    Verification must be executed as a catalog probe and judged from structured
+    fields, never by free text or LLM judgement.
+    """
+
+    type: Literal["catalog_probe"] = Field(default="catalog_probe")
+    command_id: str = Field(..., min_length=1)
+    schema_version: str = Field(default="1.0")
+    args: Dict[str, Any] = Field(default_factory=dict)
+    expected: Dict[str, Any] = Field(..., description="Structured expected fields")
+
+    @field_validator("expected")
+    @classmethod
+    def expected_must_be_structured(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        if not value:
+            raise ValueError("verification.expected must not be empty")
+        if "text" in value or "prompt" in value or "llm_judge" in value:
+            raise ValueError("free-text or LLM verification is not allowed")
+        return value
+
+
+class PreExecutionSnapshot(BaseModel):
+    enabled: bool = Field(default=True)
+    command_id: str = Field(default="nginx.ensure_known_good_snapshot")
+    scope: Literal["nginx_config"] = Field(default="nginx_config")
+    args: Dict[str, Any] = Field(default_factory=dict)
+    on_failure: Literal["block", "continue_if_existing"] = Field(default="block")
+
+
+class FixingPlanStep(BaseModel):
+    """Single strictly ordered executable step."""
+
+    step_id: int = Field(..., ge=1)
+    order: int = Field(..., ge=1)
+    command_id: str = Field(..., min_length=1)
+    schema_version: str = Field(default="1.0")
+    args: Dict[str, Any] = Field(default_factory=dict)
+    expected_outcome: str = Field(..., min_length=1)
+    on_failure: Literal["abort", "rollback", "continue"] = Field(default="abort")
+    verification: VerificationSpec
+
+    @model_validator(mode="after")
+    def reject_continue_for_v1(self):
+        if self.on_failure == "continue":
+            raise ValueError("on_failure=continue is reserved and disabled in v1")
+        return self
+
+
+class PlanSelfCheck(BaseModel):
+    passed: bool = Field(..., description="System Agent self-check decision")
+    rationale: str = Field(..., min_length=1)
+    checked_items: List[str] = Field(default_factory=list)
+
+
+class FixingPlan(BaseModel):
+    """
+    Executable System Agent plan for the controller-side Knowledge Agent.
+
+    This replaces ClaudeStylePlan on the executable path. The Knowledge Agent
+    must execute only this schema and must not infer additional actions.
+    """
+
+    schema_version: Literal["2.0"] = Field(default="2.0")
+    plan_id: str = Field(..., min_length=1)
+    rca_report_id: str = Field(..., min_length=1)
+    target_node_id: str = Field(..., min_length=1)
+    goal: str = Field(..., min_length=1)
+    risk_level: Literal["low", "medium", "high", "critical"] = Field(default="low")
+    environment_policy: Dict[str, Any] = Field(default_factory=dict)
+    pre_execution_snapshot: PreExecutionSnapshot = Field(default_factory=PreExecutionSnapshot)
+    steps: List[FixingPlanStep] = Field(..., min_length=1)
+    final_verification: VerificationSpec
+    self_check: PlanSelfCheck
+
+    @model_validator(mode="after")
+    def validate_order_and_policy(self):
+        orders = [step.order for step in self.steps]
+        if len(set(orders)) != len(orders):
+            raise ValueError("FixingPlan.steps order values must be unique")
+        if orders != sorted(orders):
+            raise ValueError("FixingPlan.steps must be sorted by order")
+        if self.environment_policy.get("environment") == "prod" and self.environment_policy.get("auto_execute_allowed") is True:
+            raise ValueError("prod plans cannot be auto-executable")
+        if not self.self_check.passed:
+            raise ValueError("FixingPlan self_check must pass before storage")
+        return self
+
+
+# ============================================================
+# LEGACY: Claude Code Style Plan Schema
 # ============================================================
 
 class StepCommand(BaseModel):
@@ -32,9 +153,21 @@ class StepCommand(BaseModel):
     - query_prometheus: Query Prometheus metrics using PromQL
     - execute_diagnostic_command: Run whitelisted read-only shell commands
     """
+    schema_version: str = Field(
+        default="1.0",
+        description="Command schema version understood by Layer 4"
+    )
     tool_name: str = Field(
         ...,
-        description="Tool to use: query_loki, query_prometheus, execute_diagnostic_command"
+        description="Tool to use: query_loki, query_prometheus, execute_diagnostic_command, node_agent"
+    )
+    command_id: Optional[str] = Field(
+        default=None,
+        description="Catalog command id for node_agent commands"
+    )
+    target_node_id: Optional[str] = Field(
+        default=None,
+        description="Registered target node id for node_agent commands"
     )
     target: str = Field(
         ...,
@@ -43,6 +176,18 @@ class StepCommand(BaseModel):
     command: str = Field(
         ...,
         description="Actual LogQL query, PromQL query, or shell command"
+    )
+    args: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Typed arguments for catalog commands"
+    )
+    risk_level: Literal["low", "medium", "high", "critical"] = Field(
+        default="low",
+        description="Risk level used by Layer 4 policy checks"
+    )
+    environment_policy: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Inline target environment and auto-execution policy"
     )
 
     class Config:
@@ -165,6 +310,10 @@ class ClaudeStylePlan(BaseModel):
     Key principle: Layer 4 Executor Agent is CONSTRAINED to execute only
     what's defined in execution_steps. It cannot invent new plans.
     """
+    schema_version: str = Field(
+        default="1.0",
+        description="Plan schema version; Layer 4 rejects unsupported versions"
+    )
     goal: str = Field(
         ...,
         description="One sentence summarizing the fix objective"
@@ -308,4 +457,3 @@ class ActionPlan(BaseModel):
                 }
             ]
         }
-

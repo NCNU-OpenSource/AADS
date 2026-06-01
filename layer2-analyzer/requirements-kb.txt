@@ -1,0 +1,6 @@
+# Optional vector knowledge base dependencies.
+# Install only when ENABLE_KNOWLEDGE_BASE=true; the v1 lab runtime keeps this
+# disabled so the controller VM does not pull Torch/CUDA wheels.
+chromadb==0.4.22
+sentence-transformers==2.3.1
+numpy<2.0

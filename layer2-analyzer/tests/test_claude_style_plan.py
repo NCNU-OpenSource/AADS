@@ -12,7 +12,16 @@ import os
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from schemas.action_plan import ClaudeStylePlan, ExecutionStep, StepCommand
+from schemas.action_plan import (
+    ClaudeStylePlan,
+    ExecutionStep,
+    FixingPlan,
+    FixingPlanStep,
+    PlanSelfCheck,
+    RootCauseReport,
+    StepCommand,
+    VerificationSpec,
+)
 
 
 class TestStepCommand:
@@ -28,11 +37,79 @@ class TestStepCommand:
         assert cmd.tool_name == "query_loki"
         assert cmd.target == "nginx-container"
         assert 'logfmt' in cmd.command
+        assert cmd.schema_version == "1.0"
+        assert cmd.risk_level == "low"
 
     def test_step_command_requires_all_fields(self):
         """Missing required fields should raise ValidationError"""
         with pytest.raises(ValidationError):
             StepCommand(tool_name="query_loki")  # Missing target and command
+
+
+class TestFixingPlan:
+    """Test executable FixingPlan v2 schema."""
+
+    def test_valid_fixing_plan_v2(self):
+        plan = FixingPlan(
+            plan_id="diag_1",
+            rca_report_id="rca_1",
+            target_node_id="target-1",
+            goal="Restore nginx",
+            risk_level="low",
+            environment_policy={"environment": "test", "auto_execute_allowed": True},
+            steps=[
+                FixingPlanStep(
+                    step_id=1,
+                    order=1,
+                    command_id="nginx.start",
+                    args={},
+                    expected_outcome="nginx service is active",
+                    on_failure="rollback",
+                    verification=VerificationSpec(
+                        command_id="nginx.status",
+                        expected={"status": "success", "active": True},
+                    ),
+                )
+            ],
+            final_verification=VerificationSpec(
+                command_id="nginx.http_check",
+                args={"url": "http://127.0.0.1/", "expected_status": 200},
+                expected={"status": "success", "http_status": 200},
+            ),
+            self_check=PlanSelfCheck(passed=True, rationale="catalog only"),
+        )
+        assert plan.schema_version == "2.0"
+        assert plan.steps[0].order == 1
+
+    def test_free_text_verification_rejected(self):
+        with pytest.raises(ValidationError):
+            VerificationSpec(command_id="nginx.status", expected={"text": "looks good"})
+
+    def test_continue_failure_policy_rejected_for_v1(self):
+        with pytest.raises(ValidationError):
+            FixingPlanStep(
+                step_id=1,
+                order=1,
+                command_id="nginx.start",
+                args={},
+                expected_outcome="nginx service is active",
+                on_failure="continue",
+                verification=VerificationSpec(
+                    command_id="nginx.status",
+                    expected={"status": "success", "active": True},
+                ),
+            )
+
+    def test_root_cause_report_schema(self):
+        report = RootCauseReport(
+            report_id="rca_1",
+            target_node_id="target-1",
+            affected_service="nginx",
+            root_cause="nginx stopped",
+            confidence=0.9,
+            recommended_capabilities=["nginx.start"],
+        )
+        assert report.affected_service == "nginx"
 
 
 class TestExecutionStep:
@@ -156,6 +233,7 @@ class TestClaudeStylePlan:
         assert plan.execution_steps[1].phase == "Execute"
         assert plan.execution_steps[1].requires_approval is True
         assert plan.execution_steps[2].phase == "Verify"
+        assert plan.schema_version == "1.0"
 
     def test_backward_compatibility_fields(self):
         """Backward compatibility fields should have defaults"""

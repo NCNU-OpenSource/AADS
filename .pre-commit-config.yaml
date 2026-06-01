@@ -1,0 +1,8 @@
+repos:
+  - repo: local
+    hooks:
+      - id: verify-no-spokenly
+        name: Verify active configs do not reference Spokenly
+        entry: scripts/verify-no-spokenly.sh
+        language: system
+        pass_filenames: false

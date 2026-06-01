@@ -10,12 +10,21 @@ Available filters:
 
 from .base import BaseFilter, FilterResult, PassThroughFilter
 from .rf_filter import RFFilter
-from .logbert_filter import LogBERTFilter
+from .pattern_filter import PatternFilter
+
+
+def __getattr__(name):
+    if name == "LogBERTFilter":
+        from .logbert_filter import LogBERTFilter
+
+        return LogBERTFilter
+    raise AttributeError(name)
 
 __all__ = [
     'BaseFilter',
     'FilterResult',
     'PassThroughFilter',
     'RFFilter',
-    'LogBERTFilter'
+    'LogBERTFilter',
+    'PatternFilter'
 ]

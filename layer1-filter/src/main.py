@@ -10,9 +10,19 @@ import asyncio
 import logging
 import os
 from datetime import datetime
+from typing import Dict, List
 
-from filters.logbert_filter import LogBERTFilter
+from filters.pattern_filter import PatternFilter
+from filters.base import FilterResult
 from storage.anomaly_store import AnomalyStore
+
+try:
+    from filters.logbert_filter import LogBERTFilter
+except ModuleNotFoundError as e:
+    LogBERTFilter = None
+    LOGBERT_IMPORT_ERROR = e
+else:
+    LOGBERT_IMPORT_ERROR = None
 
 # Configure logging
 logging.basicConfig(
@@ -24,8 +34,9 @@ logger = logging.getLogger(__name__)
 # Environment variables
 LOKI_URL = os.getenv('LOKI_URL', 'http://loki:3100')
 LOKI_TENANT = os.getenv('LOKI_TENANT', 'raw')
-LOKI_QUERY = os.getenv('LOKI_QUERY', '{source="docker", container!="logbert"}')
+LOKI_QUERY = os.getenv('LOKI_QUERY', '{source="target-nginx"}')
 POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', '10'))
+INITIAL_LOOKBACK_SECONDS = int(os.getenv('INITIAL_LOOKBACK_SECONDS', '300'))
 
 DB_HOST = os.getenv('DB_HOST', 'timescaledb')
 DB_PORT = int(os.getenv('DB_PORT', '5432'))
@@ -35,18 +46,25 @@ DB_PASSWORD = os.getenv('DB_PASSWORD', 'logdb_password')
 
 ANOMALY_THRESHOLD = float(os.getenv('ANOMALY_THRESHOLD', '0.5'))
 BATCH_SIZE = int(os.getenv('BATCH_SIZE', '50'))
+NODE_ID = os.getenv('AADS_NODE_ID', os.getenv('NODE_ID', 'controller'))
+ENABLE_PATTERN_FILTER = os.getenv('ENABLE_PATTERN_FILTER', 'true').lower() == 'true'
+ENABLE_LOGBERT_FILTER = os.getenv('ENABLE_LOGBERT_FILTER', 'true').lower() == 'true'
 
 
 class Layer1FilterService:
     """Main service for Layer 1 anomaly filtering"""
 
     def __init__(self):
-        # Initialize LogBERT filter
-        self.filter = LogBERTFilter(
-            model_path='bert-base-uncased',
-            threshold=ANOMALY_THRESHOLD,
-            device='cpu'  # Use GPU if available
-        )
+        self.pattern_filter = PatternFilter(enabled=ENABLE_PATTERN_FILTER)
+        self.logbert_filter = None
+        if ENABLE_LOGBERT_FILTER and LogBERTFilter:
+            self.logbert_filter = LogBERTFilter(
+                model_path='bert-base-uncased',
+                threshold=ANOMALY_THRESHOLD,
+                device='cpu'  # Use GPU if available
+            )
+        elif ENABLE_LOGBERT_FILTER:
+            logger.warning(f"LogBERT disabled because dependencies are unavailable: {LOGBERT_IMPORT_ERROR}")
 
         # Initialize anomaly store
         self.store = AnomalyStore(
@@ -120,6 +138,7 @@ class Layer1FilterService:
 
                                 logs.append({
                                     'timestamp': timestamp,
+                                    'node_id': labels.get('node_id', NODE_ID),
                                     'labels': labels,
                                     'message': message,
                                     'container': labels.get('container', ''),
@@ -141,7 +160,7 @@ class Layer1FilterService:
         if self.last_timestamp:
             start_time = self.last_timestamp
         else:
-            start_time = end_time - timedelta(seconds=30)
+            start_time = end_time - timedelta(seconds=INITIAL_LOOKBACK_SECONDS)
 
         # Fetch logs
         logs = await self.fetch_logs_from_loki(start_time, end_time)
@@ -152,8 +171,9 @@ class Layer1FilterService:
 
         logger.info(f"Processing {len(logs)} logs...")
 
-        # Run through LogBERT filter
-        results = self.filter.predict(logs)
+        # Run deterministic pattern OR LogBERT. Pattern matching keeps lab
+        # scenarios stable, while LogBERT remains the semantic detector.
+        results = self._run_fusion(logs)
 
         # Filter anomalies
         anomalies = [r for r in results if r.is_anomaly]
@@ -184,6 +204,10 @@ class Layer1FilterService:
         logger.info(f"  Query: {LOKI_QUERY}")
         logger.info(f"  Threshold: {ANOMALY_THRESHOLD}")
         logger.info(f"  Poll Interval: {POLL_INTERVAL}s")
+        logger.info(f"  Initial Lookback: {INITIAL_LOOKBACK_SECONDS}s")
+        logger.info(f"  Node ID: {NODE_ID}")
+        logger.info(f"  Pattern Filter: {ENABLE_PATTERN_FILTER}")
+        logger.info(f"  LogBERT Filter: {ENABLE_LOGBERT_FILTER}")
 
         try:
             while True:
@@ -197,6 +221,55 @@ class Layer1FilterService:
 
         finally:
             await self.store.close()
+
+    def _run_fusion(self, logs: List[Dict]) -> List[FilterResult]:
+        stage_results: List[FilterResult] = []
+        if self.pattern_filter.enabled:
+            stage_results.extend(self.pattern_filter.predict(logs))
+
+        if self.logbert_filter:
+            try:
+                stage_results.extend(self.logbert_filter.predict(logs))
+            except Exception as e:
+                logger.error(f"LogBERT failed; continuing with pattern results: {e}", exc_info=True)
+
+        by_key: Dict[str, List[FilterResult]] = {}
+        for result in stage_results:
+            log = result.log
+            key = f"{log.get('timestamp')}|{log.get('container')}|{log.get('message')}"
+            by_key.setdefault(key, []).append(result)
+
+        fused: List[FilterResult] = []
+        for results in by_key.values():
+            anomalies = [r for r in results if r.is_anomaly]
+            if not anomalies:
+                # Keep a normal result for stats compatibility if no stage fired.
+                fused.append(results[0])
+                continue
+
+            log = anomalies[0].log
+            stages = sorted({r.filter_stage for r in anomalies})
+            metadata = {
+                "fusion_rule": "pattern_or_logbert",
+                "stages": {
+                    r.filter_stage: {
+                        "score": r.anomaly_score,
+                        "metadata": r.metadata,
+                    }
+                    for r in anomalies
+                },
+            }
+            fused.append(
+                FilterResult(
+                    log=log,
+                    anomaly_score=max(r.anomaly_score for r in anomalies),
+                    is_anomaly=True,
+                    filter_stage="+".join(stages),
+                    metadata=metadata,
+                )
+            )
+
+        return fused
 
 
 async def main():

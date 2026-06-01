@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VAULT="${AADS_OBSIDIAN_VAULT:-/Volumes/eSSD/obsidian-aads}"
+BUCKET="${AADS_OBSIDIAN_BUCKET:-obsidian-aads}"
+ENDPOINT="${AADS_OBSIDIAN_ENDPOINT:-https://s3.tfbs.site}"
+MC_TARGET="${AADS_OBSIDIAN_MC_TARGET:-}"
+DRY_RUN="${1:-}"
+
+if [[ ! -d "$VAULT" ]]; then
+  echo "Obsidian vault not found: $VAULT" >&2
+  exit 1
+fi
+
+EXCLUDES=(
+  ".obsidian/**"
+  ".trash/**"
+  "**/.DS_Store"
+  "**/workspace.json"
+  "**/workspace-mobile.json"
+  "**/data.json"
+)
+
+echo "Syncing Obsidian vault: $VAULT"
+echo "Bucket: $BUCKET"
+
+if command -v mc >/dev/null 2>&1 && [[ -n "$MC_TARGET" ]]; then
+  args=(mirror --overwrite)
+  for pattern in "${EXCLUDES[@]}"; do
+    args+=(--exclude "$pattern")
+  done
+  [[ "$DRY_RUN" == "--dry-run" ]] && args+=(--dry-run)
+  mc "${args[@]}" "$VAULT" "$MC_TARGET/$BUCKET"
+  exit 0
+fi
+
+if command -v aws >/dev/null 2>&1; then
+  args=(s3 sync "$VAULT" "s3://$BUCKET" --endpoint-url "$ENDPOINT")
+  for pattern in "${EXCLUDES[@]}"; do
+    args+=(--exclude "$pattern")
+  done
+  [[ "$DRY_RUN" == "--dry-run" ]] && args+=(--dryrun)
+  aws "${args[@]}"
+  exit 0
+fi
+
+echo "Neither configured mc nor aws CLI is available. Install one or set AADS_OBSIDIAN_MC_TARGET." >&2
+exit 1

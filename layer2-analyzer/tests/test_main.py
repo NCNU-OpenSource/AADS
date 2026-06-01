@@ -10,7 +10,17 @@ import sys
 import os
 
 # Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+LAYER2_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, LAYER2_SRC)
+
+
+def load_root_cause_analyzer():
+    """Load layer2 main.py even when other packages also have a main.py."""
+    if sys.path[0] != LAYER2_SRC:
+        sys.path.insert(0, LAYER2_SRC)
+    sys.modules.pop('main', None)
+    from main import RootCauseAnalyzer
+    return RootCauseAnalyzer
 
 
 class TestAnalyzeClusterDedup:
@@ -28,7 +38,7 @@ class TestAnalyzeClusterDedup:
             'LLM_API_KEY': 'test-key',
             'LLM_MODEL': 'gpt-4o-mini',
         }):
-            from main import RootCauseAnalyzer
+            RootCauseAnalyzer = load_root_cause_analyzer()
             analyzer = RootCauseAnalyzer()
 
             # Mock Layer 3 components
@@ -134,7 +144,7 @@ class TestRunLayer3:
             'LLM_API_KEY': 'test-key',
             'LLM_MODEL': 'gpt-4o-mini',
         }):
-            from main import RootCauseAnalyzer
+            RootCauseAnalyzer = load_root_cause_analyzer()
             analyzer = RootCauseAnalyzer()
 
             analyzer.suggestion_generator = MagicMock()
