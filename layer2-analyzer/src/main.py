@@ -547,12 +547,22 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
         diagnosis context. Covers: nginx, postgresql, redis, mysql/mariadb.
         """
         messages = " ".join(str(a.get("raw_message", "")) for a in cluster.anomalies).lower()
+        # Also check cluster metadata: containers, services, and individual anomaly labels
+        # so service detection works even when log lines don't name the service explicitly
+        # (e.g. PostgreSQL logs say "database system is shut down", not "postgresql").
+        containers = " ".join(str(c) for c in (getattr(cluster, "containers", None) or [])).lower()
+        services   = " ".join(str(s) for s in (getattr(cluster, "services", None) or [])).lower()
+        labels     = " ".join(
+            str(a.get("service", "")) + " " + str(a.get("container", "")) + " " + str(a.get("job", ""))
+            for a in cluster.anomalies
+        ).lower()
+        ctx = " ".join([messages, containers, services, labels])
 
         # Detect which service is affected
-        is_nginx = "nginx" in messages
-        is_pg = any(k in messages for k in ("postgresql", "postgres", " pg ", "pg_ctl", "pg_ctlcluster"))
-        is_redis = "redis" in messages
-        is_mysql = any(k in messages for k in ("mysql", "mariadb", "mysqld", "mariadbd"))
+        is_nginx = "nginx" in ctx
+        is_pg = any(k in ctx for k in ("postgresql", "postgres", " pg ", "pg_ctl"))
+        is_redis = "redis" in ctx
+        is_mysql = any(k in ctx for k in ("mysql", "mariadb", "mysqld", "mariadbd"))
 
         if not any([is_nginx, is_pg, is_redis, is_mysql]):
             return action_plan
@@ -700,8 +710,21 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
 
     def _build_root_cause_report(self, action_plan: ClaudeStylePlan, cluster, diagnosis_id: str) -> RootCauseReport:
         containers = self._stable_values(cluster.containers)
-        templates = self._stable_values(cluster.templates)
-        affected_service = containers[0] if containers else "nginx"
+        services   = self._stable_values(getattr(cluster, "services", None) or [])
+        templates  = self._stable_values(cluster.templates)
+        # Filter empty strings; containers may be empty when logs come from
+        # file-based sources without a container label (e.g. syslog, pg logs).
+        valid_containers = [c for c in containers if c.strip()]
+        valid_services   = [s for s in services if s.strip()]
+        affected_service = (
+            next(iter(valid_containers), None)
+            or next((s for s in valid_services if s not in ("system", "syslog")), None)
+            or next(iter(valid_services), None)
+            or "unknown"
+        )
+        root_cause = (action_plan.root_cause or action_plan.context_analysis or "").strip()
+        if not root_cause:
+            root_cause = "Root cause could not be determined from available log data."
         evidence = [
             {
                 "source": "log",
@@ -715,7 +738,7 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
             "report_id": f"rca_{diagnosis_id}",
             "target_node_id": self.default_node_id,
             "affected_service": affected_service,
-            "root_cause": action_plan.root_cause or action_plan.context_analysis,
+            "root_cause": root_cause,
             "confidence": action_plan.confidence_score,
             "evidence": evidence,
             "recommended_capabilities": self._extract_node_agent_command_ids(action_plan),
