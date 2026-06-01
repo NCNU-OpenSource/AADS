@@ -540,14 +540,21 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
 
     def _ensure_lab_node_agent_steps(self, action_plan: ClaudeStylePlan, cluster) -> ClaudeStylePlan:
         """
-        Add deterministic node_agent remediation for known nginx lab failures.
+        Add deterministic node_agent remediation for known lab service failures.
 
         The LLM remains the primary planner. This narrow post-process makes the
         v1 lab deterministic enough for CI/E2E while preserving the generated
-        diagnosis context.
+        diagnosis context. Covers: nginx, postgresql, redis, mysql/mariadb.
         """
         messages = " ".join(str(a.get("raw_message", "")) for a in cluster.anomalies).lower()
-        if "nginx" not in messages:
+
+        # Detect which service is affected
+        is_nginx = "nginx" in messages
+        is_pg = any(k in messages for k in ("postgresql", "postgres", " pg ", "pg_ctl", "pg_ctlcluster"))
+        is_redis = "redis" in messages
+        is_mysql = any(k in messages for k in ("mysql", "mariadb", "mysqld", "mariadbd"))
+
+        if not any([is_nginx, is_pg, is_redis, is_mysql]):
             return action_plan
 
         plan = action_plan.model_copy(deep=True)
@@ -559,7 +566,8 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
         }
         next_step_id = max((step.step_id for step in plan.execution_steps), default=0) + 1
 
-        def add_step(title: str, command_id: str, phase: str, explanation: str, requires_approval: bool = False):
+        def add_step(title: str, command_id: str, phase: str, explanation: str,
+                     target: str = "nginx", requires_approval: bool = False):
             nonlocal next_step_id
             if command_id in existing_ids:
                 return
@@ -575,7 +583,7 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
                             tool_name="node_agent",
                             command_id=command_id,
                             target_node_id=self.default_node_id,
-                            target="nginx",
+                            target=target,
                             command=command_id,
                             args={},
                             risk_level="low",
@@ -588,31 +596,75 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
                         )
                     ],
                     action_type="verify" if phase != "Execute" else "k8s_exec",
-                    target="nginx",
+                    target=target,
                     command=command_id,
                     is_destructive=phase == "Execute",
                 )
             )
             next_step_id += 1
 
-        add_step("Check nginx status", "nginx.status", "Explore", "Confirm whether nginx is running.")
-        if "config" in messages or "emerg" in messages:
-            add_step(
-                "Restore known-good nginx config",
-                "nginx.restore_known_good_config",
-                "Execute",
-                "Recover the lab nginx configuration from the trusted local snapshot.",
-                requires_approval=self.force_gate_approval or self.default_node_environment != "test",
-            )
-        else:
-            add_step(
-                "Start nginx service",
-                "nginx.start",
-                "Execute",
-                "Bring nginx back online for the lab target.",
-                requires_approval=self.force_gate_approval or self.default_node_environment != "test",
-            )
-        add_step("Verify nginx config", "nginx.config_test", "Verify", "Validate nginx configuration after remediation.")
+        is_config_error = any(k in messages for k in ("config", "emerg", "syntax", "invalid", "error", "fatal"))
+
+        if is_nginx:
+            add_step("Check nginx status", "nginx.status", "Explore",
+                     "Confirm whether nginx is running.", target="nginx")
+            if is_config_error:
+                add_step("Restore known-good nginx config", "nginx.restore_known_good_config", "Execute",
+                         "Recover the lab nginx configuration from the trusted local snapshot.",
+                         target="nginx",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            else:
+                add_step("Start nginx service", "nginx.start", "Execute",
+                         "Bring nginx back online for the lab target.", target="nginx",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            add_step("Verify nginx config", "nginx.config_test", "Verify",
+                     "Validate nginx configuration after remediation.", target="nginx")
+
+        if is_pg:
+            add_step("Check PostgreSQL status", "postgresql.status", "Explore",
+                     "Confirm whether PostgreSQL is running.", target="postgresql")
+            if is_config_error:
+                add_step("Restore known-good PostgreSQL config", "postgresql.restore_known_good_config", "Execute",
+                         "Recover PostgreSQL configuration from the trusted local snapshot.",
+                         target="postgresql",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            else:
+                add_step("Restart PostgreSQL service", "postgresql.restart", "Execute",
+                         "Restart PostgreSQL to recover from crash or OOM kill.", target="postgresql",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            add_step("Test PostgreSQL connection", "postgresql.connection_test", "Verify",
+                     "Verify PostgreSQL is accepting connections after remediation.", target="postgresql")
+
+        if is_redis:
+            add_step("Check Redis status", "redis.status", "Explore",
+                     "Confirm whether Redis is running.", target="redis")
+            if is_config_error:
+                add_step("Restore known-good Redis config", "redis.restore_known_good_config", "Execute",
+                         "Recover Redis configuration from the trusted local snapshot.",
+                         target="redis",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            else:
+                add_step("Restart Redis service", "redis.restart", "Execute",
+                         "Restart Redis to recover from crash or OOM kill.", target="redis",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            add_step("Ping Redis", "redis.ping", "Verify",
+                     "Verify Redis is responding after remediation.", target="redis")
+
+        if is_mysql:
+            add_step("Check MySQL status", "mysql.status", "Explore",
+                     "Confirm whether MySQL/MariaDB is running.", target="mysql")
+            if is_config_error:
+                add_step("Restore known-good MySQL config", "mysql.restore_known_good_config", "Execute",
+                         "Recover MySQL configuration from the trusted local snapshot.",
+                         target="mysql",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            else:
+                add_step("Restart MySQL service", "mysql.restart", "Execute",
+                         "Restart MySQL/MariaDB to recover from crash or OOM kill.", target="mysql",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            add_step("Test MySQL connection", "mysql.connection_test", "Verify",
+                     "Verify MySQL/MariaDB is accepting connections after remediation.", target="mysql")
+
         return plan
 
     async def _recent_failed_plan_paths(self, cluster) -> List[Dict[str, Any]]:
@@ -754,26 +806,35 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
         )
 
     def _expected_outcome_for(self, command_id: str) -> str:
-        if command_id == "nginx.start":
-            return "nginx service is active"
-        if command_id == "nginx.restore_known_good_config":
-            return "known-good nginx config is restored and reload succeeds"
-        if command_id == "nginx.reload":
-            return "nginx config validates and reload succeeds"
-        return f"{command_id} completes successfully"
+        outcomes = {
+            "nginx.start": "nginx service is active",
+            "nginx.restore_known_good_config": "known-good nginx config is restored and reload succeeds",
+            "nginx.reload": "nginx config validates and reload succeeds",
+            "postgresql.restart": "postgresql service is active and accepting connections",
+            "postgresql.restore_known_good_config": "known-good postgresql config is restored and service reloads",
+            "postgresql.reload": "postgresql config reloaded successfully",
+            "redis.restart": "redis service is active and responding to PING",
+            "redis.restore_known_good_config": "known-good redis config is restored and service restarts",
+            "mysql.restart": "mysql/mariadb service is active and accepting connections",
+            "mysql.restore_known_good_config": "known-good mysql config is restored and service restarts",
+            "mysql.reload": "mysql/mariadb config reloaded successfully",
+        }
+        return outcomes.get(command_id, f"{command_id} completes successfully")
 
     def _verification_for(self, command_id: str) -> VerificationSpec:
-        if command_id == "nginx.start":
-            return VerificationSpec(
-                command_id="nginx.status",
-                args={},
-                expected={"status": "success", "active": True},
-            )
-        return VerificationSpec(
-            command_id="nginx.config_test",
-            args={},
-            expected={"status": "success", "returncode": 0},
-        )
+        verifications = {
+            "nginx.start": VerificationSpec(command_id="nginx.status", args={}, expected={"status": "success", "active": True}),
+            "nginx.restore_known_good_config": VerificationSpec(command_id="nginx.config_test", args={}, expected={"status": "success", "returncode": 0}),
+            "postgresql.restart": VerificationSpec(command_id="postgresql.connection_test", args={}, expected={"status": "success"}),
+            "postgresql.restore_known_good_config": VerificationSpec(command_id="postgresql.connection_test", args={}, expected={"status": "success"}),
+            "redis.restart": VerificationSpec(command_id="redis.ping", args={}, expected={"status": "success"}),
+            "redis.restore_known_good_config": VerificationSpec(command_id="redis.ping", args={}, expected={"status": "success"}),
+            "mysql.restart": VerificationSpec(command_id="mysql.connection_test", args={}, expected={"status": "success"}),
+            "mysql.restore_known_good_config": VerificationSpec(command_id="mysql.connection_test", args={}, expected={"status": "success"}),
+        }
+        if command_id in verifications:
+            return verifications[command_id]
+        return VerificationSpec(command_id="nginx.config_test", args={}, expected={"status": "success", "returncode": 0})
 
     async def _run_layer3(self, diagnosis: Dict[str, Any]) -> Dict[str, Any]:
         """
