@@ -59,10 +59,10 @@ elif ! command -v timeout >/dev/null 2>&1; then
 fi
 
 sql() {
-  # No timeout wrapper here: psql queries are fast and perl alarm() propagates
-  # into exec'd children, causing SIGALRM on the parent shell when called many
-  # times in a poll loop with set -euo pipefail. Callers add "|| true" where needed.
-  multipass exec "$CONTROLLER" -- bash -lc \
+  # timeout 30 guards against a hung multipass exec (e.g. SSH slot exhaustion
+  # from concurrent connections). Callers already use "|| true" for transient
+  # failures, so SIGALRM propagation is harmless — the call just returns 1.
+  timeout 30 multipass exec "$CONTROLLER" -- bash -lc \
     "cd ~/AADS && sudo docker compose --env-file .env.lab exec -T timescaledb \
      psql -U logdb -d logdb -At -c $(printf '%q' "$1")" 2>/dev/null
 }
@@ -227,8 +227,10 @@ chaos_schedule() {
 
 # ── Scenario implementations ─────────────────────────────────
 
-# CM-01: kill aads-agent AFTER snapshot captured, BEFORE step 1 starts.
-# Expected: failed_retryable, node_locks=0, no partial state on target.
+# CM-01: kill aads-agent BEFORE execution begins (agent unavailable at exec time).
+# Killing after sleep 3 races against a fast executor completing before the kill;
+# killing before execute guarantees the executor's first HTTP call hits a dead agent.
+# Expected: failed_retryable, node_locks=0.
 run_cm01() {
   log "CM-01: agent_killed_mid_execution"
   reset_baseline
@@ -238,16 +240,15 @@ run_cm01() {
   local plan_id; plan_id="$(wait_new_plan "$before")" || { record CM-01 FAIL "no plan generated"; return; }
   info "plan: $plan_id (status=$(sql "SELECT plan_status FROM diagnosis_reports WHERE diagnosis_id='$plan_id';" || true))"
 
-  # Approve
   gate POST "/api/plans/$plan_id/approve" -d '{"reason":"chaos-cm01"}' -o /dev/null
 
-  # Start execute in background, then kill agent after 3s (snapshot window)
-  local ikey="cm01-$(date +%s)"
-  (gate POST "/api/plans/$plan_id/execute" -H "Idempotency-Key: $ikey" -o /dev/null &)
-
-  sleep 3
+  # Kill agent BEFORE execute so the executor's first call reliably hits a dead agent.
+  # sleep 3 after execute is a race: on fast VMs the entire execution completes < 3s.
   log "CM-01: killing aads-agent on target"
   timeout 30 multipass exec "$TARGET" -- sudo bash -lc 'systemctl stop aads-agent'
+
+  local ikey="cm01-$(date +%s)"
+  gate POST "/api/plans/$plan_id/execute" -H "Idempotency-Key: $ikey" -o /dev/null
 
   # Wait for terminal state
   local exec_id; exec_id="$(sql "SELECT execution_id FROM plan_executions WHERE plan_id='$plan_id' ORDER BY requested_at DESC LIMIT 1;" || true)"
@@ -427,7 +428,7 @@ run_cm06() {
   # Directly inject a live node_lock for the target node to simulate a running mutating step.
   # This is more reliable than trying to time two concurrent executions against a
   # single-instance executor (which processes plans sequentially, not in parallel).
-  local target_node_id; target_node_id="$(sql "SELECT target_node_id FROM agent_nodes LIMIT 1;" || true)"
+  local target_node_id; target_node_id="$(sql "SELECT node_id FROM agent_nodes LIMIT 1;" || true)"
   if [[ -z "$target_node_id" ]]; then
     record CM-06 SKIP "no registered agent node found"; return
   fi

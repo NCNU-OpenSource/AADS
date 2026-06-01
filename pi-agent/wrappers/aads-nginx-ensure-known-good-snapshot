@@ -3,16 +3,19 @@ set -euo pipefail
 
 SNAPSHOT_DIR="${AADS_NGINX_SNAPSHOT_DIR:-/var/lib/aads-agent/snapshots/nginx}"
 
-mkdir -p "$SNAPSHOT_DIR"
+# Require a pre-existing snapshot: known-good must be established during a
+# healthy baseline, not inferred from a potentially broken incident state.
+# If no snapshot exists, block execution so the operator can establish one first.
+if [[ ! -f "$SNAPSHOT_DIR/nginx.conf" || ! -d "$SNAPSHOT_DIR/sites-enabled" ]]; then
+  echo "blocked: no_snapshot" >&2
+  exit 42
+fi
 
 if nginx -t >/dev/null 2>&1; then
-  if [[ -f /etc/nginx/nginx.conf ]]; then
-    cp -a /etc/nginx/nginx.conf "$SNAPSHOT_DIR/nginx.conf"
-  fi
-  if [[ -d /etc/nginx/sites-enabled ]]; then
-    rm -rf "$SNAPSHOT_DIR/sites-enabled"
-    cp -a /etc/nginx/sites-enabled "$SNAPSHOT_DIR/sites-enabled"
-  fi
+  # Config is valid — refresh the snapshot with current state
+  cp -a /etc/nginx/nginx.conf "$SNAPSHOT_DIR/nginx.conf"
+  rm -rf "$SNAPSHOT_DIR/sites-enabled"
+  cp -a /etc/nginx/sites-enabled "$SNAPSHOT_DIR/sites-enabled"
   chown -R root:aads-agent "$SNAPSHOT_DIR"
   find "$SNAPSHOT_DIR" -type d -exec chmod 0750 {} +
   find "$SNAPSHOT_DIR" -type f -exec chmod 0640 {} +
@@ -20,10 +23,6 @@ if nginx -t >/dev/null 2>&1; then
   exit 0
 fi
 
-if [[ -f "$SNAPSHOT_DIR/nginx.conf" && -d "$SNAPSHOT_DIR/sites-enabled" ]]; then
-  echo "snapshot_refreshed=false existing_snapshot=true"
-  exit 0
-fi
-
-echo "blocked: no_snapshot" >&2
-exit 42
+# Config is invalid — retain existing snapshot as the rollback baseline
+echo "snapshot_refreshed=false existing_snapshot=true"
+exit 0
