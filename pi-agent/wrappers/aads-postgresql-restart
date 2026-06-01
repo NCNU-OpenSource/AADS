@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+systemctl restart postgresql
+systemctl is-active --quiet postgresql
+echo "restarted=true"

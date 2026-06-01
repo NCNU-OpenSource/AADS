@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SNAPSHOT_DIR="${AADS_PG_SNAPSHOT_DIR:-/var/lib/aads-agent/snapshots/postgresql}"
+
+if [[ ! -f "$SNAPSHOT_DIR/postgresql.conf" ]]; then
+  echo "blocked: no_snapshot" >&2
+  exit 42
+fi
+
+PG_CONF_DIR="$(find /etc/postgresql -name "postgresql.conf" -exec dirname {} \; 2>/dev/null | sort | head -1)"
+
+if [[ -z "$PG_CONF_DIR" ]]; then
+  echo "blocked: postgresql_config_not_found" >&2
+  exit 42
+fi
+
+PG_VER="$(basename "$(dirname "$PG_CONF_DIR")")"
+PG_CLUSTER="$(basename "$PG_CONF_DIR")"
+
+# Back up current (broken) config before overwriting
+PREVIOUS_DIR="/var/lib/aads-agent/snapshots/postgresql-previous-$(date +%Y%m%d%H%M%S)"
+mkdir -p "$PREVIOUS_DIR"
+cp -a "$PG_CONF_DIR/postgresql.conf" "$PREVIOUS_DIR/" 2>/dev/null || true
+[[ -f "$PG_CONF_DIR/pg_hba.conf" ]] && cp -a "$PG_CONF_DIR/pg_hba.conf" "$PREVIOUS_DIR/" || true
+
+# Apply known-good snapshot
+cp -a "$SNAPSHOT_DIR/postgresql.conf" "$PG_CONF_DIR/"
+[[ -f "$SNAPSHOT_DIR/pg_hba.conf" ]] && cp -a "$SNAPSHOT_DIR/pg_hba.conf" "$PG_CONF_DIR/"
+
+# Validate restored config; roll back if invalid
+if ! pg_ctlcluster "$PG_VER" "$PG_CLUSTER" configtest >/dev/null 2>&1; then
+  cp -a "$PREVIOUS_DIR/postgresql.conf" "$PG_CONF_DIR/" 2>/dev/null || true
+  [[ -f "$PREVIOUS_DIR/pg_hba.conf" ]] && cp -a "$PREVIOUS_DIR/pg_hba.conf" "$PG_CONF_DIR/" || true
+  echo "blocked: restored_config_invalid" >&2
+  exit 43
+fi
+
+# Reload PostgreSQL to pick up new config
+if ! systemctl reload postgresql; then
+  # If reload fails, try restart
+  if ! systemctl restart postgresql; then
+    cp -a "$PREVIOUS_DIR/postgresql.conf" "$PG_CONF_DIR/" 2>/dev/null || true
+    [[ -f "$PREVIOUS_DIR/pg_hba.conf" ]] && cp -a "$PREVIOUS_DIR/pg_hba.conf" "$PG_CONF_DIR/" || true
+    systemctl reload postgresql 2>/dev/null || true
+    exit 44
+  fi
+fi
+
+echo "config_restored=true config_dir=$PG_CONF_DIR"

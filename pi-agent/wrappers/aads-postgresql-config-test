@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Locate the primary postgresql.conf (works for any installed version)
+PG_CONF_DIR="$(find /etc/postgresql -name "postgresql.conf" -exec dirname {} \; 2>/dev/null | sort | head -1)"
+
+if [[ -z "$PG_CONF_DIR" ]]; then
+  echo "blocked: postgresql_config_not_found" >&2
+  exit 42
+fi
+
+# Derive version and cluster name from path: /etc/postgresql/<ver>/<cluster>/
+PG_VER="$(basename "$(dirname "$PG_CONF_DIR")")"
+PG_CLUSTER="$(basename "$PG_CONF_DIR")"
+
+pg_ctlcluster "$PG_VER" "$PG_CLUSTER" configtest
+echo "config_dir=$PG_CONF_DIR config_valid=true"

@@ -19,10 +19,11 @@ SUPPORTED_SCHEMA = "1.0"
 NODE_ID_PATH = Path(os.getenv("AADS_NODE_ID_PATH", "/etc/aads-agent/node-id"))
 ENVIRONMENT = os.getenv("AADS_AGENT_ENVIRONMENT", "test")
 SNAPSHOT_DIR = Path(os.getenv("AADS_NGINX_SNAPSHOT_DIR", "/var/lib/aads-agent/snapshots/nginx"))
+PG_SNAPSHOT_DIR = Path(os.getenv("AADS_PG_SNAPSHOT_DIR", "/var/lib/aads-agent/snapshots/postgresql"))
 TOKEN = os.getenv("AADS_AGENT_TOKEN", "")
 ALLOWED_JOURNAL_UNITS = {
     unit.strip()
-    for unit in os.getenv("AADS_ALLOWED_JOURNAL_UNITS", "nginx,aads-agent").split(",")
+    for unit in os.getenv("AADS_ALLOWED_JOURNAL_UNITS", "nginx,aads-agent,postgresql").split(",")
     if unit.strip()
 }
 
@@ -32,6 +33,11 @@ WRAPPERS = {
     "nginx.config_test": "/usr/local/sbin/aads-nginx-config-test",
     "nginx.ensure_known_good_snapshot": "/usr/local/sbin/aads-nginx-ensure-known-good-snapshot",
     "nginx.restore_known_good_config": "/usr/local/sbin/aads-nginx-restore-known-good",
+    "postgresql.restart": "/usr/local/sbin/aads-postgresql-restart",
+    "postgresql.reload": "/usr/local/sbin/aads-postgresql-reload",
+    "postgresql.config_test": "/usr/local/sbin/aads-postgresql-config-test",
+    "postgresql.ensure_config_snapshot": "/usr/local/sbin/aads-postgresql-ensure-config-snapshot",
+    "postgresql.restore_known_good_config": "/usr/local/sbin/aads-postgresql-restore-config",
 }
 
 CATALOG: Dict[str, Dict[str, Any]] = {
@@ -130,6 +136,91 @@ CATALOG: Dict[str, Dict[str, Any]] = {
         "idempotent": False,
         "retry_policy": {"max_attempts": 1},
         "sudo_wrapper": WRAPPERS["nginx.restore_known_good_config"],
+    },
+    # ── PostgreSQL ────────────────────────────────────────────
+    "postgresql.status": {
+        "command_id": "postgresql.status",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "probe",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 10,
+        "risk_level": "low",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 3},
+        "sudo_wrapper": None,
+    },
+    "postgresql.connection_test": {
+        "command_id": "postgresql.connection_test",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "probe",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 10,
+        "risk_level": "low",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 3},
+        "sudo_wrapper": None,
+    },
+    "postgresql.config_test": {
+        "command_id": "postgresql.config_test",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "probe",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 15,
+        "risk_level": "low",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 3},
+        "sudo_wrapper": WRAPPERS["postgresql.config_test"],
+    },
+    "postgresql.ensure_config_snapshot": {
+        "command_id": "postgresql.ensure_config_snapshot",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "action",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 30,
+        "risk_level": "low",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 2},
+        "sudo_wrapper": WRAPPERS["postgresql.ensure_config_snapshot"],
+    },
+    "postgresql.restart": {
+        "command_id": "postgresql.restart",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "action",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 60,
+        "risk_level": "medium",
+        "idempotent": True,
+        "retry_policy": {"max_attempts": 2},
+        "sudo_wrapper": WRAPPERS["postgresql.restart"],
+    },
+    "postgresql.reload": {
+        "command_id": "postgresql.reload",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "action",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 30,
+        "risk_level": "low",
+        "idempotent": False,
+        "retry_policy": {"max_attempts": 1},
+        "sudo_wrapper": WRAPPERS["postgresql.reload"],
+    },
+    "postgresql.restore_known_good_config": {
+        "command_id": "postgresql.restore_known_good_config",
+        "schema_version": SUPPORTED_SCHEMA,
+        "scope": "action",
+        "args_schema": {},
+        "arg_allowlist": {},
+        "timeout_seconds": 60,
+        "risk_level": "medium",
+        "idempotent": False,
+        "retry_policy": {"max_attempts": 1},
+        "sudo_wrapper": WRAPPERS["postgresql.restore_known_good_config"],
     },
 }
 
@@ -249,12 +340,16 @@ def run_command(meta: Dict[str, Any], args: Dict[str, Any]):
         return nginx_status(meta["timeout_seconds"])
     if command_id == "nginx.http_check":
         return nginx_http_check(args, meta["timeout_seconds"])
-    if command_id == "nginx.config_test":
+    if command_id in ("nginx.config_test", "postgresql.config_test"):
         return exec_cmd(["sudo", "-n", meta["sudo_wrapper"]], meta["timeout_seconds"], retryable=True)
     if command_id == "system.journal_tail":
         unit = args.get("unit", "nginx")
         lines = str(int(args.get("lines", 80)))
         return exec_cmd(["journalctl", "-u", unit, "-n", lines, "--no-pager"], meta["timeout_seconds"], retryable=True)
+    if command_id == "postgresql.status":
+        return service_status("postgresql", meta["timeout_seconds"])
+    if command_id == "postgresql.connection_test":
+        return postgresql_connection_test(meta["timeout_seconds"])
 
     wrapper = meta["sudo_wrapper"]
     return exec_cmd(["sudo", "-n", wrapper], meta["timeout_seconds"], retryable=False)
@@ -347,6 +442,56 @@ def exec_cmd(argv: List[str], timeout: int, retryable: bool):
         raise HTTPException(status_code=504, detail={"status": "timeout", "stdout": e.stdout, "stderr": e.stderr, "retryable": True})
 
 
+def service_status(service: str, timeout: int):
+    """Generic systemctl is-active probe for any service."""
+    try:
+        completed = subprocess.run(
+            ["systemctl", "is-active", service],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+        state = (completed.stdout or completed.stderr).strip()
+        if completed.returncode in {0, 3}:
+            return {
+                "status": "success",
+                "returncode": completed.returncode,
+                "state": state or "unknown",
+                "active": completed.returncode == 0,
+                "stdout": completed.stdout[-4000:],
+                "stderr": completed.stderr[-4000:],
+                "retryable": False,
+            }
+        raise HTTPException(status_code=500, detail={
+            "status": "failed", "returncode": completed.returncode,
+            "state": state or "unknown", "stdout": completed.stdout[-4000:],
+            "stderr": completed.stderr[-4000:], "retryable": True,
+        })
+    except subprocess.TimeoutExpired as e:
+        raise HTTPException(status_code=504, detail={"status": "timeout", "stdout": e.stdout, "stderr": e.stderr, "retryable": True})
+
+
+def postgresql_connection_test(timeout: int):
+    """Run pg_isready to verify PostgreSQL is accepting connections."""
+    try:
+        completed = subprocess.run(
+            ["pg_isready", "-h", "localhost"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+        accepting = completed.returncode == 0
+        payload = {
+            "status": "success" if accepting else "failed",
+            "returncode": completed.returncode,
+            "stdout": completed.stdout[-4000:],
+            "stderr": completed.stderr[-4000:],
+            "checks": {"accepting_connections": accepting},
+            "retryable": not accepting,
+        }
+        if not accepting:
+            raise HTTPException(status_code=500, detail=payload)
+        return payload
+    except subprocess.TimeoutExpired as e:
+        raise HTTPException(status_code=504, detail={"status": "timeout", "stdout": e.stdout, "stderr": e.stderr, "retryable": True})
+
+
 def snapshot_available() -> bool:
     try:
         return (SNAPSHOT_DIR / "nginx.conf").exists() and (SNAPSHOT_DIR / "sites-enabled").exists()
@@ -371,6 +516,8 @@ def health_problems() -> List[str]:
     if not snapshot_available():
         problems.append(f"missing nginx known-good snapshot in {SNAPSHOT_DIR}")
     problems.extend(sudoers_health_problems())
+    # PostgreSQL snapshot is optional (service may not be installed)
+    # — only warn, not error, so nginx-only nodes stay healthy
     return problems
 
 
