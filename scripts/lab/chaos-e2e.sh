@@ -479,6 +479,19 @@ run_cm06() {
 # Expected: Knowledge Agent returns blocked:snapshot_failed.
 run_cm07() {
   log "CM-07: snapshot_missing"
+
+  # CM-07 runs right after CM-04 (LiteLLM restart). Allow up to 60s for the
+  # Layer 2 pipeline to become fully operational before injecting the fault.
+  log "CM-07: waiting for Layer 2 pipeline to be ready (up to 60s)"
+  local ready_deadline=$((SECONDS + 60))
+  while (( SECONDS < ready_deadline )); do
+    local layer2_ok; layer2_ok="$(sql "SELECT 1 FROM diagnosis_reports WHERE timestamp > NOW() - INTERVAL '5 minutes' LIMIT 1;" || true)"
+    # Also accept: Layer 2 is idle but anomaly_logs pipeline is live
+    local anomaly_ok; anomaly_ok="$(sql "SELECT 1 FROM anomaly_logs WHERE created_at > NOW() - INTERVAL '5 minutes' LIMIT 1;" || true)"
+    [[ -n "$layer2_ok" || -n "$anomaly_ok" ]] && break
+    sleep 5
+  done
+
   reset_baseline
   break_nginx_stopped
   local before; before="$(sql "SELECT COALESCE((SELECT diagnosis_id FROM diagnosis_reports ORDER BY timestamp DESC LIMIT 1),'__none__');" || true)"
