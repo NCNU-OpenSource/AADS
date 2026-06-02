@@ -613,7 +613,25 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
             )
             next_step_id += 1
 
-        is_config_error = any(k in messages for k in ("config", "emerg", "syntax", "invalid", "error", "fatal"))
+        # Distinguish a config error (needs restore) from a plain stop/crash
+        # (needs restart). Use SPECIFIC config-failure signatures, not generic
+        # "error"/"failed" which appear in any service-down log and would wrongly
+        # route a simple stop to the destructive restore path.
+        config_signatures = (
+            "emerg",                 # nginx config emergency
+            "syntax error",
+            "invalid line",          # postgresql.conf parse error
+            "invalid directive",
+            "invalid_directive",     # our injected nginx/pg marker
+            "invalid_chaos",         # our injected redis marker
+            "chaos_option",          # our injected mysql marker
+            "unknown variable",      # mysql/mariadb
+            "unknown option",
+            "can't open config",     # redis
+            "could not open configuration",
+            "configuration file",
+        )
+        is_config_error = any(k in messages for k in config_signatures)
 
         if is_nginx:
             add_step("Check nginx status", "nginx.status", "Explore",
@@ -795,11 +813,15 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
                 )
             )
 
-        final_verification = VerificationSpec(
-            command_id="nginx.http_check",
-            args={"url": "http://127.0.0.1/", "expected_status": 200},
-            expected={"status": "success", "http_status": 200},
-        )
+        repair_command_ids = [cmd.command_id or cmd.command for cmd in executable_commands]
+
+        # Final verification must match the service being repaired. Using the
+        # nginx HTTP check for a PostgreSQL/Redis/MySQL repair would always fail.
+        final_verification = self._final_verification_for(repair_command_ids)
+
+        # Pre-execution snapshot command must also match the service so the
+        # "no known-good baseline" safety check guards the right service.
+        snapshot_command_id, snapshot_scope = self._snapshot_command_for(repair_command_ids)
 
         return FixingPlan(
             plan_id=diagnosis_id,
@@ -810,8 +832,8 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
             environment_policy=environment_policy,
             pre_execution_snapshot=PreExecutionSnapshot(
                 enabled=True,
-                command_id="nginx.ensure_known_good_snapshot",
-                scope="nginx_config",
+                command_id=snapshot_command_id,
+                scope=snapshot_scope,
                 on_failure="block",
             ),
             steps=fixing_steps,
@@ -858,6 +880,33 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
         if command_id in verifications:
             return verifications[command_id]
         return VerificationSpec(command_id="nginx.config_test", args={}, expected={"status": "success", "returncode": 0})
+
+    def _final_verification_for(self, command_ids: List[str]) -> VerificationSpec:
+        """Pick a service-appropriate final verification from the repair commands."""
+        joined = " ".join(command_ids)
+        if "postgresql" in joined:
+            return VerificationSpec(command_id="postgresql.connection_test", args={}, expected={"status": "success"})
+        if "redis" in joined:
+            return VerificationSpec(command_id="redis.ping", args={}, expected={"status": "success"})
+        if "mysql" in joined:
+            return VerificationSpec(command_id="mysql.connection_test", args={}, expected={"status": "success"})
+        # Default to nginx HTTP check (original lab behaviour)
+        return VerificationSpec(
+            command_id="nginx.http_check",
+            args={"url": "http://127.0.0.1/", "expected_status": 200},
+            expected={"status": "success", "http_status": 200},
+        )
+
+    def _snapshot_command_for(self, command_ids: List[str]) -> tuple:
+        """Pick the service-appropriate pre-execution snapshot command + scope."""
+        joined = " ".join(command_ids)
+        if "postgresql" in joined:
+            return "postgresql.ensure_config_snapshot", "postgresql_config"
+        if "redis" in joined:
+            return "redis.ensure_config_snapshot", "redis_config"
+        if "mysql" in joined:
+            return "mysql.ensure_config_snapshot", "mysql_config"
+        return "nginx.ensure_known_good_snapshot", "nginx_config"
 
     async def _run_layer3(self, diagnosis: Dict[str, Any]) -> Dict[str, Any]:
         """

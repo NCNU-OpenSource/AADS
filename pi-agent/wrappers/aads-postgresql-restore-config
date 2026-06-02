@@ -15,21 +15,23 @@ if [[ -z "$PG_CONF_DIR" ]]; then
   exit 42
 fi
 
-PG_VER="$(basename "$(dirname "$PG_CONF_DIR")")"
-PG_CLUSTER="$(basename "$PG_CONF_DIR")"
-
 # Back up current (broken) config before overwriting
 PREVIOUS_DIR="/var/lib/aads-agent/snapshots/postgresql-previous-$(date +%Y%m%d%H%M%S)"
 mkdir -p "$PREVIOUS_DIR"
 cp -a "$PG_CONF_DIR/postgresql.conf" "$PREVIOUS_DIR/" 2>/dev/null || true
 [[ -f "$PG_CONF_DIR/pg_hba.conf" ]] && cp -a "$PG_CONF_DIR/pg_hba.conf" "$PREVIOUS_DIR/" || true
 
-# Apply known-good snapshot; restore original postgresql ownership so postgres
-# process can read the files (snapshot is stored root:aads-agent, which the
-# postgres user cannot read under 0640 permissions).
+restore_previous() {
+  cp -a "$PREVIOUS_DIR/postgresql.conf" "$PG_CONF_DIR/postgresql.conf" 2>/dev/null || true
+  chown postgres:postgres "$PG_CONF_DIR/postgresql.conf" 2>/dev/null || true
+  [[ -f "$PREVIOUS_DIR/pg_hba.conf" ]] && cp -a "$PREVIOUS_DIR/pg_hba.conf" "$PG_CONF_DIR/pg_hba.conf" 2>/dev/null || true
+}
+
+# Apply known-good snapshot; restore postgres-native ownership so the postgres
+# process can read the files (snapshot is stored root:aads-agent under 0640).
 cp "$SNAPSHOT_DIR/postgresql.conf" "$PG_CONF_DIR/postgresql.conf"
 chown postgres:postgres "$PG_CONF_DIR/postgresql.conf"
-chmod 0600 "$PG_CONF_DIR/postgresql.conf"
+chmod 0644 "$PG_CONF_DIR/postgresql.conf"
 
 if [[ -f "$SNAPSHOT_DIR/pg_hba.conf" ]]; then
   cp "$SNAPSHOT_DIR/pg_hba.conf" "$PG_CONF_DIR/pg_hba.conf"
@@ -37,25 +39,22 @@ if [[ -f "$SNAPSHOT_DIR/pg_hba.conf" ]]; then
   chmod 0640 "$PG_CONF_DIR/pg_hba.conf"
 fi
 
-# Validate restored config using postgres -t (does not require data dir access)
-# Falls back to pg_ctlcluster if available
-if ! su -s /bin/sh postgres -c "postgres -t -c config_file='$PG_CONF_DIR/postgresql.conf'" >/dev/null 2>&1; then
-  if ! pg_ctlcluster "$PG_VER" "$PG_CLUSTER" configtest >/dev/null 2>&1; then
-    cp -a "$PREVIOUS_DIR/postgresql.conf" "$PG_CONF_DIR/" 2>/dev/null || true
-    [[ -f "$PREVIOUS_DIR/pg_hba.conf" ]] && cp -a "$PREVIOUS_DIR/pg_hba.conf" "$PG_CONF_DIR/" || true
-    echo "blocked: restored_config_invalid" >&2
-    exit 43
-  fi
+# Validate by restarting: a successful restart proves the config is loadable.
+# (PostgreSQL has no clean offline configtest like nginx -t; restart is the
+# authoritative check and is what the operator ultimately needs anyway.)
+if ! systemctl restart postgresql; then
+  restore_previous
+  systemctl restart postgresql 2>/dev/null || true
+  echo "blocked: restored_config_invalid" >&2
+  exit 43
 fi
 
-# Reload or restart PostgreSQL to pick up new config
-if ! systemctl reload postgresql 2>/dev/null; then
-  if ! systemctl restart postgresql; then
-    cp -a "$PREVIOUS_DIR/postgresql.conf" "$PG_CONF_DIR/" 2>/dev/null || true
-    [[ -f "$PREVIOUS_DIR/pg_hba.conf" ]] && cp -a "$PREVIOUS_DIR/pg_hba.conf" "$PG_CONF_DIR/" || true
-    systemctl reload postgresql 2>/dev/null || true
-    exit 44
-  fi
+# Confirm the cluster is actually active (restart can return 0 but cluster fail)
+if ! systemctl is-active --quiet postgresql; then
+  restore_previous
+  systemctl restart postgresql 2>/dev/null || true
+  echo "blocked: restored_config_invalid" >&2
+  exit 43
 fi
 
 echo "config_restored=true config_dir=$PG_CONF_DIR"
