@@ -1,0 +1,82 @@
+name: build-images
+
+# Build & push the 6 custom AADS service images to GHCR, and publish the
+# On-Device Agent payload as a release asset. The server bootstrap
+# (dist/bootstrap-server.sh) pulls these images; targets download the payload.
+#
+# Triggers on version tags (v*) and can be run manually (pushes :latest).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - name: aads-layer1-filter
+            context: ./layer1-filter
+          - name: aads-ingester
+            context: ./layer1-filter/ingester
+          - name: aads-layer2-analyzer
+            context: ./layer2-analyzer
+          - name: aads-layer4-executor
+            context: ./layer4-executor
+          - name: aads-dashboard
+            context: ./dashboard
+          - name: aads-log-archiver
+            context: ./layer0-storage/sync
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.name }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  agent-payload:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build agent payload
+        run: bash dist/build-agent-payload.sh "$GITHUB_WORKSPACE/dist/aads-agent.tgz"
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/aads-agent.tgz
+            dist/install-agent.sh

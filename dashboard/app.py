@@ -2,7 +2,7 @@
 Simple Dashboard for AI Auto-Debug System
 Display anomalies and diagnosis reports
 """
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, send_from_directory
 import asyncpg
 import asyncio
 import hashlib
@@ -260,6 +260,23 @@ async def get_anomaly_timeline(hours=24):
 def index():
     """Main dashboard page"""
     return render_template('index.html')
+
+
+# Self-serve On-Device Agent installer. The bootstrap script drops
+# install-agent.sh + aads-agent.tgz into AADS_DIST_DIR (mounted from ./dist),
+# so targets can `curl -fsSL http://<server>:5000/install-agent.sh | sudo bash`
+# without any external download source.
+DIST_DIR = os.getenv('AADS_DIST_DIR', '/app/dist')
+
+
+@app.route('/install-agent.sh')
+def serve_install_agent():
+    return send_from_directory(DIST_DIR, 'install-agent.sh', mimetype='text/x-shellscript')
+
+
+@app.route('/aads-agent.tgz')
+def serve_agent_payload():
+    return send_from_directory(DIST_DIR, 'aads-agent.tgz', mimetype='application/gzip')
 
 
 @app.route('/api/diagnosis')

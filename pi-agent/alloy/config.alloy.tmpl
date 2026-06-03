@@ -1,0 +1,55 @@
+# AADS On-Device Alloy config (template).
+# Rendered by dist/install-agent.sh — placeholders are substituted at install time:
+#   __NODE_ID__   → this node's UUID (/etc/aads-agent/node-id)
+#   __LOKI_URL__  → controller Loki base URL, e.g. http://<server>:3100
+#
+# Forwards nginx + system logs to the controller's Loki under tenant "raw",
+# tagged with node_id so Layer 1 can scope anomaly detection per node.
+
+logging {
+  level  = "info"
+  format = "logfmt"
+}
+
+loki.source.file "nginx_error" {
+  targets = [
+    {
+      __path__         = "/var/log/nginx/error.log",
+      job              = "nginx",
+      source           = "target-nginx",
+      node_id          = "__NODE_ID__",
+      service          = "nginx",
+      compose_service  = "nginx",
+      container        = "nginx",
+    },
+  ]
+
+  forward_to = [loki.write.controller.receiver]
+}
+
+loki.source.file "syslog" {
+  targets = [
+    {
+      __path__ = "/var/log/syslog",
+      job      = "syslog",
+      source   = "target-syslog",
+      node_id  = "__NODE_ID__",
+      service  = "system",
+    },
+  ]
+
+  forward_to = [loki.write.controller.receiver]
+}
+
+loki.write "controller" {
+  endpoint {
+    url = "__LOKI_URL__/loki/api/v1/push"
+    headers = {
+      "X-Scope-OrgID" = "raw",
+    }
+  }
+
+  wal {
+    enabled = true
+  }
+}
