@@ -1,176 +1,362 @@
-# Service-Coverage E2E — Handoff for Codex
+# Service-Coverage E2E — Completion Handoff
 
 **Date**: 2026-06-02
 **Branch**: `codex/ubuntu-agent-layer0-4`
-**Goal**: Extend AADS beyond nginx so it can detect & repair PostgreSQL, Redis,
-Docker containers, and MySQL/MariaDB failures. Verified by a new
-`scripts/lab/e2e-service-repair.sh` suite (scenarios `SR-*`).
+**Goal**: Extend AADS beyond nginx so it can detect and repair PostgreSQL,
+Redis, Docker container, and MySQL/MariaDB failures. Verification lives in
+`scripts/lab/e2e-service-repair.sh` (`SR-*` scenarios).
 
 ---
 
-## 1. What this work is
+## 1. What this track verifies
 
-The existing `chaos-e2e.sh` (CM-01..08, all PASS) tests **AADS's own
-resilience** — what happens when AADS components die. This new track tests the
-**opposite**: can AADS *repair the business services it monitors* when they
-break? We added a 4th service tier and a parallel test suite.
+The existing `chaos-e2e.sh` (`CM-*`) tests **AADS's own resilience** when
+controller services, agents, approvals, locks, or upstream dependencies fail.
 
-The repair pipeline for every service follows the same 4-layer pattern:
+The service-coverage suite tests the opposite side of the closed loop: can AADS
+repair the **business services it monitors** when those services break?
 
+Every supported service follows the same 4-layer pattern:
+
+```text
+Layer 1 detect -> Layer 2 diagnose+plan -> pi-agent runner execute -> SR-* verify
+Alloy/Loki        FixingPlan 3.0 steps      argv runner on target        E2E result
 ```
-Layer 1 (detect)  →  Layer 2 (diagnose+plan)  →  pi-agent catalog (execute)  →  E2E test (verify)
-   Alloy/Loki         FixingPlan v2 steps         sudo wrappers on target        SR-* scenarios
-```
+
+Supported runner operations (Layer 2 (service, operation) -> runner spec; see layer2-analyzer/src/runner_catalog.py):
+
+- nginx: 7
+- postgresql: 7
+- redis: 7
+- docker: 3
+- mysql: 7
+- system: 1
 
 ---
 
-## 2. What is DONE (committed)
+## 2. Current verification status
 
-| Commit | Content |
-|--------|---------|
-| `808230b` | Phase 1 — PostgreSQL: 5 wrappers, 7 catalog cmds, Layer 2 prompt, SR-PG-01/02/03 |
-| `4533613` | Phase 2/3/4 — Redis (5 wrappers), Docker container (2 wrappers, allowlist), MySQL (5 wrappers); 25 catalog cmds total; SR-RD/DC/MY scenarios |
-| `d981d29` | Layer 2 `_ensure_lab_node_agent_steps` extended to PG/Redis/MySQL keyword detection |
-| `a8e05a9` | Layer 2 Pydantic fix: empty `affected_service` / `root_cause` no longer crash plan generation |
-| `c50d22d` | systemd unit: `/etc/postgresql /etc/redis /etc/mysql` + log dirs added to `ReadWritePaths` |
-| `5a097d9` | restore-config wrappers: restore service-native file ownership after restore; `ReadOnlyPaths` for data dirs |
-| `da9ad94` | Layer 2: service-aware `final_verification` + `pre_execution_snapshot` + tightened `is_config_error` |
+Final full run:
 
-**pi-agent catalog now has 32 commands** (verified live via `/v1/node/facts`):
-nginx (7), postgresql (7), redis (7), docker (3), mysql (7), system (1).
+```text
+/tmp/aads-service-repair-final-20260602T115235.log
+```
+
+Result:
+
+```text
+SR-PG-01  PASS  terminal=kb_skipped, postgresql=active
+SR-PG-02  PASS  terminal=kb_skipped, postgresql=active
+SR-PG-03  PASS  blocked:snapshot_failed
+SR-RD-01  PASS  terminal=kb_skipped, redis=active
+SR-RD-02  PASS  terminal=kb_skipped, redis=active
+SR-DC-01  SKIP  Docker not installed on aads-target
+SR-DC-02  SKIP  Docker not installed on aads-target
+SR-MY-01  PASS  terminal=kb_skipped, mysql=active
+SR-MY-02  PASS  terminal=kb_skipped, mysql=active
+
+PASS: 7   FAIL: 0   SKIP: 2
+```
+
+`kb_skipped` is a successful terminal state in this lab because
+`ENABLE_KNOWLEDGE_BASE=false`.
+
+Post-cleanup health check:
+
+```text
+postgresql: /var/run/postgresql:5432 - accepting connections
+redis: PONG
+mysql: Access denied for user 'root'@'localhost' (server reachable)
+aads-agent: active
+```
+
+The MySQL check reports `Access denied` because the probe intentionally uses
+root without credentials; for this lab that still proves the server is reachable.
 
 ---
 
-## 3. Current test status (last full run, BEFORE commit da9ad94)
+## 3. Manual Gate demo status
 
-```
-SR-PG-01  FAIL  terminal=blocked, postgresql=inactive   → restored_config_invalid
-SR-PG-02  FAIL  terminal=blocked, postgresql=active
-SR-PG-03  FAIL  blocked but reason= (want snapshot_failed)
-SR-RD-01  FAIL  terminal=execution_failed, redis=active  → repair worked, final verify (nginx) failed
-SR-RD-02  FAIL  terminal=execution_failed, redis=active
-SR-DC-01  SKIP  Docker not installed
-SR-DC-02  SKIP  Docker not installed
-SR-MY-01  SKIP  MySQL not installed (was active earlier; flaky detection)
-SR-MY-02  SKIP  MySQL not installed
+Manual Gate repair demo was run after a Gate-only reset. The reset clears
+`node_locks` and `diagnosis_reports`; foreign-key cascade clears related Gate
+approvals/executions/steps/idempotency records. It intentionally keeps
+`raw_logs`, `anomaly_logs`, and `audit_events` for evidence.
+
+For the 2026-06-03 classroom flow, use
+`scripts/lab/demo-nginx-manual-gate.sh` instead of the automated
+`e2e-service-repair.sh` suite. The helper prepares only the Nginx bad-config
+scenario, waits for the restore plan, and stops before approve/execute so the
+Dashboard remains the visible control surface.
+
+Successful manual approvals/executions:
+
+| Service demo | Plan | Execution | Command | Terminal |
+| --- | --- | --- | --- | --- |
+| Nginx bad config | `diag_cluster_0_1780388144` | `exec_bf8fdb55b7e24a96b2359f8400ce9bfa` | `nginx.restore_known_good_config` | `kb_skipped` |
+| PostgreSQL stopped | `diag_cluster_0_1780388401` | `exec_5d6c0a63a5244ddb9ce32d4bd541d746` | `postgresql.restart` | `kb_skipped` |
+| Redis bad config | `diag_cluster_0_1780388700` | `exec_d545741acc924aee9eff2f343cba09fa` | `redis.restore_known_good_config` | `kb_skipped` |
+| MySQL bad config | `diag_cluster_0_1780390317` | `exec_9585cf92a913455a9b023d492a246e81` | `mysql.restore_known_good_config` | `kb_skipped` |
+
+Final MySQL execution evidence:
+
+```text
+pre_execution_snapshot:
+  mysql.ensure_config_snapshot -> success
+  snapshot_refreshed=false existing_snapshot=true service_active=false
+
+step 1:
+  mysql.restore_known_good_config -> step_verified
+  config_restored=true config_file=/etc/mysql/mysql.conf.d/mysqld.cnf
+
+final_verification:
+  mysql.connection_test -> success
+  accepting_connections=true
 ```
 
-Commit `da9ad94` is expected to fix SR-RD-01/02 (service-aware final verify),
-SR-PG-01 (stop→restart not restore; restart-based config validation), and
-SR-PG-03 (service-aware snapshot guard). **NOT yet re-tested — see step 4.**
+Post-demo target health:
+
+```text
+nginx: active; nginx -t successful
+postgresql: accepting connections
+redis: PONG
+mysql: active/running; root Access denied means server reachable
+aads-agent: active
+```
+
+Note: after a successful restore, delayed log windows can still generate a
+stale `pending_approval` item for the same service. Treat those as stale if
+target health is already good and the latest successful execution is newer than
+the injected failure.
 
 ---
 
-## 4. CRITICAL: deploy step before next test run
+## 4. Deployment workflow
 
-Code is committed to git but the **VMs run deployed copies**. After any change
-you MUST redeploy. The deploy is NOT a single script yet — this is the gap.
+The VMs run deployed copies, so code changes must be deployed before E2E runs.
+Use the new deploy helpers instead of repeating manual transfer steps.
+
+Deploy a controller compose service:
 
 ```bash
-# (a) sync repo to controller
-bash scripts/lab/sync-controller.sh
+# Default: layer2-analyzer
+bash scripts/lab/deploy-controller.sh
 
-# (b) REBUILD layer2-analyzer (force-recreate is NOT enough — code is baked into image)
-multipass exec aads-controller -- bash -lc \
-  'cd ~/AADS && sudo docker compose --env-file .env.lab build layer2-analyzer && \
-   sudo docker compose --env-file .env.lab up -d layer2-analyzer'
-
-# (c) deploy pi-agent wrappers to target (NO deploy script exists — manual transfer)
-for w in aads-postgresql-restart aads-postgresql-reload aads-postgresql-config-test \
-         aads-postgresql-ensure-config-snapshot aads-postgresql-restore-config \
-         aads-redis-restart aads-redis-reload aads-redis-config-test \
-         aads-redis-ensure-config-snapshot aads-redis-restore-config \
-         aads-docker-container-restart aads-docker-container-start \
-         aads-mysql-restart aads-mysql-reload aads-mysql-config-test \
-         aads-mysql-ensure-config-snapshot aads-mysql-restore-config; do
-  multipass transfer "pi-agent/wrappers/$w" "aads-target:/tmp/$w"
-done
-multipass exec aads-target -- sudo bash -lc \
-  'for w in /tmp/aads-postgresql-* /tmp/aads-redis-* /tmp/aads-docker-* /tmp/aads-mysql-*; do
-     cp "$w" /usr/local/sbin/ && chmod 0755 /usr/local/sbin/$(basename "$w"); done'
-
-# (d) deploy pi-agent main.py + systemd unit (if changed), restart agent
-multipass transfer pi-agent/src/main.py aads-target:/tmp/main.py
-multipass exec aads-target -- sudo bash -lc 'cp /tmp/main.py /opt/aads-agent/main.py && systemctl restart aads-agent'
-# systemd unit is at /etc/systemd/system/aads-agent.service (see commit 5a097d9 for exact content)
+# Deploy Layer 1 after filter/cursor changes
+AADS_CONTROLLER_SERVICE=layer1-filter bash scripts/lab/deploy-controller.sh
 ```
 
-**ACTION ITEM**: write `scripts/lab/deploy-target.sh` to automate (c)+(d) and
-`scripts/lab/deploy-controller.sh` wrapping (a)+(b). This was the single biggest
-time sink — manual deploy caused several false-failure test runs.
-
----
-
-## 5. Infra state on target VM (aads-target, 192.168.252.3)
-
-- **Installed & active**: nginx, postgresql@16-main, redis-server. MySQL was
-  installed but flaky (`systemctl` detection inconsistent — sometimes reports
-  not-installed). Docker NOT installed.
-- **Snapshots** at `/var/lib/aads-agent/snapshots/{postgresql,redis,mysql}/`
-  (owner `root:aads-agent`, mode 0640).
-- **sudoers** `/etc/sudoers.d/aads-agent` has all 22 wrapper grants (docker uses
-  trailing `*` for the container arg).
-- **agent.env** has `AADS_ALLOWED_JOURNAL_UNITS` (incl. pg/redis/mysql) and
-  `AADS_DOCKER_ALLOWED_CONTAINERS=aads-test-nginx`.
-- **Alloy** `/etc/alloy/config.alloy` now tails pg/redis/mysql/syslog logs (not
-  committed to git — it's a target-side file; consider capturing it in the repo).
-- **Layer 1** `.env.lab` `LAYER1_LOKI_QUERY` changed to
-  `{node_id="128d7819-9c41-45e7-ba08-ad1dd3a14b06"}` so it queries ALL services,
-  not just `{source="target-nginx"}`. **`.env.lab` is gitignored** — change is
-  live only; document or template it.
-
----
-
-## 6. Remaining TODO (priority order)
-
-1. **Re-run after deploying `da9ad94`**: `bash scripts/lab/e2e-service-repair.sh`
-   — expect SR-PG-01/02/03 and SR-RD-01/02 to flip to PASS. Verify, debug any
-   residual failures with:
-   `SELECT result::text FROM plan_executions WHERE plan_id='<id>' ORDER BY requested_at DESC LIMIT 1;`
-
-2. **Test isolation / stale-anomaly contamination**: scenarios share a Loki
-   lookback window. Bad-config log lines from SR-PG-02 can still be in-window
-   when SR-PG-01 runs next, contaminating its anomaly cluster and skewing the
-   restart-vs-restore decision. Consider: per-scenario unique markers, or a
-   longer quiet/drain period, or narrowing the cluster time window.
-
-3. **Install MySQL reliably on target** (or gate SR-MY behind a clear
-   precondition). `mysql_installed()` detection in the script is flaky.
-
-4. **Docker scenarios**: install Docker on target, create `aads-test-nginx`
-   container, then SR-DC-01/02 can run. Currently always SKIP.
-
-5. **Persist target-side config in repo**: Alloy config and `.env.lab`
-   `LAYER1_LOKI_QUERY` are live-only. Template them so a fresh `up.sh` reproduces
-   the multi-service setup.
-
-6. **Deploy automation** (see §4) — write the two deploy scripts.
-
-7. **Docs**: once green, write a Technical-Report in `docs/obsidian-vault/` and
-   run `sync-obsidian` (per CLAUDE.md rule).
-
----
-
-## 7. Key debugging commands
+Deploy target-side On-Device Agent code, systemd unit, wrappers, sudoers, and
+agent env defaults:
 
 ```bash
-# What did an execution actually do / why blocked:
+bash scripts/lab/deploy-target.sh
+```
+
+The target deploy script also verifies `/v1/node/facts` when `.aads-lab-token`
+is present.
+
+---
+
+## 5. Test commands
+
+Full suite:
+
+```bash
+bash scripts/lab/e2e-service-repair.sh
+```
+
+Single scenario:
+
+```bash
+bash scripts/lab/e2e-service-repair.sh SR-RD-02
+```
+
+By service:
+
+```bash
+bash scripts/lab/e2e-service-repair.sh --service pg
+bash scripts/lab/e2e-service-repair.sh --service redis
+bash scripts/lab/e2e-service-repair.sh --service docker
+bash scripts/lab/e2e-service-repair.sh --service mysql
+```
+
+Long runs with saved logs:
+
+```bash
+LOG=/tmp/aads-service-repair-$(date +%Y%m%dT%H%M%S).log
+stdbuf -oL -eL bash scripts/lab/e2e-service-repair.sh 2>&1 | tee "$LOG"
+```
+
+Focused local tests added for the final fixes:
+
+```bash
+uv run --with pytest --with asyncpg python -m pytest \
+  layer1-filter/tests/test_cursor_timestamp.py \
+  layer1-filter/tests/test_pattern_filter.py
+```
+
+---
+
+## 6. Fixes completed after the original handoff
+
+### Deployment automation
+
+- Added `scripts/lab/deploy-controller.sh`.
+- Added `scripts/lab/deploy-target.sh`.
+- Updated `scripts/lab/sync-controller.sh` to remove the remote checkout with
+  `sudo rm -rf`, avoiding root-owned Docker pytest cache failures.
+
+### Layer 2 schema and planning
+
+- `PreExecutionSnapshot.scope` now accepts:
+  - `nginx_config`
+  - `postgresql_config`
+  - `redis_config`
+  - `mysql_config`
+- Service-aware `pre_execution_snapshot` and `final_verification` now cover
+  PostgreSQL, Redis, and MySQL.
+- Config-error detection uses specific signatures such as `invalid line`,
+  `invalid_chaos`, `fatal config file error`, and `can't open config`, avoiding
+  false positives from generic `error` or `failed` service-down logs.
+- MySQL config-error detection now also recognizes `wrong group definition`,
+  `includedir directive`, `invalid datadir`, and `data dir not found`, so bad
+  server config routes to `mysql.restore_known_good_config` instead of
+  `mysql.restart`.
+
+### pi-agent wrappers
+
+- PostgreSQL restart/restore verify with `pg_isready`, not only the umbrella
+  `postgresql.service`.
+- PostgreSQL connection probe tries socket first, then `localhost`.
+- Redis restart/restore verify with `redis-cli ping`.
+- MySQL restart/restore verify with `mysqladmin ping`.
+- MySQL probe treats root `Access denied` as server reachable.
+- Redis/MySQL snapshot wrappers no longer refresh known-good snapshots from
+  invalid-but-nonempty configs.
+- MySQL config discovery prefers server config files (`mysqld.cnf`,
+  `50-server.cnf`) instead of the first sorted `.cnf`, which can be a client
+  config (`mysql.cnf`).
+- MySQL snapshot refresh now requires service active, server reachable, and
+  config validation success. If MySQL is already failed, the wrapper keeps the
+  previous known-good snapshot and returns success without refreshing.
+
+### E2E isolation and cleanup
+
+- Service installation checks use `systemctl cat` instead of active unit lists.
+- Reset helpers restore service-native ownership and modes.
+- Normal scenarios reset baseline before snapshot creation.
+- Stopped/bad-config/no-snapshot scenarios emit unique timestamped markers.
+- `wait_new_plan(before, expected_command_prefix)` filters by diagnosis
+  timestamp and expected command prefix, preventing stale or unrelated plans
+  from satisfying a scenario.
+- `SR-PG-03` now restores both the PostgreSQL snapshot and PostgreSQL service
+  health after validating `blocked:snapshot_failed`.
+
+### Layer 1 cursor bug
+
+One final full run exposed that Redis bad-config logs reached `raw_logs` but
+did not always become anomalies. Root cause: `layer1-filter` queried Loki with
+`direction=forward` and `limit=BATCH_SIZE`; when a window contained more than
+50 logs, Layer 1 advanced its cursor to the poll end time instead of the newest
+fetched log timestamp, skipping the rest of the window.
+
+Fix:
+
+- `layer1-filter/src/main.py` now advances `last_timestamp` to the newest
+  fetched log timestamp when logs are returned.
+- Added `layer1-filter/tests/test_cursor_timestamp.py`.
+
+Verification:
+
+```text
+SR-RD-02 PASS terminal=kb_skipped, redis=active
+```
+
+---
+
+## 7. Remaining work
+
+1. Install Docker on `aads-target` and create the allowed `aads-test-nginx`
+   container so `SR-DC-01` and `SR-DC-02` can run.
+2. Persist currently live-only lab config into repo templates:
+   - target Alloy config that tails PostgreSQL, Redis, MySQL, and syslog
+   - `.env.lab` multi-service `LAYER1_LOKI_QUERY`
+3. Consider reducing Layer 1 lab rebuild time by keeping heavyweight LogBERT
+   dependencies out of the default lab image when semantic filtering is disabled.
+4. Re-run the full suite after Docker is installed; expected target is
+   `PASS: 9 FAIL: 0 SKIP: 0`.
+5. Add diagnosis dedupe/cooldown for delayed post-repair logs that create stale
+   Gate Queue items after a successful execution.
+6. Clarify Layer 2 diagnostic command boundary. The LLM diagnostic tool runs
+   inside the analyzer container today, so common host commands like
+   `journalctl`, `ps`, `ss`, `docker`, and `curl` may be unavailable. Prefer
+   target-side runner probes (argv + extractor) for deterministic evidence.
+
+---
+
+## 8. Useful debug commands
+
+Gate-only reset for manual demos:
+
+```bash
+multipass exec aads-controller -- bash -lc "cd ~/AADS && sudo docker compose --env-file .env.lab \
+  exec -T timescaledb psql -U logdb -d logdb -c \
+  \"DELETE FROM node_locks; DELETE FROM diagnosis_reports;\""
+```
+
+One-click Nginx manual Dashboard demo:
+
+```bash
+bash scripts/lab/demo-nginx-manual-gate.sh
+bash scripts/lab/demo-nginx-manual-gate.sh --verify <DIAGNOSIS_ID>
+```
+
+Inspect execution result:
+
+```bash
 multipass exec aads-controller -- bash -lc "cd ~/AADS && sudo docker compose --env-file .env.lab \
   exec -T timescaledb psql -U logdb -d logdb -At -c \
   \"SELECT result::text FROM plan_executions WHERE plan_id='<PLAN>' ORDER BY requested_at DESC LIMIT 1;\""
-
-# Is the generated plan schema 2.0 with steps (approvable)?  Empty/404 = fallback plan = Layer 2 crashed:
-curl -s -H "X-Admin-API-Key: $(tr -d '\n' < .aads-lab-admin-key)" \
-  http://192.168.252.2:5000/api/plans/<PLAN>/approve -X POST -d '{"reason":"x"}' -H 'Content-Type: application/json'
-
-# Layer 2 crash logs (Pydantic etc.):
-multipass exec aads-controller -- bash -lc "cd ~/AADS && sudo docker compose --env-file .env.lab \
-  logs --tail=30 layer2-analyzer | grep -E 'ERROR|Exception|Pydantic'"
-
-# Long test runs: use nohup (Bash tool caps at 10min) and watch the log:
-nohup bash scripts/lab/e2e-service-repair.sh > /tmp/sr.log 2>&1 & echo $!
 ```
 
-**Gotcha**: `sql()` in the test scripts has `timeout 30` — concurrent hung
-`multipass exec` calls can exhaust SSH slots. Don't launch background DB queries
-that may hang; they block subsequent calls.
+Inspect generated plans:
+
+```bash
+multipass exec aads-controller -- bash -lc "cd ~/AADS && sudo docker compose --env-file .env.lab \
+  exec -T timescaledb psql -U logdb -d logdb -P pager=off -c \
+  \"SELECT diagnosis_id, timestamp, LEFT(action_plan::text, 260) FROM diagnosis_reports ORDER BY timestamp DESC LIMIT 20;\""
+```
+
+Confirm Layer 1 saw a marker:
+
+```bash
+multipass exec aads-controller -- bash -lc "cd ~/AADS && sudo docker compose --env-file .env.lab \
+  exec -T timescaledb psql -U logdb -d logdb -P pager=off -c \
+  \"SELECT time, source, LEFT(message, 240) FROM raw_logs WHERE message ILIKE '%<MARKER>%' ORDER BY time DESC;\""
+```
+
+Confirm anomaly promotion:
+
+```bash
+multipass exec aads-controller -- bash -lc "cd ~/AADS && sudo docker compose --env-file .env.lab \
+  exec -T timescaledb psql -U logdb -d logdb -P pager=off -c \
+  \"SELECT time, service, LEFT(raw_message, 240) FROM anomaly_logs WHERE raw_message ILIKE '%<MARKER>%' ORDER BY time DESC;\""
+```
+
+Layer 2 crash logs:
+
+```bash
+multipass exec aads-controller -- bash -lc "cd ~/AADS && sudo docker compose --env-file .env.lab \
+  logs --tail=50 layer2-analyzer | grep -E 'ERROR|Exception|Pydantic'"
+```
+
+Target health:
+
+```bash
+multipass exec aads-target -- bash -lc '
+pg_isready || true
+redis-cli ping || true
+mysqladmin -u root --connect-timeout=5 ping || true
+systemctl is-active aads-agent || true
+'
+```

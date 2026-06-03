@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""
+AADS root command runner (V2).
+
+Reads a JSON request ``{argv, cwd, env, timeout}`` from stdin and execs ``argv``
+with ``shell=False`` as root. sudoers authorizes ONLY this single wrapper, so it
+is the one and only privileged entrypoint for the On-Device Agent.
+
+Full-power by design: this wrapper does NOT constrain which argv may run. The
+safety boundary is the agent's context-aware hook + append-only audit (and future
+safety cards), not an argument allowlist here. See docs/runner-v2-plan.md and the
+"security trade-off" section: this deliberately replaces the legacy per-wrapper
+sudoers exact-command grants. Intended for the test lab; production must add
+safety-card deny rules before relying on this.
+"""
+import json
+import os
+import subprocess
+import sys
+
+
+def main() -> int:
+    try:
+        req = json.load(sys.stdin)
+    except Exception as exc:  # noqa: BLE001 - report any malformed request
+        print(f"root-runner: invalid json request: {exc}", file=sys.stderr)
+        return 64
+
+    argv = req.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(a, str) for a in argv):
+        print("root-runner: argv must be a non-empty list of strings", file=sys.stderr)
+        return 64
+
+    cwd = req.get("cwd") or "/"
+    env = os.environ.copy()
+    for key, value in (req.get("env") or {}).items():
+        if isinstance(key, str) and isinstance(value, str):
+            env[key] = value
+    timeout = req.get("timeout")
+
+    try:
+        completed = subprocess.run(argv, cwd=cwd, env=env, timeout=timeout, check=False, shell=False)
+        return completed.returncode
+    except subprocess.TimeoutExpired:
+        print("root-runner: timeout", file=sys.stderr)
+        return 124
+    except FileNotFoundError as exc:
+        print(f"root-runner: command not found: {exc}", file=sys.stderr)
+        return 127
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -10,9 +10,10 @@
 1. [系統概述](#系統概述)
 2. [架構設計](#架構設計)
 3. [快速開始](#快速開始)
-4. [配置說明](#配置說明)
-5. [使用指南](#使用指南)
-6. [開發文檔](#開發文檔)
+4. [Manual Dashboard Demo](#manual-dashboard-demo)
+5. [配置說明](#配置說明)
+6. [使用指南](#使用指南)
+7. [開發文檔](#開發文檔)
 
 ---
 
@@ -139,6 +140,41 @@ docker compose logs -f layer2-analyzer
 # 訪問 Grafana
 open http://localhost:3000  # 預設帳密: admin/admin
 ```
+
+---
+
+## Manual Dashboard Demo
+
+課堂展示用的手動 Gate demo 入口：
+
+```text
+http://100.72.172.83:5000/
+```
+
+目前推薦展示單一場景：`nginx_bad_config`。這個流程會保留 Dashboard 上的
+**Approve** 與 **Execute** 給操作人員手動按，不會用 API 自動審批或執行。
+
+一鍵準備 demo、注入 Nginx 錯誤並等待 Queue 產生：
+
+```bash
+bash scripts/lab/demo-nginx-manual-gate.sh
+```
+
+腳本會先檢查 `.env.lab`、Dashboard Admin Key、target runner v1 能力，清掉
+Gate 上 stale 的 pending/approved item，將 Nginx 還原到 known-good baseline，
+再注入壞的 `nginx.conf`。看到輸出的 `diagnosis_id` 後，請到 Dashboard 手動按
+**Approve**，再手動按 **Execute**。
+
+執行後驗證修復結果：
+
+```bash
+bash scripts/lab/demo-nginx-manual-gate.sh --verify <DIAGNOSIS_ID>
+```
+
+成功終態可接受 `kb_skipped`、`final_verified`、`kb_imported`。目前 lab 的
+`ENABLE_KNOWLEDGE_BASE=false`，所以 `kb_skipped` 是正常成功。若 Queue 同時出現多筆，
+請優先執行 runner 包含 `aads-nginx-restore-known-good` / `nginx.restore_config`
+的 restore plan，不要執行延遲 log 造成的 stale `nginx.start` item。
 
 ---
 

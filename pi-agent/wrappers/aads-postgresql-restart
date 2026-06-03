@@ -2,5 +2,8 @@
 set -euo pipefail
 
 systemctl restart postgresql
-systemctl is-active --quiet postgresql
+if ! pg_isready -q; then
+  echo "blocked: postgresql_not_ready" >&2
+  exit 44
+fi
 echo "restarted=true"

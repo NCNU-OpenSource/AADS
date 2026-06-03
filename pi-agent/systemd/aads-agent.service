@@ -14,8 +14,8 @@ RestartSec=5
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/etc/nginx /etc/postgresql /etc/redis /etc/mysql /var/lib/aads-agent /var/log/nginx /var/log/postgresql /var/log/redis /var/log/mysql /run /tmp
-ReadOnlyPaths=/var/lib/postgresql /var/lib/redis /var/lib/mysql
+ReadWritePaths=/etc/nginx -/etc/postgresql -/etc/redis -/etc/mysql /var/lib/aads-agent /var/log/nginx -/var/log/postgresql -/var/log/redis -/var/log/mysql /run /tmp
+ReadOnlyPaths=-/var/lib/postgresql -/var/lib/redis -/var/lib/mysql
 
 [Install]
 WantedBy=multi-user.target

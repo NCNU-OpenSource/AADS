@@ -3,4 +3,8 @@ set -euo pipefail
 
 systemctl restart redis-server 2>/dev/null || systemctl restart redis
 systemctl is-active --quiet redis-server 2>/dev/null || systemctl is-active --quiet redis
+if [[ "$(redis-cli ping 2>/dev/null || true)" != "PONG" ]]; then
+  echo "blocked: redis_not_ready" >&2
+  exit 44
+fi
 echo "restarted=true"

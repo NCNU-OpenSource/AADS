@@ -28,11 +28,22 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CONTROLLER="${AADS_CONTROLLER_VM:-aads-controller}"
-TARGET="${AADS_TARGET_VM:-aads-target}"
+CONTROLLER_IP="${AADS_CONTROLLER_IP:?AADS_CONTROLLER_IP must be set}"
+TARGET_IP="${AADS_TARGET_IP:?AADS_TARGET_IP must be set}"
+SSH_USER="${AADS_SSH_USER:-ubuntu}"
+SSH_KEY="${AADS_SSH_KEY:-}"
+
+if [[ -n "$SSH_KEY" ]]; then
+  SSH_OPTS="-i ${SSH_KEY} -o StrictHostKeyChecking=no -o BatchMode=yes"
+else
+  SSH_OPTS="-o StrictHostKeyChecking=no -o BatchMode=yes"
+fi
+
+ctrl()   { ssh $SSH_OPTS "${SSH_USER}@${CONTROLLER_IP}" "$@"; }
+target() { ssh $SSH_OPTS "${SSH_USER}@${TARGET_IP}" "$@"; }
 TIMEOUT_SECONDS="${AADS_CHAOS_TIMEOUT:-200}"
 ADMIN_KEY_FILE="${ROOT}/.aads-lab-admin-key"
-DASH="http://192.168.252.2:5000"
+DASH="http://${CONTROLLER_IP}:5000"
 
 PASS=0; FAIL=0; SKIP=0
 RESULTS=()
@@ -62,7 +73,7 @@ sql() {
   # timeout 30 guards against a hung multipass exec (e.g. SSH slot exhaustion
   # from concurrent connections). Callers already use "|| true" for transient
   # failures, so SIGALRM propagation is harmless — the call just returns 1.
-  timeout 30 multipass exec "$CONTROLLER" -- bash -lc \
+  timeout 30 ctrl bash -lc \
     "cd ~/AADS && sudo docker compose --env-file .env.lab exec -T timescaledb \
      psql -U logdb -d logdb -At -c $(printf '%q' "$1")" 2>/dev/null
 }
@@ -78,7 +89,7 @@ gate() {
 }
 
 target_nginx_ok() {
-  timeout 30 multipass exec "$TARGET" -- bash -lc \
+  timeout 30 target bash -lc \
     'sudo nginx -t >/dev/null 2>&1 && systemctl is-active --quiet nginx \
      && curl -fsS --max-time 8 -o /dev/null http://127.0.0.1/'
 }
@@ -87,7 +98,7 @@ reset_baseline() {
   log "reset baseline on $TARGET"
   # Use 'bash +e' inside the remote shell so individual failures don't abort
   # the reset. We explicitly check the outcome with final nginx/curl tests.
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc '
+  timeout 30 target sudo bash -lc '
     set +e  # tolerate partial failures in the restore sequence
     SNAP=/var/lib/aads-agent/snapshots/nginx
 
@@ -108,20 +119,20 @@ reset_baseline() {
   ' 2>/dev/null || log "WARNING: reset_baseline remote call failed (continuing)"
 
   # Restart Knowledge Agent in case a prior test left it stopped
-  timeout 30 multipass exec "$CONTROLLER" -- bash -lc \
+  timeout 30 ctrl bash -lc \
     'cd ~/AADS && sudo docker compose --env-file .env.lab start layer4-executor 2>/dev/null' 2>/dev/null || true
   # Release any stale node locks (failure here is non-fatal)
   sql "DELETE FROM node_locks;" 2>/dev/null || true
 }
 
 break_nginx_stopped() {
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc \
+  timeout 30 target sudo bash -lc \
     'systemctl stop nginx; logger -t nginx "nginx failed to start: chaos-e2e stop"
      printf "%s [error] nginx failed to start: chaos-e2e stop\n" "$(date -Is)" >> /var/log/nginx/error.log'
 }
 
 break_nginx_bad_config() {
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc \
+  timeout 30 target sudo bash -lc \
     'cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.chaos-bak
      echo "chaos {" >> /etc/nginx/nginx.conf
      systemctl reload nginx || true
@@ -245,7 +256,7 @@ run_cm01() {
   # Kill agent BEFORE execute so the executor's first call reliably hits a dead agent.
   # sleep 3 after execute is a race: on fast VMs the entire execution completes < 3s.
   log "CM-01: killing aads-agent on target"
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc 'systemctl stop aads-agent'
+  timeout 30 target sudo bash -lc 'systemctl stop aads-agent'
 
   local ikey="cm01-$(date +%s)"
   gate POST "/api/plans/$plan_id/execute" -H "Idempotency-Key: $ikey" -o /dev/null
@@ -255,7 +266,7 @@ run_cm01() {
   local terminal; terminal="$(wait_execution_terminal "$exec_id")"
 
   # Restart agent for subsequent tests
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc 'systemctl start aads-agent' 2>/dev/null || true
+  timeout 30 target sudo bash -lc 'systemctl start aads-agent' 2>/dev/null || true
 
   local locks; locks="$(sql "SELECT count(*) FROM node_locks;" || true)"
 
@@ -283,12 +294,12 @@ run_cm02() {
 
   sleep 5
   log "CM-02: stopping layer4-executor container"
-  timeout 30 multipass exec "$CONTROLLER" -- bash -lc \
+  timeout 30 ctrl bash -lc \
     'cd ~/AADS && sudo docker compose --env-file .env.lab stop layer4-executor 2>/dev/null'
 
   sleep 3
   log "CM-02: restarting layer4-executor container"
-  timeout 30 multipass exec "$CONTROLLER" -- bash -lc \
+  timeout 30 ctrl bash -lc \
     'cd ~/AADS && sudo docker compose --env-file .env.lab start layer4-executor 2>/dev/null'
 
   local exec_id; exec_id="$(sql "SELECT execution_id FROM plan_executions WHERE plan_id='$plan_id' ORDER BY requested_at DESC LIMIT 1;" || true)"
@@ -315,7 +326,7 @@ run_cm03() {
   sleep 30
 
   log "CM-03: stopping Loki"
-  timeout 30 multipass exec "$CONTROLLER" -- bash -lc \
+  timeout 30 ctrl bash -lc \
     'cd ~/AADS && sudo docker compose --env-file .env.lab stop loki 2>/dev/null'
   sleep 5  # let Alloy detect the connection is gone before injecting
 
@@ -335,7 +346,7 @@ run_cm03() {
   done
 
   log "CM-03: restoring Loki"
-  timeout 30 multipass exec "$CONTROLLER" -- bash -lc \
+  timeout 30 ctrl bash -lc \
     'cd ~/AADS && sudo docker compose --env-file .env.lab start loki 2>/dev/null'
 
   if [[ "$appeared" == "false" ]]; then
@@ -356,7 +367,7 @@ run_cm04() {
   sleep 30
 
   log "CM-04: stopping LiteLLM"
-  timeout 30 multipass exec "$CONTROLLER" -- bash -lc \
+  timeout 30 ctrl bash -lc \
     'cd ~/AADS && sudo docker compose --env-file .env.lab stop litellm 2>/dev/null'
 
   break_nginx_stopped
@@ -375,7 +386,7 @@ run_cm04() {
   done
 
   log "CM-04: restoring LiteLLM"
-  timeout 30 multipass exec "$CONTROLLER" -- bash -lc \
+  timeout 30 ctrl bash -lc \
     'cd ~/AADS && sudo docker compose --env-file .env.lab start litellm 2>/dev/null'
 
   if [[ "$v2_appeared" == "false" ]]; then
@@ -502,7 +513,7 @@ run_cm07() {
 
   # Remove the snapshot so ensure_known_good_snapshot has nothing to fall back to
   log "CM-07: removing nginx snapshot"
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc \
+  timeout 30 target sudo bash -lc \
     'rm -rf /var/lib/aads-agent/snapshots/nginx'
 
   local ikey="cm07-$(date +%s)"
@@ -512,7 +523,7 @@ run_cm07() {
   local terminal; terminal="$(wait_execution_terminal "$exec_id")"
 
   # Restore snapshot for subsequent tests
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc '
+  timeout 30 target sudo bash -lc '
     mkdir -p /var/lib/aads-agent/snapshots/nginx
     cp -a /etc/nginx/nginx.conf /var/lib/aads-agent/snapshots/nginx/nginx.conf
     cp -a /etc/nginx/sites-enabled /var/lib/aads-agent/snapshots/nginx/sites-enabled
@@ -544,7 +555,7 @@ run_cm08() {
 
   # Block outbound from controller to target:8090
   log "CM-08: blocking port 8090 via iptables on target"
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc \
+  timeout 30 target sudo bash -lc \
     'iptables -I INPUT -p tcp --dport 8090 -j DROP'
 
   local ikey="cm08-$(date +%s)"
@@ -555,7 +566,7 @@ run_cm08() {
   local locks; locks="$(sql "SELECT count(*) FROM node_locks;" || true)"
 
   # Remove firewall rule regardless of result
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc \
+  timeout 30 target sudo bash -lc \
     'iptables -D INPUT -p tcp --dport 8090 -j DROP 2>/dev/null || true'
 
   if [[ "$terminal" == "failed_retryable" && "$locks" -eq 0 ]]; then
@@ -576,7 +587,7 @@ fi
 # Verify admin key file exists before any gate() call can use it
 if [[ ! -f "$ADMIN_KEY_FILE" ]]; then
   echo "ERROR: admin key not found at $ADMIN_KEY_FILE" >&2
-  echo "       Create it with: multipass exec $CONTROLLER -- cat ~/.aads-lab-admin-key > $ADMIN_KEY_FILE" >&2
+  echo "       Create it with: ssh ${SSH_USER}@${CONTROLLER_IP} cat ~/.aads-lab-admin-key > $ADMIN_KEY_FILE" >&2
   exit 1
 fi
 

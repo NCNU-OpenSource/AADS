@@ -8,9 +8,22 @@ if [[ ! -f "$SNAPSHOT_DIR/my.cnf" ]]; then
   exit 42
 fi
 
-MYSQL_CONF="$(find /etc/mysql -name "*.cnf" \
-  \( -path "*/mysql.conf.d/*" -o -path "*/mariadb.conf.d/*" -o -name "my.cnf" \) \
-  2>/dev/null | sort | head -1)"
+mysql_server_config() {
+  local candidate
+  for candidate in \
+    "${AADS_MYSQL_CONF:-}" \
+    /etc/mysql/mysql.conf.d/mysqld.cnf \
+    /etc/mysql/mariadb.conf.d/50-server.cnf \
+    /etc/mysql/my.cnf; do
+    [[ -n "$candidate" && -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+  done
+
+  find /etc/mysql -type f -name "*.cnf" \
+    \( -name "mysqld.cnf" -o -name "*server*.cnf" -o -path "*/mariadb.conf.d/*.cnf" \) \
+    2>/dev/null | sort | head -1
+}
+
+MYSQL_CONF="$(mysql_server_config)"
 
 if [[ -z "$MYSQL_CONF" ]]; then
   echo "blocked: mysql_config_not_found" >&2
@@ -43,6 +56,13 @@ if ! systemctl restart "$SVC"; then
   cp -a "$PREVIOUS_DIR/my.cnf" "$MYSQL_CONF" 2>/dev/null || true
   systemctl restart "$SVC" 2>/dev/null || true
   exit 44
+fi
+
+if ! mysqladmin -u root --connect-timeout=5 ping >/dev/null 2>&1; then
+  cp -a "$PREVIOUS_DIR/my.cnf" "$MYSQL_CONF" 2>/dev/null || true
+  systemctl restart "$SVC" 2>/dev/null || true
+  echo "blocked: restored_config_invalid" >&2
+  exit 43
 fi
 
 echo "config_restored=true config_file=$MYSQL_CONF"

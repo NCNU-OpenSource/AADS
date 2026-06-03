@@ -1,9 +1,57 @@
 # AADS 測試說明文件
 
-**文件版本**: 1.0 ｜ **更新日期**: 2026-06-02 ｜ **對應分支**: `codex/ubuntu-agent-layer0-4`
+**文件版本**: 1.1 ｜ **更新日期**: 2026-06-03 ｜ **對應分支**: `codex/ubuntu-agent-layer0-4`
 
 本文件涵蓋 AADS 的兩套端對端測試：**Chaos E2E**（測系統自身韌性）與
 **Service-Coverage E2E**（測修復能力）。系統架構見 [AADS-System-Overview.md](AADS-System-Overview.md)。
+
+---
+
+## 0. Demo 入口與腳本
+
+目前 demo 的 Dashboard / Gate Console：
+
+```text
+http://100.72.172.83:5000/
+```
+
+demo lab 常用環境變數：
+
+```bash
+export AADS_CONTROLLER_IP=100.72.172.83
+export AADS_TARGET_IP=100.77.197.118
+export AADS_SSH_USER=bs10081
+```
+
+手動 UI demo 的建議入口是新的 Nginx 單場腳本。它會做部署後 demo 的現場準備與故障注入，但刻意停在 Dashboard Queue 產生後，保留 **Approve** 與 **Execute** 給 operator 手動操作：
+
+```bash
+bash scripts/lab/demo-nginx-manual-gate.sh
+```
+
+腳本會檢查：
+- `.env.lab` 必須維持 `AADS_FORCE_GATE_APPROVAL=true`
+- `AADS_NODE_ID` / `AADS_DEFAULT_NODE_ID` 必須是 `3bf76430-cf5d-44c6-8ff2-ee0161f73740`
+- `LAYER1_LOKI_QUERY` 必須是 `{node_id="3bf76430-cf5d-44c6-8ff2-ee0161f73740"}`
+- target `/v1/node/facts` 必須回 `runner_capabilities.schema_version="runner.v1"`，且不能再有 legacy `supported_commands`
+
+當腳本印出 recommended `diagnosis_id` 後，請開 Dashboard 手動按 **Approve**，再按 **Execute**。執行後用同一支腳本查 execution trace 與 Nginx health：
+
+```bash
+bash scripts/lab/demo-nginx-manual-gate.sh --verify <DIAGNOSIS_ID>
+```
+
+成功終態接受 `kb_skipped`、`final_verified`、`kb_imported`；目前 lab `ENABLE_KNOWLEDGE_BASE=false` 時 `kb_skipped` 是正常成功。
+
+Service-Coverage 腳本會自動注入故障、等待 plan、呼叫 Gate API approve/execute，適合用來展示「指令列一鍵驗證」：
+
+```bash
+bash scripts/lab/e2e-service-repair.sh              # 全部服務修復場景
+bash scripts/lab/e2e-service-repair.sh SR-PG-01     # 單一場景
+bash scripts/lab/e2e-service-repair.sh --service mysql
+```
+
+如果 demo 目標是展示 Dashboard 上的人工 Gate 流程，請不要用 `e2e-service-repair.sh` 直接跑完整場景，因為它會透過 API 自動 approve/execute。請改用 `scripts/lab/demo-nginx-manual-gate.sh`。
 
 ---
 
@@ -11,12 +59,12 @@
 
 | 維度 | Chaos E2E | Service-Coverage E2E |
 |------|-----------|---------------------|
-| 腳本 | `scripts/lab/chaos-e2e.sh` | `scripts/lab/e2e-service-repair.sh` |
+| 腳本 | `scripts/lab/chaos-e2e.sh` | `scripts/lab/e2e-service-repair.sh`；手動 UI demo 用 `scripts/lab/demo-nginx-manual-gate.sh` |
 | 場景前綴 | `CM-*` | `SR-*` |
 | 目的 | AADS **自身**掛掉還能不能活？ | AADS 能不能**修好它監控的服務**？ |
 | 故障對象 | AADS 元件（agent、executor、Loki、LiteLLM…） | 業務服務（nginx、postgresql、redis…） |
 | 驗證問題 | 安全性、狀態一致性、不洩漏 lock | 偵測 → 計畫 → 執行 → 服務恢復 |
-| 現況 | ✅ 8/8 全 PASS | 🚧 進行中（見 §4） |
+| 現況 | ✅ 8/8 全 PASS | ✅ 已安裝服務 7/7 PASS；Docker 2 項因未安裝 SKIP |
 
 兩者互補：一個確保系統壞掉時「安全停下」，一個確保服務壞掉時「能修起來」。
 
@@ -46,7 +94,7 @@ node lock 生命週期、優雅降級、恢復正確性。
 | **CM-01** agent_killed_mid_execution | execute 前殺掉 target 的 `aads-agent` | `failed_retryable`，node_locks=0 | Agent 死亡不洩漏 lock |
 | **CM-02** executor_crashed_mid_step | 執行中途 stop layer4-executor 容器再重啟 | 從 DB 恢復 → `kb_skipped` | crash 後從 DB（非記憶體）恢復、不重複執行 |
 | **CM-03** loki_unavailable | 停 Loki 90 秒並弄壞 nginx | 期間無新 anomaly 寫入 | 資料來源斷裂不誤報 |
-| **CM-04** litellm_down | 停 LiteLLM 並弄壞 nginx | 期間無 schema 2.0 plan 產生 | LLM 不可用時不亂發計畫 |
+| **CM-04** litellm_down | 停 LiteLLM 並弄壞 nginx | 期間無 schema 3.0 plan 產生 | LLM 不可用時不亂發計畫 |
 | **CM-05** approval_expired_before_exec | approve 後改 DB 讓授權過期再 execute | HTTP 403 拒絕 | 授權時間窗口硬性執行 |
 | **CM-06** concurrent_repair_lock | 注入一個 live node_lock 模擬並行 | `policy.blocked:node_locked` | 同節點最多一個執行中 |
 | **CM-07** snapshot_missing | 執行前刪掉 nginx 快照 | `blocked:snapshot_failed` | 無回滾基準時拒絕修復 |
@@ -82,6 +130,14 @@ PASS: 8   FAIL: 0   SKIP: 0
 ./scripts/lab/e2e-service-repair.sh --service pg # 只跑 PostgreSQL（pg/redis/docker/mysql）
 ```
 
+VM 使用部署副本，測試前請先同步/部署最新程式：
+
+```bash
+bash scripts/lab/deploy-controller.sh
+AADS_CONTROLLER_SERVICE=layer1-filter bash scripts/lab/deploy-controller.sh
+bash scripts/lab/deploy-target.sh
+```
+
 > 長時間執行請用 `nohup`（Bash 工具有 10 分鐘上限）：
 > `nohup bash scripts/lab/e2e-service-repair.sh > /tmp/sr.log 2>&1 &`
 
@@ -106,26 +162,89 @@ PASS: 8   FAIL: 0   SKIP: 0
 ### 安全特性：Docker 容器雙重白名單
 
 `docker.container_restart` 的容器名受**兩層**白名單管制：
-1. **pi-agent catalog** 的 `arg_allowlist`（HTTP 層，回 400）
+1. **wrapper 腳本**內的 `AADS_DOCKER_ALLOWED_CONTAINERS`（OS 層；V2 已無 catalog arg_allowlist）
 2. **wrapper 腳本**內的 `AADS_DOCKER_ALLOWED_CONTAINERS` 環境變數（OS 層）
 
 兩層缺一不可，sudoers 用 `*` 通配參數但實際管制在 wrapper。
 
 ---
 
-## 4. Service-Coverage 目前進度與已知問題
+## 4. Service-Coverage 目前狀態
 
-### 最近一次完整執行（在最終修復 commit `da9ad94` **部署前**）
+### 最終完整執行（2026-06-02）
 
 ```
-SR-PG-01  FAIL  blocked / restored_config_invalid
-SR-PG-02  FAIL  blocked
-SR-PG-03  FAIL  blocked but reason 為空
-SR-RD-01  FAIL  execution_failed（但 redis 已 active — 修復其實成功）
-SR-RD-02  FAIL  execution_failed（同上）
-SR-DC-01/02  SKIP  Docker 未安裝
-SR-MY-01/02  SKIP  MySQL 偵測 flaky
+SR-PG-01  PASS  terminal=kb_skipped, postgresql=active
+SR-PG-02  PASS  terminal=kb_skipped, postgresql=active
+SR-PG-03  PASS  blocked:snapshot_failed
+SR-RD-01  PASS  terminal=kb_skipped, redis=active
+SR-RD-02  PASS  terminal=kb_skipped, redis=active
+SR-DC-01  SKIP  Docker not installed on aads-target
+SR-DC-02  SKIP  Docker not installed on aads-target
+SR-MY-01  PASS  terminal=kb_skipped, mysql=active
+SR-MY-02  PASS  terminal=kb_skipped, mysql=active
+
+PASS: 7   FAIL: 0   SKIP: 2
 ```
+
+完整 log：`/tmp/aads-service-repair-final-20260602T115235.log`
+
+Docker 兩個場景不是失敗，而是 target VM 尚未安裝 Docker；安裝 Docker 並建立
+`aads-test-nginx` allowlisted container 後，預期完整目標為 `PASS: 9 FAIL: 0 SKIP: 0`。
+
+最後 target health：
+
+```
+postgresql: /var/run/postgresql:5432 - accepting connections
+redis: PONG
+mysql: Access denied for user 'root'@'localhost'（server reachable）
+aads-agent: active
+```
+
+`kb_skipped` 在目前 lab 是成功終態，因為 `ENABLE_KNOWLEDGE_BASE=false`。
+
+### 手動 Gate 修復 Demo（2026-06-02；2026-06-03 補一鍵 Nginx demo 腳本）
+
+這輪不是重跑自動 PASS 報表，而是從乾淨 Gate 開始，讓 operator 在 UI 手動
+Approve / Execute，驗證實際修復閉環：target service 真的被破壞，Layer 1/2
+產生 FixingPlan 3.0，Gate 出現 Queue，Layer 4 執行後服務恢復。
+
+2026-06-03 起，課堂展示建議使用 `scripts/lab/demo-nginx-manual-gate.sh` 產生單一
+Nginx bad-config 場景。它會自動拒絕 stale pending/approved queue items、還原 Nginx baseline、
+注入壞設定、等待 schema 3.0 restore plan，但不會 approve/execute。若 Queue 產生兩筆，
+選 runner 包含 `aads-nginx-restore-known-good` / `nginx.restore_config` 的那筆；延遲 log
+產生的 `nginx.start` item 視為 stale，不應執行。
+
+Gate-only reset 只清 Gate 顯示來源與執行狀態：
+
+```sql
+DELETE FROM node_locks;
+DELETE FROM diagnosis_reports;
+```
+
+`diagnosis_reports` 的外鍵 cascade 會清掉相關 `plan_approvals`、
+`plan_executions`、`execution_steps`、`plan_execute` idempotency records。
+`raw_logs`、`anomaly_logs`、`audit_events` 保留，方便追查證據。
+
+| Demo | 故障注入 | Gate plan | Expected command | Execution | Terminal | 修復驗證 |
+|------|----------|-----------|------------------|-----------|----------|----------|
+| Nginx bad config | `nginx.conf` invalid directive；`nginx -t` fail，HTTP 舊 worker 仍可能 200 | `diag_cluster_0_1780388144` | `nginx.restore_known_good_config` | `exec_bf8fdb55b7e24a96b2359f8400ce9bfa` | `kb_skipped` | `nginx -t` pass、service active、HTTP 200 |
+| PostgreSQL stopped | `systemctl stop postgresql`；`pg_isready` no response | `diag_cluster_0_1780388401` | `postgresql.restart` | `exec_5d6c0a63a5244ddb9ce32d4bd541d746` | `kb_skipped` | `postgresql.service` / `postgresql@16-main` active，`pg_isready` accepting |
+| Redis bad config | `redis.conf` invalid directive；restart fail、`redis-cli ping` refused | `diag_cluster_0_1780388700` | `redis.restore_known_good_config` | `exec_d545741acc924aee9eff2f343cba09fa` | `kb_skipped` | `redis-server.service` active，`redis-cli ping` = `PONG` |
+| MySQL bad config | `mysqld.cnf` invalid `datadir=/nonexistent/...`；restart fail、socket unreachable | `diag_cluster_0_1780390317` | `mysql.restore_known_good_config` | `exec_9585cf92a913455a9b023d492a246e81` | `kb_skipped` | `mysql.service` active/running；bad marker 0；`mysqladmin` = `Access denied`（server reachable） |
+
+MySQL demo 的最終 execution trace：
+
+```text
+step 0  mysql.ensure_config_snapshot      -> step_verified
+        snapshot_refreshed=false existing_snapshot=true service_active=false
+step 1  mysql.restore_known_good_config   -> step_verified
+        config_restored=true config_file=/etc/mysql/mysql.conf.d/mysqld.cnf
+final   mysql.connection_test             -> success, accepting_connections=true
+```
+
+這輪手動 demo 額外驗證了一件自動報表不容易暴露的事：pre-execution snapshot
+不能在服務已故障時刷新 known-good snapshot，否則會把壞設定保存成回滾基準。
 
 ### 開發過程中已修掉的 bug（依發現順序）
 
@@ -140,15 +259,19 @@ SR-MY-01/02  SKIP  MySQL 偵測 flaky
 | 7 | SR-PG-03 沒正確 block | `pre_execution_snapshot` 寫死 nginx 快照指令 | service-aware `_snapshot_command_for`（`da9ad94`） |
 | 8 | 停止服務被誤判為 config error | `is_config_error` 比對到泛用的 "error"/"failed" | 收緊成特定 config 失敗訊號（`da9ad94`） |
 | 9 | PG restore 永遠 invalid | `postgres -t` 語法錯且 binary 不在 PATH；`pg_ctlcluster` 無 configtest action | 改用 restart + is-active 當驗證（`da9ad94`） |
+| 10 | SR-RD-02 no plan generated | Layer 1 forward query 超過 `BATCH_SIZE` 時把 cursor 推到 poll end，跳過後段 Redis config error log | cursor 改推到 newest fetched log timestamp，新增 `test_cursor_timestamp.py` |
+| 11 | SR-PG-03 後 target PG 殘留 stopped | no-snapshot guard PASS 後只重建 snapshot，沒有 reset baseline | `restore_pg_after_snapshot_guard` 重建 snapshot 並重啟 PostgreSQL |
+| 12 | MySQL bad-config demo 沒真的打壞服務 | wrapper / lab helper 用排序第一個 `.cnf`，選到 client config `/etc/mysql/mysql.conf.d/mysql.cnf` | MySQL config discovery 優先選 server config：`mysqld.cnf` / `50-server.cnf` |
+| 13 | MySQL invalid datadir 被規劃成 `mysql.restart` | Layer 2 config signature 未涵蓋 `invalid datadir` / `data dir not found` / option-file parse 訊號 | 擴充 deterministic config-error signatures，移除錯誤的 `mysql.restart` execute step |
+| 14 | MySQL restore 被 snapshot 污染擋住 | `mysql.ensure_config_snapshot` 在 service failed 時仍因 `mysqld --validate-config` 回 0 而刷新壞 snapshot | snapshot refresh 必須同時滿足 service active + `mysqladmin` reachable + config validate |
 
-### 待辦（優先序）
+### 剩餘待辦（優先序）
 
-1. **部署 `da9ad94` 後重跑** — 預期 SR-PG-01/02/03、SR-RD-01/02 翻 PASS
-2. **測試隔離** — 場景共用 Loki lookback 視窗，前一場景的壞 config log 會污染下一場景的 cluster
-3. **MySQL 安裝穩定化** — `mysql_installed()` 偵測 flaky
-4. **Docker 場景** — 在 target 裝 Docker + 建 `aads-test-nginx` 容器
-5. **target 設定進 git** — Alloy config、`.env.lab` 的 `LOKI_QUERY` 目前只在線上
-6. **部署自動化** — 寫 `deploy-target.sh` / `deploy-controller.sh`
+1. **Docker 場景** — 在 target 裝 Docker + 建 `aads-test-nginx` 容器
+2. **target 設定進 git** — Alloy config、`.env.lab` 的 `LAYER1_LOKI_QUERY` 目前仍是 live-only
+3. **Layer 1 lab image 輕量化** — 若語意過濾未啟用，避免預設 rebuild 仍下載 torch/transformers
+4. **Gate duplicate / stale plan handling** — repair 成功後，延遲 log window 仍可能再產生一筆同服務 `pending_approval`（例如 MySQL post-recovery `mysql.restart`）。操作上先以 target health 和最新 successful execution 判斷，不應直接 execute stale item；後續可加入 diagnosis dedupe / cooldown。
+5. **Layer 2 diagnostic command boundary** — LLM agent 的 `execute_diagnostic_command` 目前在 analyzer container 內跑，常遇到 `journalctl`、`ps`、`ss`、`docker`、`curl` 不存在。deterministic post-process 可補足修復步驟，但 RCA 工具邊界仍需釐清：要改成 target-side probes，或明確限制為 controller-local diagnostics。
 
 詳細交接見 [service-coverage-handoff.md](service-coverage-handoff.md)。
 
@@ -162,7 +285,7 @@ multipass exec aads-controller -- bash -lc "cd ~/AADS && sudo docker compose --e
   exec -T timescaledb psql -U logdb -d logdb -At -c \
   \"SELECT result::text FROM plan_executions WHERE plan_id='<PLAN>' ORDER BY requested_at DESC LIMIT 1;\""
 
-# 確認 plan 是否為可審批的 schema 2.0（空/404 = fallback = Layer 2 出錯）：
+# 確認 plan 是否為可審批的 schema 3.0（空/404 = fallback = Layer 2 出錯）：
 curl -s -H \"X-Admin-API-Key: $(tr -d '\n' < .aads-lab-admin-key)\" \
   -X POST http://192.168.252.2:5000/api/plans/<PLAN>/approve \
   -H 'Content-Type: application/json' -d '{\"reason\":\"x\"}'
@@ -171,9 +294,9 @@ curl -s -H \"X-Admin-API-Key: $(tr -d '\n' < .aads-lab-admin-key)\" \
 multipass exec aads-controller -- bash -lc "cd ~/AADS && sudo docker compose --env-file .env.lab \
   logs --tail=30 layer2-analyzer | grep -E 'ERROR|Exception|Pydantic'"
 
-# 確認 catalog 指令已上線：
+# 確認 runner capabilities 已上線：
 curl -s -H \"Authorization: Bearer <token>\" http://192.168.252.3:8090/v1/node/facts | \
-  python3 -c \"import sys,json; print(len(json.load(sys.stdin)['supported_commands']), 'commands')\"
+  python3 -c \"import sys,json; print(json.load(sys.stdin)['runner_capabilities'])\"
 ```
 
 **Gotcha**：測試腳本的 `sql()` 有 `timeout 30`。不要在背景發可能 hang 的 DB 查詢，

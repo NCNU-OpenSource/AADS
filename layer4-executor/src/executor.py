@@ -1,15 +1,24 @@
 """
 Knowledge Agent executor.
 
-Consumes queued FixingPlan v2 executions, validates Gate/policy, calls the
-On-Device Agent catalog API one step at a time, verifies each step with a
-catalog probe, and records append-only audit events. This process is
-deterministic and intentionally imports no LLM client.
+Consumes queued FixingPlan 3.0 executions, validates Gate/policy, calls the
+On-Device Agent runner API (``POST /v1/commands/run``) one step at a time,
+verifies each step by running a read-only runner and extracting structured
+fields, and records append-only audit events. This process is deterministic and
+intentionally imports no LLM client.
+
+Removal note (legacy): this previously consumed FixingPlan 2.0 ``command_id``
+steps and looked up catalog metadata (``scope`` / ``idempotent`` /
+``retry_policy``) from node facts ``supported_commands``. The catalog is gone;
+behaviour now comes from the plan's runner specs: ``runner.side_effect`` drives
+locking, ``step.idempotency`` drives retry, ``verification.extract`` drives
+structured verification, and ``plan.rollback.runner`` drives rollback.
 """
 import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,7 +32,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("knowledge-agent")
 
-SUPPORTED_PLAN_SCHEMA = "2.0"
+SUPPORTED_PLAN_SCHEMA = "3.0"
 POLL_INTERVAL = int(os.getenv("EXECUTOR_POLL_INTERVAL", "5"))
 DEFAULT_LOCK_TTL_SECONDS = int(os.getenv("NODE_LOCK_TTL_SECONDS", "120"))
 ON_DEVICE_AGENT_TOKEN = os.getenv("PI_AGENT_TOKEN", os.getenv("AADS_AGENT_TOKEN", ""))
@@ -163,17 +172,10 @@ class Executor:
                 await self.finish_execution(conn, execution_id, "blocked", {"reason": "approval_required_or_expired"})
                 return
 
-        node, facts = await self.load_node_and_facts(plan_id, target_node_id, idempotency_key)
+        node = await self.load_node(plan_id, target_node_id, idempotency_key)
         if not node:
             async with self.pool.acquire() as conn:
                 await self.finish_execution(conn, execution_id, "failed_retryable", {"reason": "agent_unreachable_or_unknown"})
-            return
-
-        command_check = self.validate_supported_commands(plan, facts)
-        if command_check:
-            async with self.pool.acquire() as conn:
-                await self.audit(conn, "policy.blocked", plan_id, None, target_node_id, schema_version, command_check, idempotency_key, 0, "blocked", {})
-                await self.finish_execution(conn, execution_id, "blocked", {"reason": command_check})
             return
 
         if not self.environment_allowed(node["environment"], plan.get("environment_policy") or {}):
@@ -183,17 +185,17 @@ class Executor:
             return
 
         final_result: Dict[str, Any] = {"steps": []}
-        any_mutating = any(self.find_command(facts, step["command_id"], step.get("schema_version", "1.0")).get("scope") == "action" for step in plan["steps"])
+        any_mutating = any((step.get("runner") or {}).get("side_effect") == "mutate" for step in plan["steps"])
 
-        if any_mutating and plan.get("pre_execution_snapshot", {}).get("enabled", True):
-            snapshot_status, snapshot_result = await self.ensure_snapshot(execution_id, plan_id, idempotency_key, schema_version, plan, node, facts)
+        if any_mutating and plan.get("pre_execution_snapshot", {}).get("enabled", False):
+            snapshot_status, snapshot_result = await self.ensure_snapshot(execution_id, plan_id, idempotency_key, schema_version, plan, node)
             final_result["pre_execution_snapshot"] = snapshot_result
             if snapshot_status != "step_verified":
                 async with self.pool.acquire() as conn:
                     await self.finish_execution(conn, execution_id, "blocked", {"reason": "snapshot_failed", **final_result})
                 return
 
-        resume_index = await self.recovery_start_index(execution_id, plan, node, facts, idempotency_key)
+        resume_index = await self.recovery_start_index(execution_id, plan, node, idempotency_key)
         if resume_index == -1:
             async with self.pool.acquire() as conn:
                 await self.finish_execution(conn, execution_id, "execution_failed_unknown_state", {"reason": "running_step_not_recoverable"})
@@ -208,12 +210,11 @@ class Executor:
                 plan,
                 step,
                 node,
-                facts,
             )
             final_result["steps"].append({"step_id": step["step_id"], "status": step_status, "result": step_result})
             if step_status != "step_verified":
-                if step_status == "step_failed_aborted" and plan.get("pre_execution_snapshot", {}).get("enabled", True):
-                    rollback_status, rollback_result = await self.rollback(execution_id, plan_id, idempotency_key, schema_version, plan, node, facts)
+                if step_status == "step_failed_aborted" and (plan.get("rollback") or {}).get("enabled", False):
+                    rollback_status, rollback_result = await self.rollback(execution_id, plan_id, idempotency_key, schema_version, plan, node)
                     final_result["rollback"] = {"status": rollback_status, "result": rollback_result}
                 async with self.pool.acquire() as conn:
                     terminal = "blocked" if step_status == "step_failed_blocked" else "execution_failed"
@@ -225,7 +226,7 @@ class Executor:
             await conn.execute("UPDATE diagnosis_reports SET plan_status = 'final_verifying' WHERE diagnosis_id = $1", plan_id)
             await self.audit(conn, "execution.final_verifying", plan_id, None, target_node_id, schema_version, "allowed", idempotency_key, 0, "final_verifying", {})
 
-        final_status, final_payload = await self.run_verification(plan["final_verification"], plan_id, None, idempotency_key, schema_version, node, facts, event_prefix="final_verification", execution_id=None)
+        final_status, final_payload = await self.run_verification(plan["final_verification"], plan_id, None, idempotency_key, schema_version, node, event_prefix="final_verification", execution_id=None)
         final_result["final_verification"] = final_payload
         if final_status != "step_verified":
             async with self.pool.acquire() as conn:
@@ -249,26 +250,26 @@ class Executor:
         plan: Dict[str, Any],
         step: Dict[str, Any],
         node,
-        facts: Dict[str, Any],
     ) -> Tuple[str, Dict[str, Any]]:
-        command_meta = self.find_command(facts, step["command_id"], step.get("schema_version", "1.0"))
-        status, command_result = await self.run_catalog_command(
+        step_label = self.step_label(step)
+        status, command_result = await self.run_runner_command(
             plan_id,
             step["step_id"],
             idempotency_key,
             schema_version,
             node,
-            command_meta,
-            step.get("args") or {},
+            step["runner"],
+            step.get("context") or {},
+            step.get("idempotency") or {},
             execution_id,
         )
         if status == "blocked":
             async with self.pool.acquire() as conn:
-                await self.upsert_step(conn, execution_id, step["step_id"], "step_failed_blocked", step["command_id"], node["node_id"], idempotency_key, command_result.get("retry_count", 0), command_result)
+                await self.upsert_step(conn, execution_id, step["step_id"], "step_failed_blocked", step_label, node["node_id"], idempotency_key, command_result.get("retry_count", 0), command_result)
             return "step_failed_blocked", command_result
         if status != "success":
             async with self.pool.acquire() as conn:
-                await self.upsert_step(conn, execution_id, step["step_id"], "step_failed_aborted", step["command_id"], node["node_id"], idempotency_key, command_result.get("retry_count", 0), command_result)
+                await self.upsert_step(conn, execution_id, step["step_id"], "step_failed_aborted", step_label, node["node_id"], idempotency_key, command_result.get("retry_count", 0), command_result)
             return "step_failed_aborted", command_result
 
         verification_status, verification_result = await self.run_verification(
@@ -278,39 +279,57 @@ class Executor:
             idempotency_key,
             schema_version,
             node,
-            facts,
             event_prefix="step_verification",
             execution_id=execution_id,
         )
         result = {"command": command_result, "verification": verification_result}
         if verification_status == "step_verified":
             async with self.pool.acquire() as conn:
-                await self.upsert_step(conn, execution_id, step["step_id"], "step_verified", step["command_id"], node["node_id"], idempotency_key, command_result.get("retry_count", 0), result)
+                await self.upsert_step(conn, execution_id, step["step_id"], "step_verified", step_label, node["node_id"], idempotency_key, command_result.get("retry_count", 0), result)
             return "step_verified", result
 
         async with self.pool.acquire() as conn:
-            await self.upsert_step(conn, execution_id, step["step_id"], "step_failed_aborted", step["command_id"], node["node_id"], idempotency_key, command_result.get("retry_count", 0), result)
+            await self.upsert_step(conn, execution_id, step["step_id"], "step_failed_aborted", step_label, node["node_id"], idempotency_key, command_result.get("retry_count", 0), result)
         return "step_failed_aborted", result
 
-    async def run_catalog_command(
+    @staticmethod
+    def step_label(step: Dict[str, Any]) -> str:
+        """Human/audit label for a runner step (replaces legacy command_id)."""
+        context = step.get("context") or {}
+        service = context.get("service")
+        operation = context.get("operation")
+        if service and operation:
+            return f"{service}.{operation}"
+        argv = (step.get("runner") or {}).get("argv") or []
+        return argv[0] if argv else "runner"
+
+    async def run_runner_command(
         self,
         plan_id: str,
         step_id: Optional[int],
         idempotency_key: str,
         schema_version: str,
         node,
-        command_meta: Dict[str, Any],
-        args: Dict[str, Any],
+        runner: Dict[str, Any],
+        context: Dict[str, Any],
+        idempotency: Dict[str, Any],
         execution_id: str,
     ) -> Tuple[str, Dict[str, Any]]:
+        """
+        Execute one runner spec via the agent's ``/v1/commands/run``.
+
+        ``runner.side_effect == "mutate"`` is what acquires the node lock — not
+        ``as_root``. Retry count comes from ``idempotency``, not catalog metadata.
+        The agent returns HTTP 200 with a structured body even when the command
+        exits non-zero, so the body (returncode/stdout/stderr) is always returned
+        to the caller for extraction/verification.
+        """
         base_url = node["base_url"].rstrip("/")
-        command_id = command_meta["command_id"]
         node_id = node["node_id"]
-        scope = command_meta.get("scope", "probe")
-        mutating = scope == "action"
-        endpoint = "/v1/actions/run" if mutating else "/v1/probes/run"
-        timeout = int(command_meta.get("timeout_seconds", 30))
-        attempts = self.max_attempts(mutating, command_meta)
+        label = context.get("service", "") and f"{context.get('service')}.{context.get('operation')}" or (runner.get("argv") or ["runner"])[0]
+        mutating = runner.get("side_effect") == "mutate"
+        timeout = int(runner.get("timeout_seconds", 30))
+        attempts = self.max_attempts(idempotency)
         lock_id = None
 
         if mutating:
@@ -320,30 +339,37 @@ class Executor:
                     await self.audit(conn, "policy.blocked", plan_id, step_id, node_id, schema_version, "node_locked", idempotency_key, 0, "blocked", {})
                     return "blocked", {"reason": "node_locked", "retry_count": 0}
 
+        body = {"schema_version": "runner.v1", "runner": runner, "context": context, "idempotency": idempotency}
         try:
             last_payload: Dict[str, Any] = {}
             for attempt in range(1, attempts + 1):
                 retry_count = attempt - 1
                 async with self.pool.acquire() as conn:
                     if step_id is not None:
-                        await self.upsert_step(conn, execution_id, step_id, "step_running", command_id, node_id, idempotency_key, retry_count)
-                    await self.audit(conn, "execution.attempt", plan_id, step_id, node_id, schema_version, "allowed", idempotency_key, retry_count, "step_running", {"command_id": command_id})
+                        await self.upsert_step(conn, execution_id, step_id, "step_running", label, node_id, idempotency_key, retry_count)
+                    await self.audit(conn, "execution.attempt", plan_id, step_id, node_id, schema_version, "allowed", idempotency_key, retry_count, "step_running", {"label": label, "as_root": runner.get("as_root", False), "side_effect": runner.get("side_effect", "read")})
 
-                status, payload = await self.call_agent(
-                    base_url,
-                    "POST",
-                    endpoint,
-                    {"command_id": command_id, "schema_version": command_meta.get("schema_version", "1.0"), "args": args},
-                    timeout,
-                )
+                transport, payload = await self.call_agent(base_url, "POST", "/v1/commands/run", body, timeout)
+                if transport != "success":
+                    # HTTP/transport error (no structured body); retry if attempts remain.
+                    payload["retry_count"] = retry_count
+                    last_payload = payload
+                    if attempt < attempts:
+                        await self.audit_event(plan_id, step_id, node_id, schema_version, "execution.retrying", idempotency_key, retry_count, "step_failed_retried", payload)
+                        continue
+                    await self.audit_event(plan_id, step_id, node_id, schema_version, "execution.command_failed", idempotency_key, retry_count, "failed_retryable", payload)
+                    return "error", payload
+
                 payload["retry_count"] = retry_count
                 last_payload = payload
-                if status == "success":
-                    await self.audit_event(plan_id, step_id, node_id, schema_version, "execution.command_success", idempotency_key, retry_count, "success", payload)
-                    return "success", payload
-                if status == "blocked":
+                run_status = payload.get("status")
+                if run_status == "blocked":
                     await self.audit_event(plan_id, step_id, node_id, schema_version, "execution.command_blocked", idempotency_key, retry_count, "blocked", payload)
                     return "blocked", payload
+                if run_status == "success":
+                    await self.audit_event(plan_id, step_id, node_id, schema_version, "execution.command_success", idempotency_key, retry_count, "success", payload)
+                    return "success", payload
+                # run_status in (failed, timeout): the command ran but exited non-zero.
                 if attempt < attempts:
                     await self.audit_event(plan_id, step_id, node_id, schema_version, "execution.retrying", idempotency_key, retry_count, "step_failed_retried", payload)
 
@@ -362,32 +388,49 @@ class Executor:
         idempotency_key: str,
         schema_version: str,
         node,
-        facts: Dict[str, Any],
         event_prefix: str,
         execution_id: Optional[str],
     ) -> Tuple[str, Dict[str, Any]]:
-        command_meta = self.find_command(facts, verification["command_id"], verification.get("schema_version", "1.0"))
-        if not command_meta or command_meta.get("scope") != "probe":
-            payload = {"reason": "verification_probe_not_supported", "command_id": verification.get("command_id")}
+        runner = verification.get("runner") or {}
+        if not runner.get("argv"):
+            payload = {"reason": "verification_runner_invalid"}
+            await self.audit_event(plan_id, step_id, node["node_id"], schema_version, f"{event_prefix}.blocked", idempotency_key, 0, "blocked", payload)
+            return "step_failed_blocked", payload
+        if runner.get("side_effect", "read") != "read":
+            payload = {"reason": "verification_runner_not_read"}
             await self.audit_event(plan_id, step_id, node["node_id"], schema_version, f"{event_prefix}.blocked", idempotency_key, 0, "blocked", payload)
             return "step_failed_blocked", payload
 
-        status, payload = await self.run_catalog_command(
+        # Verification never retries on a non-zero exit: a probe that "fails" by
+        # design (e.g. is-active -> inactive) must still yield its output so we can
+        # extract structured fields and decide via matches_expected.
+        status, payload = await self.run_runner_command(
             plan_id,
             step_id,
             idempotency_key,
             schema_version,
             node,
-            command_meta,
-            verification.get("args") or {},
+            runner,
+            verification.get("context") or {"purpose": "verify", **{k: v for k, v in (verification.get("context") or {}).items()}},
+            {"mode": "idempotent", "max_attempts": 1},
             execution_id or f"verify_{plan_id}_{step_id or 0}",
         )
-        if status != "success":
+        if status == "blocked":
+            await self.audit_event(plan_id, step_id, node["node_id"], schema_version, f"{event_prefix}.blocked", idempotency_key, payload.get("retry_count", 0), "blocked", payload)
+            return "step_failed_blocked", payload
+        if status == "error":
             await self.audit_event(plan_id, step_id, node["node_id"], schema_version, f"{event_prefix}.failed", idempotency_key, payload.get("retry_count", 0), "failed", payload)
             return "step_failed_aborted", payload
 
-        match, mismatches = self.matches_expected(payload, verification.get("expected") or {})
-        result = {"status": "success" if match else "failed", "observed": payload, "expected": verification.get("expected") or {}, "mismatches": mismatches}
+        observed = self.apply_extractors(payload, verification.get("extract") or {})
+        match, mismatches = self.matches_expected(observed, verification.get("expected") or {})
+        result = {
+            "status": "success" if match else "failed",
+            "observed": observed,
+            "expected": verification.get("expected") or {},
+            "mismatches": mismatches,
+            "raw": {"returncode": payload.get("returncode"), "stdout": payload.get("stdout"), "stderr": payload.get("stderr")},
+        }
         await self.audit_event(
             plan_id,
             step_id,
@@ -401,35 +444,91 @@ class Executor:
         )
         return ("step_verified", result) if match else ("step_failed_aborted", result)
 
-    async def ensure_snapshot(self, execution_id: str, plan_id: str, idempotency_key: str, schema_version: str, plan: Dict[str, Any], node, facts: Dict[str, Any]):
+    def apply_extractors(self, result: Dict[str, Any], extract_spec: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Turn a runner result (returncode/stdout/stderr) into a structured
+        ``observed`` dict per the declarative extract rules. This is the trust
+        boundary for verification: only these five sources are readable, and the
+        op decides the value type (bool/int/value/string).
+        """
+        observed: Dict[str, Any] = {}
+        for key, rule in (extract_spec or {}).items():
+            source = rule.get("from", rule.get("from_"))
+            if source == "returncode":
+                text = "" if result.get("returncode") is None else str(result.get("returncode"))
+            elif source == "stdout":
+                text = result.get("stdout", "") or ""
+            elif source == "stderr":
+                text = result.get("stderr", "") or ""
+            elif source == "stdout_stripped":
+                text = (result.get("stdout", "") or "").strip()
+            elif source == "stderr_stripped":
+                text = (result.get("stderr", "") or "").strip()
+            else:
+                text = ""
+
+            if rule.get("equals") is not None:
+                observed[key] = text == rule["equals"]
+            elif rule.get("contains") is not None:
+                observed[key] = rule["contains"] in text
+            elif rule.get("regex") is not None:
+                observed[key] = bool(re.search(rule["regex"], text))
+            elif rule.get("as_int"):
+                try:
+                    observed[key] = int(text.strip())
+                except (ValueError, TypeError):
+                    observed[key] = None
+            elif rule.get("json_path"):
+                observed[key] = self._json_path_value(text, rule["json_path"])
+            elif source == "returncode":
+                observed[key] = result.get("returncode")
+            else:
+                observed[key] = text
+        return observed
+
+    @staticmethod
+    def _json_path_value(text: str, path: str) -> Any:
+        try:
+            data: Any = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+        for part in str(path).split("."):
+            if isinstance(data, dict) and part in data:
+                data = data[part]
+            else:
+                return None
+        return data
+
+    async def ensure_snapshot(self, execution_id: str, plan_id: str, idempotency_key: str, schema_version: str, plan: Dict[str, Any], node):
         spec = plan.get("pre_execution_snapshot") or {}
-        command_id = spec.get("command_id", "nginx.ensure_known_good_snapshot")
-        command_meta = self.find_command(facts, command_id, "1.0")
-        if not command_meta:
-            return "step_failed_blocked", {"reason": "snapshot_command_not_supported", "command_id": command_id}
-        status, result = await self.run_catalog_command(plan_id, 0, idempotency_key, schema_version, node, command_meta, spec.get("args") or {}, execution_id)
+        runner = spec.get("runner") or {}
+        label = f"{(spec.get('scope') or 'snapshot')}.ensure_snapshot"
+        if not runner.get("argv"):
+            return "step_failed_blocked", {"reason": "snapshot_runner_invalid"}
+        status, result = await self.run_runner_command(plan_id, 0, idempotency_key, schema_version, node, runner, {"purpose": "snapshot", "operation": "ensure_snapshot"}, spec.get("idempotency") or {"mode": "idempotent", "max_attempts": 2}, execution_id)
         if status == "success":
             async with self.pool.acquire() as conn:
-                await self.upsert_step(conn, execution_id, 0, "step_verified", command_id, node["node_id"], idempotency_key, result.get("retry_count", 0), result)
+                await self.upsert_step(conn, execution_id, 0, "step_verified", label, node["node_id"], idempotency_key, result.get("retry_count", 0), result)
             await self.audit_event(plan_id, 0, node["node_id"], schema_version, "snapshot.ready", idempotency_key, result.get("retry_count", 0), "step_verified", result)
             return "step_verified", result
         step_status = "step_failed_blocked" if status == "blocked" else "step_failed_aborted"
         async with self.pool.acquire() as conn:
-            await self.upsert_step(conn, execution_id, 0, step_status, command_id, node["node_id"], idempotency_key, result.get("retry_count", 0), result)
+            await self.upsert_step(conn, execution_id, 0, step_status, label, node["node_id"], idempotency_key, result.get("retry_count", 0), result)
         await self.audit_event(plan_id, 0, node["node_id"], schema_version, "snapshot.failed", idempotency_key, result.get("retry_count", 0), step_status, result)
         return status, result
 
-    async def rollback(self, execution_id: str, plan_id: str, idempotency_key: str, schema_version: str, plan: Dict[str, Any], node, facts: Dict[str, Any]):
-        command_meta = self.find_command(facts, "nginx.restore_known_good_config", "1.0")
-        if not command_meta:
-            return "rollback_failed", {"reason": "rollback_command_not_supported"}
+    async def rollback(self, execution_id: str, plan_id: str, idempotency_key: str, schema_version: str, plan: Dict[str, Any], node):
+        spec = plan.get("rollback") or {}
+        runner = spec.get("runner") or {}
+        if not spec.get("enabled") or not runner.get("argv"):
+            return "rollback_skipped", {"reason": "rollback_runner_not_configured"}
         await self.audit_event(plan_id, None, node["node_id"], schema_version, "rollback.running", idempotency_key, 0, "rollback_running", {})
-        status, result = await self.run_catalog_command(plan_id, None, idempotency_key, schema_version, node, command_meta, {}, execution_id)
+        status, result = await self.run_runner_command(plan_id, None, idempotency_key, schema_version, node, runner, {"purpose": "rollback", "operation": "restore_config"}, {"mode": "idempotent", "max_attempts": 1}, execution_id)
         rollback_status = "rollback_completed" if status == "success" else "rollback_failed"
         await self.audit_event(plan_id, None, node["node_id"], schema_version, f"rollback.{rollback_status}", idempotency_key, result.get("retry_count", 0), rollback_status, result)
         return rollback_status, result
 
-    async def recovery_start_index(self, execution_id: str, plan: Dict[str, Any], node, facts: Dict[str, Any], idempotency_key: str) -> int:
+    async def recovery_start_index(self, execution_id: str, plan: Dict[str, Any], node, idempotency_key: str) -> int:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -448,30 +547,31 @@ class Executor:
             if row["status"] == "step_verified":
                 continue
             if row["status"] == "step_running":
-                verification_status, _ = await self.run_verification(step["verification"], plan["plan_id"], step["step_id"], idempotency_key, plan["schema_version"], node, facts, "recovery_verification", execution_id=execution_id)
+                verification_status, _ = await self.run_verification(step["verification"], plan["plan_id"], step["step_id"], idempotency_key, plan["schema_version"], node, "recovery_verification", execution_id=execution_id)
                 if verification_status == "step_verified":
                     async with self.pool.acquire() as conn:
-                        await self.upsert_step(conn, execution_id, step["step_id"], "step_verified", step["command_id"], node["node_id"], idempotency_key, row["retry_count"], {"recovered": True})
+                        await self.upsert_step(conn, execution_id, step["step_id"], "step_verified", self.step_label(step), node["node_id"], idempotency_key, row["retry_count"], {"recovered": True})
                     continue
-                command_meta = self.find_command(facts, step["command_id"], step.get("schema_version", "1.0"))
-                if command_meta and command_meta.get("idempotent") is True and row["retry_count"] < self.max_attempts(command_meta.get("scope") == "action", command_meta) - 1:
+                idempotency = step.get("idempotency") or {}
+                if idempotency.get("mode") == "idempotent" and row["retry_count"] < self.max_attempts(idempotency) - 1:
                     return index
                 return -1
             return -1
         return len(plan["steps"])
 
-    async def load_node_and_facts(self, plan_id: str, target_node_id: str, idempotency_key: str):
+    async def load_node(self, plan_id: str, target_node_id: str, idempotency_key: str):
         assert self.pool
         async with self.pool.acquire() as conn:
             node = await conn.fetchrow("SELECT * FROM agent_nodes WHERE node_id = $1", target_node_id)
             if not node:
                 await self.audit(conn, "policy.blocked", plan_id, None, target_node_id, SUPPORTED_PLAN_SCHEMA, "unknown_node", idempotency_key, 0, "blocked", {})
-                return None, {}
+                return None
+        # Reachability check only — the catalog is gone, facts no longer gate commands.
         status, facts = await self.call_agent(node["base_url"].rstrip("/"), "GET", "/v1/node/facts", None, 10)
         if status != "success":
             await self.audit_event(plan_id, None, target_node_id, SUPPORTED_PLAN_SCHEMA, "agent.unreachable", idempotency_key, 0, "failed_retryable", facts)
-            return None, {}
-        return node, facts
+            return None
+        return node
 
     def validate_plan(self, plan: Dict[str, Any], schema_version: str) -> Optional[str]:
         if schema_version != SUPPORTED_PLAN_SCHEMA or plan.get("schema_version") != SUPPORTED_PLAN_SCHEMA:
@@ -489,43 +589,48 @@ class Executor:
         if orders != sorted(orders) or len(set(orders)) != len(orders):
             return "invalid_step_order"
         for step in steps:
-            for field in ["step_id", "order", "command_id", "args", "expected_outcome", "on_failure", "verification"]:
+            for field in ["step_id", "order", "runner", "expected_outcome", "on_failure", "verification"]:
                 if field not in step:
                     return f"missing_step_{field}"
-            if step["on_failure"] == "continue":
-                return "continue_not_enabled"
+            if step["on_failure"] not in ("abort", "rollback"):
+                return "invalid_on_failure"
+            reason = self.validate_runner(step.get("runner"), require_read=False)
+            if reason:
+                return reason
             reason = self.validate_verification(step["verification"])
             if reason:
                 return reason
         return self.validate_verification(plan["final_verification"])
 
+    def validate_runner(self, runner: Optional[Dict[str, Any]], require_read: bool) -> Optional[str]:
+        if not isinstance(runner, dict):
+            return "missing_runner"
+        argv = runner.get("argv")
+        if not isinstance(argv, list) or not argv or any((not isinstance(a, str) or a == "") for a in argv):
+            return "invalid_runner_argv"
+        if runner.get("mode", "argv") != "argv":
+            return "unsupported_runner_mode"
+        if runner.get("side_effect", "read") not in ("read", "mutate"):
+            return "invalid_side_effect"
+        if require_read and runner.get("side_effect", "read") != "read":
+            return "verification_runner_not_read"
+        return None
+
     def validate_verification(self, verification: Dict[str, Any]) -> Optional[str]:
-        if verification.get("type", "catalog_probe") != "catalog_probe":
+        if verification.get("type", "runner_probe") != "runner_probe":
             return "invalid_verification_type"
-        if not verification.get("command_id"):
-            return "missing_verification_command"
+        reason = self.validate_runner(verification.get("runner"), require_read=True)
+        if reason:
+            return reason
         expected = verification.get("expected")
         if not isinstance(expected, dict) or not expected:
             return "invalid_structured_verification"
         if any(key in expected for key in {"text", "prompt", "llm_judge"}):
             return "free_text_verification_not_allowed"
-        return None
-
-    def validate_supported_commands(self, plan: Dict[str, Any], facts: Dict[str, Any]) -> Optional[str]:
-        snapshot = plan.get("pre_execution_snapshot") or {}
-        snapshot_command = snapshot.get("command_id")
-        if snapshot.get("enabled", True) and snapshot_command and not self.find_command(facts, snapshot_command, "1.0"):
-            return "unsupported_snapshot_command"
-        for step in plan["steps"]:
-            if not self.find_command(facts, step["command_id"], step.get("schema_version", "1.0")):
-                return "unsupported_command"
-            verification = step["verification"]
-            meta = self.find_command(facts, verification["command_id"], verification.get("schema_version", "1.0"))
-            if not meta or meta.get("scope") != "probe":
-                return "unsupported_verification_probe"
-        final_meta = self.find_command(facts, plan["final_verification"]["command_id"], plan["final_verification"].get("schema_version", "1.0"))
-        if not final_meta or final_meta.get("scope") != "probe":
-            return "unsupported_final_verification_probe"
+        extract = verification.get("extract") or {}
+        missing = set(expected.keys()) - set(extract.keys())
+        if missing:
+            return "extract_missing_expected_keys"
         return None
 
     def environment_allowed(self, node_environment: str, env_policy: Dict[str, Any]) -> bool:
@@ -544,21 +649,14 @@ class Executor:
             and policy.get("auto_execute_allowed") is True
         )
 
-    def max_attempts(self, mutating: bool, command_meta: Dict[str, Any]) -> int:
-        policy = command_meta.get("retry_policy") or {}
-        if mutating and command_meta.get("idempotent") is not True:
+    def max_attempts(self, idempotency: Dict[str, Any]) -> int:
+        idempotency = idempotency or {}
+        if idempotency.get("mode", "idempotent") != "idempotent":
             return 1
-        return max(1, int(policy.get("max_attempts", 2 if mutating else 3)))
+        return max(1, int(idempotency.get("max_attempts", 2)))
 
-    def find_command(self, facts: Dict[str, Any], command_id: str, schema_version: str) -> Optional[Dict[str, Any]]:
-        for item in facts.get("supported_commands", []):
-            if item.get("command_id") == command_id and item.get("schema_version") == schema_version:
-                return item
-        return None
-
-    def matches_expected(self, payload: Dict[str, Any], expected: Dict[str, Any]) -> Tuple[bool, List[Dict[str, Any]]]:
+    def matches_expected(self, observed: Dict[str, Any], expected: Dict[str, Any]) -> Tuple[bool, List[Dict[str, Any]]]:
         mismatches = []
-        observed = payload.get("payload", payload)
         for key, expected_value in expected.items():
             observed_value = observed.get(key)
             if observed_value != expected_value:

@@ -51,6 +51,11 @@ ENABLE_PATTERN_FILTER = os.getenv('ENABLE_PATTERN_FILTER', 'true').lower() == 't
 ENABLE_LOGBERT_FILTER = os.getenv('ENABLE_LOGBERT_FILTER', 'true').lower() == 'true'
 
 
+def _next_cursor_timestamp(logs: List[Dict], fallback: datetime) -> datetime:
+    timestamps = [log.get('timestamp') for log in logs if log.get('timestamp')]
+    return max(timestamps) if timestamps else fallback
+
+
 class Layer1FilterService:
     """Main service for Layer 1 anomaly filtering"""
 
@@ -187,7 +192,7 @@ class Layer1FilterService:
             self.stats['total_anomalies'] += len(anomalies)
 
         self.stats['total_processed'] += len(logs)
-        self.last_timestamp = end_time
+        self.last_timestamp = _next_cursor_timestamp(logs, end_time)
 
         # Print stats every 100 logs
         if self.stats['total_processed'] % 100 == 0:

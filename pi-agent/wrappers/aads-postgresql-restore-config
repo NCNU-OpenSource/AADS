@@ -49,8 +49,9 @@ if ! systemctl restart postgresql; then
   exit 43
 fi
 
-# Confirm the cluster is actually active (restart can return 0 but cluster fail)
-if ! systemctl is-active --quiet postgresql; then
+# Confirm the cluster is actually accepting connections (the umbrella service
+# can be active even when the versioned cluster failed to start).
+if ! pg_isready -q; then
   restore_previous
   systemctl restart postgresql 2>/dev/null || true
   echo "blocked: restored_config_invalid" >&2

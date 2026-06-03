@@ -32,11 +32,22 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-CONTROLLER="${AADS_CONTROLLER_VM:-aads-controller}"
-TARGET="${AADS_TARGET_VM:-aads-target}"
+CONTROLLER_IP="${AADS_CONTROLLER_IP:?AADS_CONTROLLER_IP must be set}"
+TARGET_IP="${AADS_TARGET_IP:?AADS_TARGET_IP must be set}"
+SSH_USER="${AADS_SSH_USER:-ubuntu}"
+SSH_KEY="${AADS_SSH_KEY:-}"
+
+if [[ -n "$SSH_KEY" ]]; then
+  SSH_OPTS="-i ${SSH_KEY} -o StrictHostKeyChecking=no -o BatchMode=yes"
+else
+  SSH_OPTS="-o StrictHostKeyChecking=no -o BatchMode=yes"
+fi
+
+ctrl()   { ssh $SSH_OPTS "${SSH_USER}@${CONTROLLER_IP}" "$@"; }
+target() { ssh $SSH_OPTS "${SSH_USER}@${TARGET_IP}" "$@"; }
 TIMEOUT_SECONDS="${AADS_SR_TIMEOUT:-300}"
 ADMIN_KEY_FILE="${ROOT}/.aads-lab-admin-key"
-DASH="http://192.168.252.2:5000"
+DASH="http://${CONTROLLER_IP}:5000"
 
 PASS=0; FAIL=0; SKIP=0
 RESULTS=()
@@ -58,9 +69,8 @@ elif ! command -v timeout >/dev/null 2>&1; then
 fi
 
 sql() {
-  timeout 30 multipass exec "$CONTROLLER" -- bash -lc \
-    "cd ~/AADS && sudo docker compose --env-file .env.lab exec -T timescaledb \
-     psql -U logdb -d logdb -At -c $(printf '%q' "$1")" 2>/dev/null
+  timeout 30 ctrl bash -lc \
+    "cd ~/AADS && sudo docker compose --env-file .env.lab exec -T timescaledb psql -U logdb -d logdb -At -c $(printf '%q' "$1")" 2>/dev/null
 }
 
 admin_key() { tr -d '\n' < "$ADMIN_KEY_FILE"; }
@@ -86,10 +96,14 @@ record() {
 }
 
 wait_new_plan() {
-  local before="$1" deadline=$((SECONDS + TIMEOUT_SECONDS))
+  local before="$1" expected_command_prefix="${2:-}" deadline=$((SECONDS + TIMEOUT_SECONDS))
   while (( SECONDS < deadline )); do
     local id
-    id="$(sql "SELECT diagnosis_id FROM diagnosis_reports ORDER BY timestamp DESC LIMIT 1;" || true)"
+    if [[ -n "$expected_command_prefix" ]]; then
+      id="$(sql "SELECT diagnosis_id FROM diagnosis_reports WHERE timestamp > COALESCE((SELECT timestamp FROM diagnosis_reports WHERE diagnosis_id = '$before'), '-infinity'::timestamptz) AND action_plan::text ILIKE '%$expected_command_prefix%' ORDER BY timestamp DESC LIMIT 1;" || true)"
+    else
+      id="$(sql "SELECT diagnosis_id FROM diagnosis_reports ORDER BY timestamp DESC LIMIT 1;" || true)"
+    fi
     [[ "$id" != "$before" && -n "$id" ]] && { echo "$id"; return 0; }
     sleep 8
   done
@@ -113,44 +127,55 @@ wait_execution_terminal() {
 # ── target helpers ───────────────────────────────────────────
 
 pg_installed() {
-  multipass exec "$TARGET" -- bash -lc \
-    'command -v pg_ctlcluster >/dev/null 2>&1 && systemctl list-units --type=service | grep -q postgresql' 2>/dev/null
+  target bash -lc \
+    'command -v pg_ctlcluster >/dev/null 2>&1 && systemctl cat postgresql >/dev/null 2>&1' 2>/dev/null
 }
 
 pg_conf_dir() {
-  multipass exec "$TARGET" -- bash -lc \
+  target bash -lc \
     'find /etc/postgresql -name postgresql.conf -exec dirname {} \; 2>/dev/null | sort | head -1' 2>/dev/null
 }
 
 reset_pg_baseline() {
   log "reset PostgreSQL baseline on $TARGET"
   # Restore config from snapshot if available, then restart
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc '
+  timeout 30 target sudo bash -lc '
     SNAP=/var/lib/aads-agent/snapshots/postgresql
     CONF=$(find /etc/postgresql -name postgresql.conf -exec dirname {} \; 2>/dev/null | sort | head -1)
     if [[ -n "$CONF" && -f "$SNAP/postgresql.conf" ]]; then
-      cp -a "$SNAP/postgresql.conf" "$CONF/"
-      [[ -f "$SNAP/pg_hba.conf" ]] && cp -a "$SNAP/pg_hba.conf" "$CONF/"
+      cp "$SNAP/postgresql.conf" "$CONF/postgresql.conf"
+      chown postgres:postgres "$CONF/postgresql.conf"
+      chmod 0644 "$CONF/postgresql.conf"
+      if [[ -f "$SNAP/pg_hba.conf" ]]; then
+        cp "$SNAP/pg_hba.conf" "$CONF/pg_hba.conf"
+        chown postgres:postgres "$CONF/pg_hba.conf"
+        chmod 0640 "$CONF/pg_hba.conf"
+      fi
     fi
     systemctl restart postgresql 2>/dev/null || true
-    systemctl is-active postgresql >/dev/null 2>&1 && echo "pg_ok" || echo "pg_warn"
+    pg_isready -q && echo "pg_ok" || echo "pg_warn"
   ' 2>/dev/null || log "WARNING: reset_pg_baseline remote call failed (continuing)"
   sql "DELETE FROM node_locks;" 2>/dev/null || true
 }
 
 ensure_pg_snapshot() {
   # Create initial snapshot on target if missing (bootstrap step)
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc '
+  timeout 30 target sudo bash -lc '
     SNAP=/var/lib/aads-agent/snapshots/postgresql
     CONF=$(find /etc/postgresql -name postgresql.conf -exec dirname {} \; 2>/dev/null | sort | head -1)
     if [[ -z "$CONF" ]]; then exit 1; fi
     mkdir -p "$SNAP"
-    cp -a "$CONF/postgresql.conf" "$SNAP/"
-    [[ -f "$CONF/pg_hba.conf" ]] && cp -a "$CONF/pg_hba.conf" "$SNAP/"
+    cp "$CONF/postgresql.conf" "$SNAP/postgresql.conf"
+    [[ -f "$CONF/pg_hba.conf" ]] && cp "$CONF/pg_hba.conf" "$SNAP/pg_hba.conf"
     chown -R root:aads-agent "$SNAP"
     chmod 0640 "$SNAP"/*.conf 2>/dev/null || true
     echo "snapshot_created=true"
   ' 2>/dev/null
+}
+
+restore_pg_after_snapshot_guard() {
+  ensure_pg_snapshot 2>/dev/null || true
+  reset_pg_baseline
 }
 
 # ── scenario implementations ─────────────────────────────────
@@ -163,14 +188,22 @@ run_sr_pg_01() {
     record SR-PG-01 SKIP "PostgreSQL not installed on $TARGET"; return
   fi
 
-  ensure_pg_snapshot
   reset_pg_baseline
+  ensure_pg_snapshot
   local before; before="$(sql "SELECT COALESCE((SELECT diagnosis_id FROM diagnosis_reports ORDER BY timestamp DESC LIMIT 1),'__none__');" || true)"
 
   log "SR-PG-01: stopping PostgreSQL"
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc 'systemctl stop postgresql'
+  timeout 30 target sudo bash -lc '
+    systemctl stop postgresql
+    MARKER="sr-pg-01-$(date +%s)"
+    logger -t postgresql "postgresql failed to start: service stopped by AADS lab $MARKER"
+    LOG=$(find /var/log/postgresql -name "postgresql-*.log" 2>/dev/null | sort | head -1)
+    if [[ -n "$LOG" ]]; then
+      { printf "%s [error] postgresql failed to start: service stopped by AADS lab %s\n" "$(date -Is)" "$MARKER" >> "$LOG"; } 2>/dev/null || true
+    fi
+  '
 
-  local plan_id; plan_id="$(wait_new_plan "$before")" || { record SR-PG-01 FAIL "no plan generated"; return; }
+  local plan_id; plan_id="$(wait_new_plan "$before" "postgresql.")" || { record SR-PG-01 FAIL "no plan generated"; return; }
   info "plan: $plan_id"
 
   gate POST "/api/plans/$plan_id/approve" -d '{"reason":"sr-pg-01"}' -o /dev/null
@@ -180,7 +213,7 @@ run_sr_pg_01() {
   local exec_id; exec_id="$(sql "SELECT execution_id FROM plan_executions WHERE plan_id='$plan_id' ORDER BY requested_at DESC LIMIT 1;" || true)"
   local terminal; terminal="$(wait_execution_terminal "$exec_id")"
 
-  local pg_active; pg_active="$(multipass exec "$TARGET" -- bash -lc 'systemctl is-active postgresql' 2>/dev/null || echo 'inactive')"
+  local pg_active; pg_active="$(target bash -lc 'systemctl is-active postgresql' 2>/dev/null || echo 'inactive')"
 
   if [[ "$terminal" == "kb_skipped" || "$terminal" == "final_verified" || "$terminal" == "kb_imported" ]] \
      && [[ "$pg_active" == "active" ]]; then
@@ -198,20 +231,20 @@ run_sr_pg_02() {
     record SR-PG-02 SKIP "PostgreSQL not installed on $TARGET"; return
   fi
 
-  ensure_pg_snapshot
   reset_pg_baseline
+  ensure_pg_snapshot
   local before; before="$(sql "SELECT COALESCE((SELECT diagnosis_id FROM diagnosis_reports ORDER BY timestamp DESC LIMIT 1),'__none__');" || true)"
 
   log "SR-PG-02: injecting config syntax error"
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc '
+  timeout 30 target sudo bash -lc '
+    MARKER="sr-pg-02-$(date +%s)"
     CONF=$(find /etc/postgresql -name postgresql.conf -exec dirname {} \; 2>/dev/null | sort | head -1)
-    echo "invalid_directive_chaos = ???" >> "$CONF/postgresql.conf"
-    pg_ver=$(basename "$(dirname "$CONF")")
-    pg_cluster=$(basename "$CONF")
-    pg_ctlcluster "$pg_ver" "$pg_cluster" reload 2>/dev/null || true
+    echo "invalid_directive_chaos_$MARKER = ???" >> "$CONF/postgresql.conf"
+    systemctl restart postgresql 2>/dev/null || true
+    logger -t postgresql "postgresql config error: invalid directive from AADS lab $MARKER"
   '
 
-  local plan_id; plan_id="$(wait_new_plan "$before")" || { record SR-PG-02 FAIL "no plan generated"; return; }
+  local plan_id; plan_id="$(wait_new_plan "$before" "postgresql.")" || { record SR-PG-02 FAIL "no plan generated"; return; }
   info "plan: $plan_id"
 
   gate POST "/api/plans/$plan_id/approve" -d '{"reason":"sr-pg-02"}' -o /dev/null
@@ -221,7 +254,7 @@ run_sr_pg_02() {
   local exec_id; exec_id="$(sql "SELECT execution_id FROM plan_executions WHERE plan_id='$plan_id' ORDER BY requested_at DESC LIMIT 1;" || true)"
   local terminal; terminal="$(wait_execution_terminal "$exec_id")"
 
-  local pg_active; pg_active="$(multipass exec "$TARGET" -- bash -lc 'systemctl is-active postgresql' 2>/dev/null || echo 'inactive')"
+  local pg_active; pg_active="$(target bash -lc 'systemctl is-active postgresql' 2>/dev/null || echo 'inactive')"
 
   if [[ "$terminal" == "kb_skipped" || "$terminal" == "final_verified" || "$terminal" == "kb_imported" ]] \
      && [[ "$pg_active" == "active" ]]; then
@@ -243,13 +276,17 @@ run_sr_pg_03() {
   local before; before="$(sql "SELECT COALESCE((SELECT diagnosis_id FROM diagnosis_reports ORDER BY timestamp DESC LIMIT 1),'__none__');" || true)"
 
   log "SR-PG-03: removing PostgreSQL snapshot"
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc \
+  timeout 30 target sudo bash -lc \
     'rm -rf /var/lib/aads-agent/snapshots/postgresql'
 
   log "SR-PG-03: stopping PostgreSQL"
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc 'systemctl stop postgresql'
+  timeout 30 target sudo bash -lc '
+    systemctl stop postgresql
+    MARKER="sr-pg-03-$(date +%s)"
+    logger -t postgresql "postgresql failed to start: missing snapshot guard AADS lab $MARKER"
+  '
 
-  local plan_id; plan_id="$(wait_new_plan "$before")" || { record SR-PG-03 FAIL "no plan generated"; return; }
+  local plan_id; plan_id="$(wait_new_plan "$before" "postgresql.")" || { restore_pg_after_snapshot_guard; record SR-PG-03 FAIL "no plan generated"; return; }
 
   gate POST "/api/plans/$plan_id/approve" -d '{"reason":"sr-pg-03"}' -o /dev/null
   local ikey="sr-pg-03-$(date +%s)"
@@ -258,8 +295,8 @@ run_sr_pg_03() {
   local exec_id; exec_id="$(sql "SELECT execution_id FROM plan_executions WHERE plan_id='$plan_id' ORDER BY requested_at DESC LIMIT 1;" || true)"
   local terminal; terminal="$(wait_execution_terminal "$exec_id")"
 
-  # Restore snapshot for subsequent tests
-  ensure_pg_snapshot 2>/dev/null || true
+  # Restore snapshot and service health for subsequent tests/final target state.
+  restore_pg_after_snapshot_guard
 
   if [[ "$terminal" == "blocked" ]]; then
     local reason; reason="$(sql "SELECT result->>'reason' FROM plan_executions WHERE execution_id='$exec_id';" || true)"
@@ -276,36 +313,39 @@ run_sr_pg_03() {
 # ── Redis helpers ────────────────────────────────────────────
 
 redis_installed() {
-  multipass exec "$TARGET" -- bash -lc \
-    'command -v redis-cli >/dev/null 2>&1 && (systemctl list-units --type=service | grep -qE "redis-server|redis\b")' 2>/dev/null
+  target bash -lc \
+    'command -v redis-cli >/dev/null 2>&1 && (systemctl cat redis-server >/dev/null 2>&1 || systemctl cat redis >/dev/null 2>&1)' 2>/dev/null
 }
 
 redis_service() {
-  multipass exec "$TARGET" -- bash -lc \
+  target bash -lc \
     'systemctl cat redis-server >/dev/null 2>&1 && echo "redis-server" || echo "redis"' 2>/dev/null
 }
 
 reset_redis_baseline() {
   log "reset Redis baseline on $TARGET"
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc '
+  timeout 30 target sudo bash -lc '
     SNAP=/var/lib/aads-agent/snapshots/redis
     CONF="${AADS_REDIS_CONF:-/etc/redis/redis.conf}"
     if [[ -f "$SNAP/redis.conf" ]]; then
-      cp -a "$SNAP/redis.conf" "$CONF"
+      cp "$SNAP/redis.conf" "$CONF"
+      chown redis:redis "$CONF" 2>/dev/null || chown root:redis "$CONF" 2>/dev/null || true
+      chmod 0640 "$CONF"
     fi
     systemctl restart redis-server 2>/dev/null || systemctl restart redis || true
-    echo "redis_reset_done"
+    [[ "$(redis-cli ping 2>/dev/null || true)" == "PONG" ]] && echo "redis_ok" || echo "redis_warn"
   ' 2>/dev/null || true
   sql "DELETE FROM node_locks;" 2>/dev/null || true
 }
 
 ensure_redis_snapshot() {
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc '
+  timeout 30 target sudo bash -lc '
     SNAP=/var/lib/aads-agent/snapshots/redis
     CONF="${AADS_REDIS_CONF:-/etc/redis/redis.conf}"
     if [[ ! -f "$CONF" ]]; then exit 1; fi
+    redis-server "$CONF" --test-config >/dev/null 2>&1
     mkdir -p "$SNAP"
-    cp -a "$CONF" "$SNAP/redis.conf"
+    cp "$CONF" "$SNAP/redis.conf"
     chown -R root:aads-agent "$SNAP"
     chmod 0640 "$SNAP/redis.conf" 2>/dev/null || true
     echo "snapshot_created=true"
@@ -319,15 +359,23 @@ run_sr_rd_01() {
     record SR-RD-01 SKIP "Redis not installed on $TARGET"; return
   fi
 
-  ensure_redis_snapshot
   reset_redis_baseline
+  ensure_redis_snapshot
   local svc; svc="$(redis_service)"
   local before; before="$(sql "SELECT COALESCE((SELECT diagnosis_id FROM diagnosis_reports ORDER BY timestamp DESC LIMIT 1),'__none__');" || true)"
 
   log "SR-RD-01: stopping Redis ($svc)"
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc "systemctl stop $svc"
+  timeout 30 target sudo bash -lc "
+    systemctl stop $svc
+    MARKER=sr-rd-01-\$(date +%s)
+    logger -t $svc \"redis failed to start: service stopped by AADS lab \$MARKER\"
+    LOG=/var/log/redis/redis-server.log
+    if [[ -f \"\$LOG\" ]]; then
+      { printf '%s [error] redis failed to start: service stopped by AADS lab %s\n' \"\$(date -Is)\" \"\$MARKER\" >> \"\$LOG\"; } 2>/dev/null || true
+    fi
+  "
 
-  local plan_id; plan_id="$(wait_new_plan "$before")" || { record SR-RD-01 FAIL "no plan generated"; return; }
+  local plan_id; plan_id="$(wait_new_plan "$before" "redis.")" || { record SR-RD-01 FAIL "no plan generated"; return; }
   info "plan: $plan_id"
 
   gate POST "/api/plans/$plan_id/approve" -d '{"reason":"sr-rd-01"}' -o /dev/null
@@ -337,7 +385,7 @@ run_sr_rd_01() {
   local exec_id; exec_id="$(sql "SELECT execution_id FROM plan_executions WHERE plan_id='$plan_id' ORDER BY requested_at DESC LIMIT 1;" || true)"
   local terminal; terminal="$(wait_execution_terminal "$exec_id")"
 
-  local redis_active; redis_active="$(multipass exec "$TARGET" -- bash -lc "systemctl is-active $svc" 2>/dev/null || echo 'inactive')"
+  local redis_active; redis_active="$(target bash -lc "systemctl is-active $svc" 2>/dev/null || echo 'inactive')"
 
   if [[ "$terminal" == "kb_skipped" || "$terminal" == "final_verified" || "$terminal" == "kb_imported" ]] \
      && [[ "$redis_active" == "active" ]]; then
@@ -354,19 +402,21 @@ run_sr_rd_02() {
     record SR-RD-02 SKIP "Redis not installed on $TARGET"; return
   fi
 
-  ensure_redis_snapshot
   reset_redis_baseline
+  ensure_redis_snapshot
   local svc; svc="$(redis_service)"
   local before; before="$(sql "SELECT COALESCE((SELECT diagnosis_id FROM diagnosis_reports ORDER BY timestamp DESC LIMIT 1),'__none__');" || true)"
 
   log "SR-RD-02: injecting Redis config error"
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc '
+  timeout 30 target sudo bash -lc '
+    MARKER="sr-rd-02-$(date +%s)"
     CONF="${AADS_REDIS_CONF:-/etc/redis/redis.conf}"
-    echo "invalid_chaos_directive ???" >> "$CONF"
+    echo "invalid_chaos_directive_$MARKER ???" >> "$CONF"
     systemctl restart redis-server 2>/dev/null || systemctl restart redis || true
+    logger -t redis-server "redis config error: invalid directive from AADS lab $MARKER"
   '
 
-  local plan_id; plan_id="$(wait_new_plan "$before")" || { record SR-RD-02 FAIL "no plan generated"; return; }
+  local plan_id; plan_id="$(wait_new_plan "$before" "redis.")" || { record SR-RD-02 FAIL "no plan generated"; return; }
   info "plan: $plan_id"
 
   gate POST "/api/plans/$plan_id/approve" -d '{"reason":"sr-rd-02"}' -o /dev/null
@@ -376,7 +426,7 @@ run_sr_rd_02() {
   local exec_id; exec_id="$(sql "SELECT execution_id FROM plan_executions WHERE plan_id='$plan_id' ORDER BY requested_at DESC LIMIT 1;" || true)"
   local terminal; terminal="$(wait_execution_terminal "$exec_id")"
 
-  local redis_active; redis_active="$(multipass exec "$TARGET" -- bash -lc "systemctl is-active $svc" 2>/dev/null || echo 'inactive')"
+  local redis_active; redis_active="$(target bash -lc "systemctl is-active $svc" 2>/dev/null || echo 'inactive')"
 
   if [[ "$terminal" == "kb_skipped" || "$terminal" == "final_verified" || "$terminal" == "kb_imported" ]] \
      && [[ "$redis_active" == "active" ]]; then
@@ -389,13 +439,13 @@ run_sr_rd_02() {
 # ── Docker helpers ────────────────────────────────────────────
 
 docker_installed() {
-  multipass exec "$TARGET" -- bash -lc 'command -v docker >/dev/null 2>&1' 2>/dev/null
+  target bash -lc 'command -v docker >/dev/null 2>&1' 2>/dev/null
 }
 
 TEST_CONTAINER="${AADS_TEST_CONTAINER:-aads-test-nginx}"
 
 ensure_test_container() {
-  timeout 60 multipass exec "$TARGET" -- bash -lc "
+  timeout 60 target bash -lc "
     docker ps -a --format '{{.Names}}' | grep -q '^${TEST_CONTAINER}\$' || \
       docker run -d --name ${TEST_CONTAINER} --restart unless-stopped nginx:alpine
     docker inspect --format '{{.State.Status}}' ${TEST_CONTAINER} | grep -q running || \
@@ -415,9 +465,13 @@ run_sr_dc_01() {
   sql "DELETE FROM node_locks;" 2>/dev/null || true
 
   log "SR-DC-01: stopping container $TEST_CONTAINER"
-  timeout 30 multipass exec "$TARGET" -- bash -lc "docker stop $TEST_CONTAINER" 2>/dev/null
+  timeout 30 target bash -lc "
+    docker stop $TEST_CONTAINER
+    MARKER=sr-dc-01-\$(date +%s)
+    logger -t docker 'docker container $TEST_CONTAINER exited unexpectedly: AADS lab' \"\$MARKER\"
+  " 2>/dev/null
 
-  local plan_id; plan_id="$(wait_new_plan "$before")" || { record SR-DC-01 FAIL "no plan generated"; return; }
+  local plan_id; plan_id="$(wait_new_plan "$before" "docker.")" || { record SR-DC-01 FAIL "no plan generated"; return; }
   info "plan: $plan_id"
 
   gate POST "/api/plans/$plan_id/approve" -d '{"reason":"sr-dc-01"}' -o /dev/null
@@ -427,7 +481,7 @@ run_sr_dc_01() {
   local exec_id; exec_id="$(sql "SELECT execution_id FROM plan_executions WHERE plan_id='$plan_id' ORDER BY requested_at DESC LIMIT 1;" || true)"
   local terminal; terminal="$(wait_execution_terminal "$exec_id")"
 
-  local ctr_state; ctr_state="$(multipass exec "$TARGET" -- bash -lc "docker inspect --format '{{.State.Status}}' $TEST_CONTAINER" 2>/dev/null || echo 'unknown')"
+  local ctr_state; ctr_state="$(target bash -lc "docker inspect --format '{{.State.Status}}' $TEST_CONTAINER" 2>/dev/null || echo 'unknown')"
 
   if [[ "$terminal" == "kb_skipped" || "$terminal" == "final_verified" || "$terminal" == "kb_imported" ]] \
      && [[ "$ctr_state" == "running" ]]; then
@@ -439,67 +493,87 @@ run_sr_dc_01() {
 
 # SR-DC-02: attempt restart of non-allowlisted container → policy.blocked
 run_sr_dc_02() {
-  log "SR-DC-02: container_not_allowed"
-  if ! docker_installed; then
-    record SR-DC-02 SKIP "Docker not installed on $TARGET"; return
-  fi
+  log "SR-DC-02: legacy catalog endpoint removed (V2)"
 
-  # Directly call the pi-agent API with a container not in allowlist
-  local token; token="$(multipass exec "$TARGET" -- bash -lc 'cat /etc/aads-agent/agent-token 2>/dev/null || echo ""')"
-  local agent_url="http://192.168.252.3:8090"
+  # V2: the catalog endpoints (/v1/actions/run, /v1/probes/run) are gone; the
+  # only executor path is /v1/commands/run. Assert the legacy endpoint 404/405s,
+  # proving the catalog command whitelist was removed.
+  local token; token="$(target bash -lc 'cat /etc/aads-agent/agent-token 2>/dev/null || echo ""')"
+  local agent_url="http://${TARGET_IP}:8090"
   local http_code
   http_code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$agent_url/v1/actions/run" \
     -H "Authorization: Bearer $token" \
     -H "Content-Type: application/json" \
-    -d '{"command_id":"docker.container_restart","args":{"container":"not_allowed_container"}}' 2>/dev/null || echo '000')"
+    -d '{"command_id":"docker.container_restart","args":{"container":"x"}}' 2>/dev/null || echo '000')"
 
-  if [[ "$http_code" == "400" ]]; then
-    record SR-DC-02 PASS "pi-agent returned 400 for non-allowlisted container ✓"
+  if [[ "$http_code" == "404" || "$http_code" == "405" ]]; then
+    record SR-DC-02 PASS "legacy /v1/actions/run removed (HTTP $http_code) ✓"
   else
-    record SR-DC-02 FAIL "expected 400, got HTTP $http_code"
+    record SR-DC-02 FAIL "expected 404/405 for removed catalog endpoint, got HTTP $http_code"
   fi
 }
 
 # ── MySQL helpers ─────────────────────────────────────────────
 
 mysql_installed() {
-  multipass exec "$TARGET" -- bash -lc \
+  target bash -lc \
     '(command -v mysqld || command -v mariadbd) >/dev/null 2>&1 && \
-     (systemctl list-units --type=service | grep -qE "mysql|mariadb")' 2>/dev/null
+     (systemctl cat mysql >/dev/null 2>&1 || systemctl cat mariadb >/dev/null 2>&1)' 2>/dev/null
 }
 
 mysql_service() {
-  multipass exec "$TARGET" -- bash -lc \
+  target bash -lc \
     'systemctl cat mysql >/dev/null 2>&1 && echo "mysql" || echo "mariadb"' 2>/dev/null
 }
 
 mysql_conf_file() {
-  multipass exec "$TARGET" -- bash -lc \
-    'find /etc/mysql -name "*.cnf" \( -path "*/mysql.conf.d/*" -o -path "*/mariadb.conf.d/*" -o -name "my.cnf" \) 2>/dev/null | sort | head -1' 2>/dev/null
+  target bash -lc \
+    'for candidate in "${AADS_MYSQL_CONF:-}" /etc/mysql/mysql.conf.d/mysqld.cnf /etc/mysql/mariadb.conf.d/50-server.cnf /etc/mysql/my.cnf; do
+       [[ -n "$candidate" && -f "$candidate" ]] && { printf "%s\n" "$candidate"; exit 0; }
+     done
+     find /etc/mysql -type f -name "*.cnf" \( -name "mysqld.cnf" -o -name "*server*.cnf" -o -path "*/mariadb.conf.d/*.cnf" \) 2>/dev/null | sort | head -1' 2>/dev/null
 }
 
 reset_mysql_baseline() {
   log "reset MySQL baseline on $TARGET"
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc '
+  timeout 30 target sudo bash -lc '
     SNAP=/var/lib/aads-agent/snapshots/mysql
-    CONF=$(find /etc/mysql -name "*.cnf" \( -path "*/mysql.conf.d/*" -o -path "*/mariadb.conf.d/*" -o -name "my.cnf" \) 2>/dev/null | sort | head -1)
+    CONF=""
+    for candidate in "${AADS_MYSQL_CONF:-}" /etc/mysql/mysql.conf.d/mysqld.cnf /etc/mysql/mariadb.conf.d/50-server.cnf /etc/mysql/my.cnf; do
+      [[ -n "$candidate" && -f "$candidate" ]] && { CONF="$candidate"; break; }
+    done
+    if [[ -z "$CONF" ]]; then
+      CONF=$(find /etc/mysql -type f -name "*.cnf" \( -name "mysqld.cnf" -o -name "*server*.cnf" -o -path "*/mariadb.conf.d/*.cnf" \) 2>/dev/null | sort | head -1)
+    fi
     if [[ -n "$CONF" && -f "$SNAP/my.cnf" ]]; then
-      cp -a "$SNAP/my.cnf" "$CONF"
+      cp "$SNAP/my.cnf" "$CONF"
+      chown root:root "$CONF"
+      chmod 0644 "$CONF"
     fi
     SVC="mysql"; systemctl cat mysql >/dev/null 2>&1 || SVC="mariadb"
     systemctl restart "$SVC" 2>/dev/null || true
-    echo "mysql_reset_done"
+    mysqladmin -u root --connect-timeout=5 ping >/dev/null 2>&1 && echo "mysql_ok" || echo "mysql_warn"
   ' 2>/dev/null || true
   sql "DELETE FROM node_locks;" 2>/dev/null || true
 }
 
 ensure_mysql_snapshot() {
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc '
+  timeout 30 target sudo bash -lc '
     SNAP=/var/lib/aads-agent/snapshots/mysql
-    CONF=$(find /etc/mysql -name "*.cnf" \( -path "*/mysql.conf.d/*" -o -path "*/mariadb.conf.d/*" -o -name "my.cnf" \) 2>/dev/null | sort | head -1)
+    CONF=""
+    for candidate in "${AADS_MYSQL_CONF:-}" /etc/mysql/mysql.conf.d/mysqld.cnf /etc/mysql/mariadb.conf.d/50-server.cnf /etc/mysql/my.cnf; do
+      [[ -n "$candidate" && -f "$candidate" ]] && { CONF="$candidate"; break; }
+    done
+    if [[ -z "$CONF" ]]; then
+      CONF=$(find /etc/mysql -type f -name "*.cnf" \( -name "mysqld.cnf" -o -name "*server*.cnf" -o -path "*/mariadb.conf.d/*.cnf" \) 2>/dev/null | sort | head -1)
+    fi
     if [[ -z "$CONF" ]]; then exit 1; fi
+    SVC="mysql"; systemctl cat mysql >/dev/null 2>&1 || SVC="mariadb"
+    systemctl is-active --quiet "$SVC"
+    mysqladmin -u root --connect-timeout=5 ping >/dev/null 2>&1
+    mysqld --validate-config >/dev/null 2>&1 || mariadbd --validate-config >/dev/null 2>&1
     mkdir -p "$SNAP"
-    cp -a "$CONF" "$SNAP/my.cnf"
+    cp "$CONF" "$SNAP/my.cnf"
     chown -R root:aads-agent "$SNAP"
     chmod 0640 "$SNAP/my.cnf" 2>/dev/null || true
     echo "snapshot_created=true"
@@ -513,15 +587,23 @@ run_sr_my_01() {
     record SR-MY-01 SKIP "MySQL/MariaDB not installed on $TARGET"; return
   fi
 
-  ensure_mysql_snapshot
   reset_mysql_baseline
+  ensure_mysql_snapshot
   local svc; svc="$(mysql_service)"
   local before; before="$(sql "SELECT COALESCE((SELECT diagnosis_id FROM diagnosis_reports ORDER BY timestamp DESC LIMIT 1),'__none__');" || true)"
 
   log "SR-MY-01: stopping $svc"
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc "systemctl stop $svc"
+  timeout 30 target sudo bash -lc "
+    systemctl stop $svc
+    MARKER=sr-my-01-\$(date +%s)
+    logger -t $svc \"mysql failed to start: service stopped by AADS lab \$MARKER\"
+    LOG=/var/log/mysql/error.log
+    if [[ -f \"\$LOG\" ]]; then
+      { printf '%s [ERROR] mysql failed to start: service stopped by AADS lab %s\n' \"\$(date -Is)\" \"\$MARKER\" >> \"\$LOG\"; } 2>/dev/null || true
+    fi
+  "
 
-  local plan_id; plan_id="$(wait_new_plan "$before")" || { record SR-MY-01 FAIL "no plan generated"; return; }
+  local plan_id; plan_id="$(wait_new_plan "$before" "mysql.")" || { record SR-MY-01 FAIL "no plan generated"; return; }
   info "plan: $plan_id"
 
   gate POST "/api/plans/$plan_id/approve" -d '{"reason":"sr-my-01"}' -o /dev/null
@@ -531,7 +613,7 @@ run_sr_my_01() {
   local exec_id; exec_id="$(sql "SELECT execution_id FROM plan_executions WHERE plan_id='$plan_id' ORDER BY requested_at DESC LIMIT 1;" || true)"
   local terminal; terminal="$(wait_execution_terminal "$exec_id")"
 
-  local svc_active; svc_active="$(multipass exec "$TARGET" -- bash -lc "systemctl is-active $svc" 2>/dev/null || echo 'inactive')"
+  local svc_active; svc_active="$(target bash -lc "systemctl is-active $svc" 2>/dev/null || echo 'inactive')"
 
   if [[ "$terminal" == "kb_skipped" || "$terminal" == "final_verified" || "$terminal" == "kb_imported" ]] \
      && [[ "$svc_active" == "active" ]]; then
@@ -548,20 +630,22 @@ run_sr_my_02() {
     record SR-MY-02 SKIP "MySQL/MariaDB not installed on $TARGET"; return
   fi
 
-  ensure_mysql_snapshot
   reset_mysql_baseline
+  ensure_mysql_snapshot
   local svc; svc="$(mysql_service)"
   local conf; conf="$(mysql_conf_file)"
   local before; before="$(sql "SELECT COALESCE((SELECT diagnosis_id FROM diagnosis_reports ORDER BY timestamp DESC LIMIT 1),'__none__');" || true)"
 
   log "SR-MY-02: injecting MySQL config error into $conf"
-  timeout 30 multipass exec "$TARGET" -- sudo bash -lc "
-    echo '[chaos_section_invalid]' >> '$conf'
+  timeout 30 target sudo bash -lc "
+    MARKER=sr-my-02-\$(date +%s)
+    echo \"[chaos_section_invalid_\$MARKER]\" >> '$conf'
     echo 'chaos_option = ???' >> '$conf'
     SVC=$svc; systemctl restart \"\$SVC\" 2>/dev/null || true
+    logger -t $svc \"mysql config error: invalid directive from AADS lab \$MARKER\"
   "
 
-  local plan_id; plan_id="$(wait_new_plan "$before")" || { record SR-MY-02 FAIL "no plan generated"; return; }
+  local plan_id; plan_id="$(wait_new_plan "$before" "mysql.")" || { record SR-MY-02 FAIL "no plan generated"; return; }
   info "plan: $plan_id"
 
   gate POST "/api/plans/$plan_id/approve" -d '{"reason":"sr-my-02"}' -o /dev/null
@@ -571,7 +655,7 @@ run_sr_my_02() {
   local exec_id; exec_id="$(sql "SELECT execution_id FROM plan_executions WHERE plan_id='$plan_id' ORDER BY requested_at DESC LIMIT 1;" || true)"
   local terminal; terminal="$(wait_execution_terminal "$exec_id")"
 
-  local svc_active; svc_active="$(multipass exec "$TARGET" -- bash -lc "systemctl is-active $svc" 2>/dev/null || echo 'inactive')"
+  local svc_active; svc_active="$(target bash -lc "systemctl is-active $svc" 2>/dev/null || echo 'inactive')"
 
   if [[ "$terminal" == "kb_skipped" || "$terminal" == "final_verified" || "$terminal" == "kb_imported" ]] \
      && [[ "$svc_active" == "active" ]]; then
@@ -613,7 +697,7 @@ fi
 
 if [[ ! -f "$ADMIN_KEY_FILE" ]]; then
   echo "ERROR: admin key not found at $ADMIN_KEY_FILE" >&2
-  echo "       Create it with: multipass exec $CONTROLLER -- cat ~/.aads-lab-admin-key > $ADMIN_KEY_FILE" >&2
+  echo "       Create it with: ssh ${SSH_USER}@${CONTROLLER_IP} cat ~/.aads-lab-admin-key > $ADMIN_KEY_FILE" >&2
   exit 1
 fi
 

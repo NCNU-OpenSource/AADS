@@ -28,7 +28,8 @@ const INFLIGHT = new Set(["queued", "executing", "final_verifying"]);
 const TERMINAL_FAIL = new Set(["blocked", "execution_failed", "execution_failed_unknown_state"]);
 
 function bucketOf(report) { return statusMeta(report.plan_status).bucket; }
-function isSchemaV2(report) { return (report.action_plan || {}).schema_version === "2.0"; }
+// V2 runner plans are schema 3.0 (kept the helper name to limit churn).
+function isSchemaV2(report) { return (report.action_plan || {}).schema_version === "3.0"; }
 
 function severityTone(sev) {
   return { critical: "red", high: "amber", medium: "blue", low: "green" }[sev] || "grey";

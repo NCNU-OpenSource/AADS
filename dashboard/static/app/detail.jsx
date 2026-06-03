@@ -47,6 +47,23 @@ function GateStepper({ status }) {
 }
 
 /* ---- plan audit (gate contract + sequence) ---- */
+/* V2: runner-based labels (replaces legacy command_id). */
+function runnerLabel(runner) {
+  if (!runner || !runner.argv || !runner.argv.length) return "n/a";
+  const base = runner.argv[0].split("/").pop();
+  return runner.argv.length > 1 ? `${base} ${runner.argv.slice(1).join(" ")}` : base;
+}
+function stepLabel(s) {
+  const ctx = s.context || {};
+  if (ctx.service && ctx.operation) return `${ctx.service}.${ctx.operation}`;
+  return runnerLabel(s.runner);
+}
+function expectSummary(v) {
+  const e = (v && v.expected) || {};
+  const keys = Object.keys(e);
+  return keys.length ? keys.map((k) => `${k}=${e[k]}`).join(", ") : "—";
+}
+
 function PlanBody({ plan }) {
   const snap = plan.pre_execution_snapshot || {};
   const finalV = plan.final_verification || {};
@@ -59,15 +76,15 @@ function PlanBody({ plan }) {
           <div className="cstep">
             <span className="ix snap">S</span>
             <div>
-              <code>{snap.command_id || "snapshot disabled"}</code>
+              <code>{snap.enabled !== false ? runnerLabel(snap.runner) : "snapshot disabled"}</code>
               <div className="cmeta">scope {snap.scope || "n/a"} · on_fail: {snap.on_failure || "block"}</div>
             </div>
           </div>
           <div className="cstep">
             <span className="ix final">F</span>
             <div>
-              <code>{finalV.command_id || "n/a"}</code>
-              <div className="cmeta">final probe · expect {finalV.expect || "—"}</div>
+              <code>{runnerLabel(finalV.runner)}</code>
+              <div className="cmeta">final probe · expect {expectSummary(finalV)}</div>
             </div>
           </div>
         </div>
@@ -81,9 +98,11 @@ function PlanBody({ plan }) {
               <span className="ix">{s.order}</span>
               <div>
                 <div className="stitle">
-                  <code>{s.command_id}</code>
+                  <code>{stepLabel(s)}</code>
+                  {s.runner?.as_root && <Pill tone="amber" mono>root</Pill>}
+                  <Pill tone={s.runner?.side_effect === "mutate" ? "violet" : "grey"} mono>{s.runner?.side_effect || "read"}</Pill>
                   <Pill tone={s.on_failure === "rollback" ? "violet" : "grey"} mono>on_fail {s.on_failure}</Pill>
-                  <Pill plain mono>verify {s.verification?.command_id}</Pill>
+                  <Pill plain mono>verify {runnerLabel(s.verification?.runner)}</Pill>
                 </div>
                 <div className="sdetail">{s.expected_outcome}</div>
                 <JsonBlock data={s.verification?.expected || {}} />
@@ -103,9 +122,9 @@ function ApproveChecklist({ report, plan, agent }) {
   const hasRollback = (plan.steps || []).some((s) => s.on_failure === "rollback");
   const items = [
   { label: "target", ok: !!agent, detail: agent ? `${shortId(agent.node_id)} · agent ${agent.agent_version} · seen ${fmtTime(agent.last_seen)}` : "target not registered" },
-  { label: "snapshot", ok: snap.enabled !== false, detail: `${snap.command_id || "none"} · on_fail ${snap.on_failure || "block"}` },
+  { label: "snapshot", ok: snap.enabled !== false, detail: `${snap.enabled !== false ? runnerLabel(snap.runner) : "none"} · on_fail ${snap.on_failure || "block"}` },
   { label: "rollback", ok: hasRollback, detail: hasRollback ? "at least one step reverts on failure" : "no rollback contract" },
-  { label: "verify", ok: !!finalV.command_id, detail: `final ${finalV.command_id} → ${finalV.expect}` }];
+  { label: "verify", ok: !!(finalV.runner && finalV.runner.argv), detail: `final ${runnerLabel(finalV.runner)} → ${expectSummary(finalV)}` }];
 
   return (
     <div className="checklist">

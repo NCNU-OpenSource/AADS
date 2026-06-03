@@ -29,4 +29,12 @@ if ! (systemctl restart redis-server 2>/dev/null || systemctl restart redis); th
   exit 43
 fi
 
+if [[ "$(redis-cli ping 2>/dev/null || true)" != "PONG" ]]; then
+  cp -a "$PREVIOUS_DIR/redis.conf" "$REDIS_CONF" 2>/dev/null || true
+  chown redis:redis "$REDIS_CONF" 2>/dev/null || true
+  systemctl restart redis-server 2>/dev/null || systemctl restart redis || true
+  echo "blocked: restored_config_invalid" >&2
+  exit 43
+fi
+
 echo "config_restored=true"

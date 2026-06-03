@@ -15,8 +15,8 @@ if [[ ! -f "$REDIS_CONF" ]]; then
   exit 42
 fi
 
-# Refresh snapshot only if current config is valid
-if redis-server "$REDIS_CONF" --test-config >/dev/null 2>&1 || [[ -s "$REDIS_CONF" ]]; then
+# Refresh snapshot only if current config is valid.
+if redis-server "$REDIS_CONF" --test-config >/dev/null 2>&1; then
   cp -a "$REDIS_CONF" "$SNAPSHOT_DIR/redis.conf"
   chown root:aads-agent "$SNAPSHOT_DIR/redis.conf"
   chmod 0640 "$SNAPSHOT_DIR/redis.conf"

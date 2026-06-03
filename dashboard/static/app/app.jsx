@@ -217,7 +217,10 @@ function App() {
         r.diagnosis_id, r.summary, r.severity, r._status, plan.schema_version, plan.target_node_id, plan.goal, plan.risk_level,
         (plan.environment_policy || {}).environment, root.affected_service,
         ...(root.recommended_capabilities || []),
-        ...((plan.steps || []).flatMap((s) => [s.command_id, s.expected_outcome, s.on_failure, s.verification?.command_id])),
+        ...((plan.steps || []).flatMap((s) => [
+          (s.context || {}).service, (s.context || {}).operation, (s.runner?.argv || [])[0],
+          s.expected_outcome, s.on_failure, (s.verification?.runner?.argv || [])[0],
+        ])),
       ].filter(Boolean).join(" ").toLowerCase();
       return idx.includes(q);
     });

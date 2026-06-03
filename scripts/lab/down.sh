@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
+# PVE environment: VMs are managed by Proxmox, not this script.
+# This is a no-op placeholder kept for compatibility.
 set -euo pipefail
 
-CONTROLLER="${AADS_CONTROLLER_VM:-aads-controller}"
-TARGET="${AADS_TARGET_VM:-aads-target}"
-
-for vm in "$CONTROLLER" "$TARGET"; do
-  if multipass info "$vm" >/dev/null 2>&1; then
-    multipass stop "$vm" || true
-  fi
-done
-
-echo "Stopped AADS lab VMs. Delete them with: multipass delete --purge $CONTROLLER $TARGET"
+echo "PVE lab: VM lifecycle is managed by Proxmox (not this script)."
+echo "To stop services on the controller, SSH in and run:"
+echo "  ssh ubuntu@\${AADS_CONTROLLER_IP} 'cd ~/AADS && sudo docker compose --env-file .env.lab down'"

@@ -9,4 +9,8 @@ else
   systemctl restart mariadb
   systemctl is-active --quiet mariadb
 fi
+if ! mysqladmin -u root --connect-timeout=5 ping >/dev/null 2>&1; then
+  echo "blocked: mysql_not_ready" >&2
+  exit 44
+fi
 echo "restarted=true"

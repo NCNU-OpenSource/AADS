@@ -37,13 +37,24 @@
      The detail pane reads plan.requires_approval, plan.auto_execute and a
      human string final_verification.expect. The backend keeps those under
      environment_policy / final_verification.expected, so lift + derive here. */
+  /* V2: runner-based label helpers (replace legacy command_id). */
+  function runnerLabel(runner) {
+    if (!runner || !runner.argv || !runner.argv.length) return "n/a";
+    return runner.argv[0].split("/").pop();
+  }
+  function planStepLabel(s) {
+    const ctx = (s && s.context) || {};
+    if (ctx.service && ctx.operation) return `${ctx.service}.${ctx.operation}`;
+    return runnerLabel(s && s.runner);
+  }
   function expectString(fv) {
     if (!fv) return "—";
     const e = fv.expected || {};
-    if (e.http_status != null) return `http ${e.http_status}`;
+    if (e.http_code != null) return `http ${e.http_code}`;
     if ("active" in e) return e.active ? "service active" : "inactive";
+    if ("pong" in e) return e.pong ? "PONG" : "no pong";
     const keys = Object.keys(e);
-    return keys.length ? keys.map((k) => `${k}: ${e[k]}`).join(", ") : (fv.command_id || "—");
+    return keys.length ? keys.map((k) => `${k}: ${e[k]}`).join(", ") : (runnerLabel(fv.runner));
   }
   function mapReport(d) {
     const plan = d.action_plan || {};
@@ -56,7 +67,7 @@
     // Normalise to needs_triage so the queue bucket and status badge are consistent:
     //   - "approved"/"pending_approval" on a schema 1.0 item is misleading noise.
     //   - "rejected" is already a terminal state and should stay as-is.
-    const isNonExecutable = !plan.schema_version || plan.schema_version !== "2.0";
+    const isNonExecutable = !plan.schema_version || plan.schema_version !== "3.0";
     const terminalOrRejected = ["rejected", "blocked", "execution_failed",
       "execution_failed_unknown_state", "final_verified", "kb_imported",
       "kb_skipped", "kb_import_failed"].includes(d.plan_status);
@@ -108,7 +119,7 @@
     if (snap || result.pre_execution_snapshot) {
       rows.push({
         tn: "S",
-        command_id: (plan.pre_execution_snapshot || {}).command_id || (snap && snap.command_id) || "ensure_known_good_snapshot",
+        command_id: runnerLabel((plan.pre_execution_snapshot || {}).runner) || (snap && snap.command_id) || "ensure_snapshot",
         state: STEP_STATE[snap && snap.status] || (snap ? "run" : "wait"),
         at: relTime(exec.started_at, snap && snap.finished_at),
         note: snap && snap.status === "step_verified" ? "snapshot captured" : undefined,
@@ -121,7 +132,7 @@
       const verif = (s && s.result && s.result.verification) || {};
       rows.push({
         tn: String(ps.order || ps.step_id),
-        command_id: ps.command_id,
+        command_id: planStepLabel(ps),
         state: s ? (STEP_STATE[s.status] || "wait") : "wait",
         at: relTime(exec.started_at, s && s.finished_at),
         expected: (ps.verification && ps.verification.expected) || verif.expected || null,
@@ -134,7 +145,7 @@
       const done = result.rollback.status === "rollback_completed";
       rows.push({
         tn: "R",
-        command_id: "nginx.restore_known_good_config",
+        command_id: runnerLabel((plan.rollback || {}).runner) || "restore_config",
         state: "roll",
         note: done ? "snapshot restored — no partial state left on target" : "rollback attempted",
       });
@@ -150,7 +161,7 @@
       else if (exec.status === "execution_failed") state = "fail";
       rows.push({
         tn: "F",
-        command_id: (plan.final_verification || {}).command_id || "http_check",
+        command_id: runnerLabel((plan.final_verification || {}).runner) || "final_verification",
         state,
         at: relTime(exec.started_at, exec.finished_at),
         note: ok ? "final verification passed" : undefined,
@@ -252,7 +263,7 @@
     // execution-derived decorations
     const needsExec = INFLIGHT_SET.has(status) || FAIL_SET.has(status)
       || status === "failed_retryable" || RESOLVED_SET.has(status);
-    if (needsExec || plan.schema_version === "2.0") {
+    if (needsExec || plan.schema_version === "3.0") {
       try {
         const execs = await getJSON(`/api/plans/${id}/execution`);
         const exec = latestExecution(execs);

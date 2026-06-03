@@ -8,17 +8,45 @@ if [[ ! -f "$SNAPSHOT_DIR/my.cnf" ]]; then
   exit 42
 fi
 
-MYSQL_CONF="$(find /etc/mysql -name "*.cnf" \
-  \( -path "*/mysql.conf.d/*" -o -path "*/mariadb.conf.d/*" -o -name "my.cnf" \) \
-  2>/dev/null | sort | head -1)"
+mysql_server_config() {
+  local candidate
+  for candidate in \
+    "${AADS_MYSQL_CONF:-}" \
+    /etc/mysql/mysql.conf.d/mysqld.cnf \
+    /etc/mysql/mariadb.conf.d/50-server.cnf \
+    /etc/mysql/my.cnf; do
+    [[ -n "$candidate" && -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+  done
+
+  find /etc/mysql -type f -name "*.cnf" \
+    \( -name "mysqld.cnf" -o -name "*server*.cnf" -o -path "*/mariadb.conf.d/*.cnf" \) \
+    2>/dev/null | sort | head -1
+}
+
+MYSQL_CONF="$(mysql_server_config)"
 
 if [[ -z "$MYSQL_CONF" ]]; then
   echo "blocked: mysql_config_not_found" >&2
   exit 42
 fi
 
-# Refresh only if config currently validates
-if mysqld --validate-config >/dev/null 2>&1 || mariadbd --validate-config >/dev/null 2>&1 || [[ -s "$MYSQL_CONF" ]]; then
+SVC="mysql"
+systemctl cat mysql >/dev/null 2>&1 || SVC="mariadb"
+
+# Snapshot refresh is a baseline operation. If the service is already unhealthy,
+# keep the previous known-good snapshot so a later restore can recover from it.
+if ! systemctl is-active --quiet "$SVC"; then
+  echo "snapshot_refreshed=false existing_snapshot=true service_active=false config_file=$MYSQL_CONF"
+  exit 0
+fi
+
+if ! mysqladmin -u root --connect-timeout=5 ping >/dev/null 2>&1; then
+  echo "snapshot_refreshed=false existing_snapshot=true server_reachable=false config_file=$MYSQL_CONF"
+  exit 0
+fi
+
+# Refresh only if config currently validates and the live server is healthy.
+if mysqld --validate-config >/dev/null 2>&1 || mariadbd --validate-config >/dev/null 2>&1; then
   cp -a "$MYSQL_CONF" "$SNAPSHOT_DIR/my.cnf"
   chown root:aads-agent "$SNAPSHOT_DIR/my.cnf"
   chmod 0640 "$SNAPSHOT_DIR/my.cnf"
