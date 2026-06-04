@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SNAPSHOT_DIR="${AADS_PG_SNAPSHOT_DIR:-/var/lib/aads-agent/snapshots/postgresql}"
+
+# Require a pre-existing snapshot: known-good must be established during a
+# healthy baseline, not captured during an incident state.
+if [[ ! -f "$SNAPSHOT_DIR/postgresql.conf" ]]; then
+  echo "blocked: no_snapshot" >&2
+  exit 42
+fi
+
+PG_CONF_DIR="$(find /etc/postgresql -name "postgresql.conf" -exec dirname {} \; 2>/dev/null | sort | head -1)"
+
+if [[ -z "$PG_CONF_DIR" ]]; then
+  echo "blocked: postgresql_config_not_found" >&2
+  exit 42
+fi
+
+PG_VER="$(basename "$(dirname "$PG_CONF_DIR")")"
+PG_CLUSTER="$(basename "$PG_CONF_DIR")"
+
+# Only refresh snapshot if current config passes configtest
+if pg_ctlcluster "$PG_VER" "$PG_CLUSTER" configtest >/dev/null 2>&1; then
+  cp -a "$PG_CONF_DIR/postgresql.conf" "$SNAPSHOT_DIR/"
+  [[ -f "$PG_CONF_DIR/pg_hba.conf" ]] && cp -a "$PG_CONF_DIR/pg_hba.conf" "$SNAPSHOT_DIR/"
+  chown -R root:aads-agent "$SNAPSHOT_DIR"
+  find "$SNAPSHOT_DIR" -type f -exec chmod 0640 {} +
+  echo "snapshot_refreshed=true config_dir=$PG_CONF_DIR"
+  exit 0
+fi
+
+# Config is currently invalid — retain existing snapshot as rollback baseline
+echo "snapshot_refreshed=false existing_snapshot=true"
+exit 0

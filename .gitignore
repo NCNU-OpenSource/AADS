@@ -6,9 +6,13 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
+.venv-test/
 *.egg-info/
-dist/
 build/
+
+# Deployment scripts live in dist/ (tracked); only the built agent payload is ignored.
+dist/aads-agent.tgz
 
 # PyTorch/Transformers models
 *.bin

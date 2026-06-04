@@ -2,7 +2,7 @@
 Simple Dashboard for AI Auto-Debug System
 Display anomalies and diagnosis reports
 """
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, send_from_directory
 import asyncpg
 import asyncio
 import hashlib
@@ -22,7 +22,7 @@ DB_USER = os.getenv('DB_USER', 'logdb')
 DB_PASSWORD = os.getenv('DB_PASSWORD', 'logdb_password')
 ADMIN_API_KEY = os.getenv('AADS_ADMIN_API_KEY', 'change-me-admin-key')
 APPROVAL_EXPIRY_MINUTES = int(os.getenv('APPROVAL_EXPIRY_MINUTES', '30'))
-SUPPORTED_EXECUTION_SCHEMA = '2.0'
+SUPPORTED_EXECUTION_SCHEMA = '3.0'
 IDEMPOTENCY_TTL_MINUTES = int(os.getenv('AADS_IDEMPOTENCY_TTL_MINUTES', '30'))
 
 
@@ -262,6 +262,23 @@ def index():
     return render_template('index.html')
 
 
+# Self-serve On-Device Agent installer. The bootstrap script drops
+# install-agent.sh + aads-agent.tgz into AADS_DIST_DIR (mounted from ./dist),
+# so targets can `curl -fsSL http://<server>:5000/install-agent.sh | sudo bash`
+# without any external download source.
+DIST_DIR = os.getenv('AADS_DIST_DIR', '/app/dist')
+
+
+@app.route('/install-agent.sh')
+def serve_install_agent():
+    return send_from_directory(DIST_DIR, 'install-agent.sh', mimetype='text/x-shellscript')
+
+
+@app.route('/aads-agent.tgz')
+def serve_agent_payload():
+    return send_from_directory(DIST_DIR, 'aads-agent.tgz', mimetype='application/gzip')
+
+
 @app.route('/api/diagnosis')
 def api_diagnosis():
     """API endpoint for diagnosis reports"""
@@ -307,13 +324,13 @@ async def register_agent(payload):
         await conn.execute(
             """
             INSERT INTO agent_nodes
-            (node_id, environment, agent_version, base_url, supported_commands, status, last_seen, metadata)
+            (node_id, environment, agent_version, base_url, runner_capabilities, status, last_seen, metadata)
             VALUES ($1, $2, $3, $4, $5, 'registered', NOW(), $6)
             ON CONFLICT (node_id) DO UPDATE SET
                 environment = EXCLUDED.environment,
                 agent_version = EXCLUDED.agent_version,
                 base_url = EXCLUDED.base_url,
-                supported_commands = EXCLUDED.supported_commands,
+                runner_capabilities = EXCLUDED.runner_capabilities,
                 status = 'registered',
                 last_seen = NOW(),
                 metadata = EXCLUDED.metadata
@@ -322,7 +339,7 @@ async def register_agent(payload):
             payload.get('environment', 'test'),
             payload.get('agent_version', 'unknown'),
             payload['base_url'],
-            json.dumps(payload.get('supported_commands', [])),
+            json.dumps(payload.get('runner_capabilities', {})),
             json.dumps(payload.get('metadata', {})),
         )
         await audit(conn, 'agent.registered', 'admin', None, None, payload['node_id'], 'allowed', None, 'success', payload)
@@ -342,7 +359,7 @@ async def list_agents():
         rows = await conn.fetch(
             """
             SELECT node_id, environment, agent_version, base_url,
-                   supported_commands, status, last_seen
+                   runner_capabilities, status, last_seen
             FROM agent_nodes
             ORDER BY node_id
             """
@@ -353,7 +370,7 @@ async def list_agents():
                 'environment': row['environment'],
                 'agent_version': row['agent_version'],
                 'base_url': row['base_url'],
-                'supported_commands': parse_jsonb(row['supported_commands']),
+                'runner_capabilities': parse_jsonb(row['runner_capabilities']),
                 'status': row['status'],
                 'last_seen': row['last_seen'].isoformat(),
             }

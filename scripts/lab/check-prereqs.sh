@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# PVE environment: only ssh/scp/openssl needed (no multipass/OrbStack).
 missing=0
-for cmd in multipass ssh scp openssl; do
+for cmd in ssh scp openssl; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "missing required command: $cmd" >&2
     missing=1
   fi
 done
 
-if ! command -v orb >/dev/null 2>&1 && ! pgrep -f OrbStack >/dev/null 2>&1; then
-  echo "warning: OrbStack was not detected; macOS Docker debugging should use OrbStack." >&2
-fi
-
 if [[ "$missing" -ne 0 ]]; then
   exit 1
+fi
+
+if [[ -z "${AADS_CONTROLLER_IP:-}" ]] && [[ -z "${AADS_TARGET_IP:-}" ]]; then
+  echo "warning: AADS_CONTROLLER_IP and AADS_TARGET_IP are not set; set them before running deploy scripts." >&2
 fi
 
 echo "Prerequisites look usable."

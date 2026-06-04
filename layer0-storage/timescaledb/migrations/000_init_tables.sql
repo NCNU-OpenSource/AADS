@@ -82,7 +82,8 @@ CREATE TABLE IF NOT EXISTS agent_nodes (
     environment TEXT NOT NULL DEFAULT 'test',
     agent_version TEXT NOT NULL DEFAULT 'unknown',
     base_url TEXT NOT NULL,
-    supported_commands JSONB DEFAULT '[]'::jsonb,
+    -- V2: argv runner capabilities (replaces legacy catalog supported_commands).
+    runner_capabilities JSONB DEFAULT '{}'::jsonb,
     status TEXT NOT NULL DEFAULT 'registered',
     registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),

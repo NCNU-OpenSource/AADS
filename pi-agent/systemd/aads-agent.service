@@ -1,6 +1,6 @@
 [Unit]
 Description=AADS On-Device Agent
-After=network-online.target nginx.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -14,7 +14,8 @@ RestartSec=5
 NoNewPrivileges=false
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/etc/nginx /var/lib/aads-agent /var/log/nginx /run /tmp
+ReadWritePaths=-/etc/nginx -/etc/postgresql -/etc/redis -/etc/mysql /var/lib/aads-agent -/var/log/nginx -/var/log/postgresql -/var/log/redis -/var/log/mysql /run /tmp
+ReadOnlyPaths=-/var/lib/postgresql -/var/lib/redis -/var/lib/mysql
 
 [Install]
 WantedBy=multi-user.target

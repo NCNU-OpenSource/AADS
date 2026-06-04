@@ -115,9 +115,9 @@ function FleetDrawer({ open, onClose, agents, stats }) {
           <div>
             <div className="sec-label">On-device agents · {agents.length}<span className="ln" /></div>
             {agents.map((a) => {
-              const cmds = a.supported_commands || [];
-              const probes = cmds.filter((c) => c.scope === "probe").length;
-              const actions = cmds.filter((c) => c.scope === "action").length;
+              // V2: runner_capabilities replaces the legacy catalog supported_commands.
+              const caps = a.runner_capabilities || {};
+              const modes = caps.modes || [];
               return (
                 <div className="agentcard" key={a.node_id}>
                   <div className="between">
@@ -125,12 +125,15 @@ function FleetDrawer({ open, onClose, agents, stats }) {
                     <Pill tone={a.environment === "test" ? "green" : "amber"} mono led>{a.environment}</Pill>
                   </div>
                   <div className="row tight wrap" style={{ marginTop: 8 }}>
-                    <Tag k="agent">{a.agent_version}</Tag><Tag>{probes} probes</Tag><Tag>{actions} actions</Tag>
+                    <Tag k="agent">{a.agent_version}</Tag>
+                    <Tag k="runner">{caps.schema_version || "runner.v1"}</Tag>
+                    {caps.supports_as_root && <Tag>root</Tag>}
                     <Tag k="seen">{fmtTime(a.last_seen)}</Tag>
                   </div>
                   <div className="xs muted mono" style={{ marginTop: 7 }}>{a.base_url}</div>
                   <div className="cmd-cloud">
-                    {cmds.map((c) => <span className="tag" key={c.command_id}><span className="k">{c.scope === "action" ? "▸" : "◇"}</span>{c.command_id}@{c.schema_version}</span>)}
+                    {modes.map((m) => <span className="tag" key={m}><span className="k">◇</span>{m}</span>)}
+                    <span className="tag"><span className="k">hook</span>{caps.hook_default || "allow_audit"}</span>
                   </div>
                 </div>
               );

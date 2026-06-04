@@ -45,19 +45,23 @@ python3 -m venv /opt/aads-agent/venv
 /opt/aads-agent/venv/bin/pip install -r "$SRC_DIR/requirements.txt"
 install -o root -g root -m 0644 "$SRC_DIR/src/main.py" /opt/aads-agent/main.py
 
-install -o root -g root -m 0755 "$SRC_DIR/wrappers/aads-nginx-start" /usr/local/sbin/aads-nginx-start
-install -o root -g root -m 0755 "$SRC_DIR/wrappers/aads-nginx-reload" /usr/local/sbin/aads-nginx-reload
-install -o root -g root -m 0755 "$SRC_DIR/wrappers/aads-nginx-config-test" /usr/local/sbin/aads-nginx-config-test
-install -o root -g root -m 0755 "$SRC_DIR/wrappers/aads-nginx-ensure-known-good-snapshot" /usr/local/sbin/aads-nginx-ensure-known-good-snapshot
-install -o root -g root -m 0755 "$SRC_DIR/wrappers/aads-nginx-restore-known-good" /usr/local/sbin/aads-nginx-restore-known-good
+# V2: install the single root runner wrapper plus every service wrapper. The
+# wrappers are now invoked as plain argv (by the root runner or directly), not as
+# catalog entries. sudoers authorizes ONLY the root runner.
+install -o root -g root -m 0755 "$SRC_DIR/wrappers/aads-root-command-runner" /usr/local/sbin/aads-root-command-runner
+for wrapper in "$SRC_DIR"/wrappers/aads-*; do
+  name="$(basename "$wrapper")"
+  [[ "$name" == "aads-root-command-runner" ]] && continue
+  install -o root -g root -m 0755 "$wrapper" "/usr/local/sbin/$name"
+done
 
+# Security trade-off (deliberate, see docs/runner-v2-plan.md): this replaces the
+# legacy per-wrapper exact-command grants with a single grant for the full-power
+# root runner. OS-level argv constraint is gone; the safety boundary is now the
+# agent's context-aware hook + append-only audit (and future safety cards).
+# Intended for the test lab; production must add safety-card deny rules first.
 cat > /etc/sudoers.d/aads-agent <<'EOF'
-Defaults:aads-agent !requiretty
-aads-agent ALL=(root) NOPASSWD: /usr/local/sbin/aads-nginx-start
-aads-agent ALL=(root) NOPASSWD: /usr/local/sbin/aads-nginx-reload
-aads-agent ALL=(root) NOPASSWD: /usr/local/sbin/aads-nginx-config-test
-aads-agent ALL=(root) NOPASSWD: /usr/local/sbin/aads-nginx-ensure-known-good-snapshot
-aads-agent ALL=(root) NOPASSWD: /usr/local/sbin/aads-nginx-restore-known-good
+aads-agent ALL=(root) NOPASSWD: /usr/local/sbin/aads-root-command-runner
 EOF
 chmod 0440 /etc/sudoers.d/aads-agent
 visudo -cf /etc/sudoers.d/aads-agent

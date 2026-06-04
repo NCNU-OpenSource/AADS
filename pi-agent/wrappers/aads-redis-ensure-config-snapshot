@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SNAPSHOT_DIR="${AADS_REDIS_SNAPSHOT_DIR:-/var/lib/aads-agent/snapshots/redis}"
+REDIS_CONF="${AADS_REDIS_CONF:-/etc/redis/redis.conf}"
+
+# Require a pre-existing snapshot — never create from potentially broken state.
+if [[ ! -f "$SNAPSHOT_DIR/redis.conf" ]]; then
+  echo "blocked: no_snapshot" >&2
+  exit 42
+fi
+
+if [[ ! -f "$REDIS_CONF" ]]; then
+  echo "blocked: redis_config_not_found" >&2
+  exit 42
+fi
+
+# Refresh snapshot only if current config is valid.
+if redis-server "$REDIS_CONF" --test-config >/dev/null 2>&1; then
+  cp -a "$REDIS_CONF" "$SNAPSHOT_DIR/redis.conf"
+  chown root:aads-agent "$SNAPSHOT_DIR/redis.conf"
+  chmod 0640 "$SNAPSHOT_DIR/redis.conf"
+  echo "snapshot_refreshed=true"
+  exit 0
+fi
+
+echo "snapshot_refreshed=false existing_snapshot=true"
+exit 0

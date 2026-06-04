@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Redis does not support SIGHUP config reload in all versions;
+# graceful restart is the safe equivalent.
+systemctl restart redis-server 2>/dev/null || systemctl restart redis
+systemctl is-active --quiet redis-server 2>/dev/null || systemctl is-active --quiet redis
+echo "reloaded=true"

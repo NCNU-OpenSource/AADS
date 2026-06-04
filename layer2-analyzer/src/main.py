@@ -48,10 +48,12 @@ from schemas.action_plan import (
     FixingPlanStep,
     PlanSelfCheck,
     PreExecutionSnapshot,
+    RollbackSpec,
     RootCauseReport,
     StepCommand,
     VerificationSpec,
 )
+import runner_catalog
 
 logging.basicConfig(
     level=logging.INFO,
@@ -296,7 +298,7 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
                     'confidence': rca_report.confidence,
                     'report': rca_report.model_dump()
                 },
-                'action_plan': fixing_plan.model_dump(),
+                'action_plan': fixing_plan.model_dump(by_alias=True),
                 'affected_services': [
                     {
                         "container": container,
@@ -316,17 +318,18 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
                         'status': 'pending',
                         'commands': [{
                             'tool_name': 'node_agent',
-                            'command_id': step.command_id,
+                            'operation': (step.context or {}).get('operation'),
+                            'service': (step.context or {}).get('service'),
                             'target_node_id': fixing_plan.target_node_id,
-                            'target': fixing_plan.target_node_id,
-                            'command': step.command_id,
-                            'args': step.args,
+                            'target': (step.context or {}).get('service') or fixing_plan.target_node_id,
+                            'command': self._step_label(step),
+                            'runner': step.runner.model_dump(by_alias=True),
                             'risk_level': fixing_plan.risk_level,
                             'environment_policy': fixing_plan.environment_policy,
                         }],
                         'action_type': 'k8s_exec',
-                        'target': fixing_plan.target_node_id,
-                        'command': step.command_id,
+                        'target': (step.context or {}).get('service') or fixing_plan.target_node_id,
+                        'command': self._step_label(step),
                         'is_destructive': True,
                         'description': step.expected_outcome
                     }
@@ -540,29 +543,48 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
 
     def _ensure_lab_node_agent_steps(self, action_plan: ClaudeStylePlan, cluster) -> ClaudeStylePlan:
         """
-        Add deterministic node_agent remediation for known nginx lab failures.
+        Add deterministic node_agent remediation for known lab service failures.
 
         The LLM remains the primary planner. This narrow post-process makes the
         v1 lab deterministic enough for CI/E2E while preserving the generated
-        diagnosis context.
+        diagnosis context. Covers: nginx, postgresql, redis, mysql/mariadb.
         """
         messages = " ".join(str(a.get("raw_message", "")) for a in cluster.anomalies).lower()
-        if "nginx" not in messages:
+        # Also check cluster metadata: containers, services, and individual anomaly labels
+        # so service detection works even when log lines don't name the service explicitly
+        # (e.g. PostgreSQL logs say "database system is shut down", not "postgresql").
+        containers = " ".join(str(c) for c in (getattr(cluster, "containers", None) or [])).lower()
+        services   = " ".join(str(s) for s in (getattr(cluster, "services", None) or [])).lower()
+        labels     = " ".join(
+            str(a.get("service", "")) + " " + str(a.get("container", "")) + " " + str(a.get("job", ""))
+            for a in cluster.anomalies
+        ).lower()
+        ctx = " ".join([messages, containers, services, labels])
+
+        # Detect which service is affected
+        is_nginx = "nginx" in ctx
+        is_pg = any(k in ctx for k in ("postgresql", "postgres", " pg ", "pg_ctl"))
+        is_redis = "redis" in ctx
+        is_mysql = any(k in ctx for k in ("mysql", "mariadb", "mysqld", "mariadbd"))
+
+        if not any([is_nginx, is_pg, is_redis, is_mysql]):
             return action_plan
 
         plan = action_plan.model_copy(deep=True)
         existing_ids = {
-            command.command_id
+            (command.target, command.operation)
             for step in plan.execution_steps
             for command in step.commands
-            if command.command_id
+            if command.operation
         }
         next_step_id = max((step.step_id for step in plan.execution_steps), default=0) + 1
 
-        def add_step(title: str, command_id: str, phase: str, explanation: str, requires_approval: bool = False):
+        def add_step(title: str, operation: str, phase: str, explanation: str,
+                     target: str = "nginx", requires_approval: bool = False):
             nonlocal next_step_id
-            if command_id in existing_ids:
+            if (target, operation) in existing_ids:
                 return
+            existing_ids.add((target, operation))
             plan.execution_steps.append(
                 ExecutionStep(
                     step_id=next_step_id,
@@ -573,10 +595,10 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
                     commands=[
                         StepCommand(
                             tool_name="node_agent",
-                            command_id=command_id,
+                            operation=operation,
                             target_node_id=self.default_node_id,
-                            target="nginx",
-                            command=command_id,
+                            target=target,
+                            command=f"{target}.{operation}",
                             args={},
                             risk_level="low",
                             environment_policy={
@@ -588,31 +610,119 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
                         )
                     ],
                     action_type="verify" if phase != "Execute" else "k8s_exec",
-                    target="nginx",
-                    command=command_id,
+                    target=target,
+                    command=f"{target}.{operation}",
                     is_destructive=phase == "Execute",
                 )
             )
             next_step_id += 1
 
-        add_step("Check nginx status", "nginx.status", "Explore", "Confirm whether nginx is running.")
-        if "config" in messages or "emerg" in messages:
-            add_step(
-                "Restore known-good nginx config",
-                "nginx.restore_known_good_config",
-                "Execute",
-                "Recover the lab nginx configuration from the trusted local snapshot.",
-                requires_approval=self.force_gate_approval or self.default_node_environment != "test",
-            )
-        else:
-            add_step(
-                "Start nginx service",
-                "nginx.start",
-                "Execute",
-                "Bring nginx back online for the lab target.",
-                requires_approval=self.force_gate_approval or self.default_node_environment != "test",
-            )
-        add_step("Verify nginx config", "nginx.config_test", "Verify", "Validate nginx configuration after remediation.")
+        # Distinguish a config error (needs restore) from a plain stop/crash
+        # (needs restart). Use SPECIFIC config-failure signatures, not generic
+        # "error"/"failed" which appear in any service-down log and would wrongly
+        # route a simple stop to the destructive restore path.
+        config_signatures = (
+            "emerg",                 # nginx config emergency
+            "syntax error",
+            "invalid line",          # postgresql.conf parse error
+            "invalid directive",
+            "invalid_directive",     # our injected nginx/pg marker
+            "invalid_chaos",         # our injected redis marker
+            "chaos_option",          # our injected mysql marker
+            "fatal config file error",
+            "config file error",
+            "unknown variable",      # mysql/mariadb
+            "unknown option",
+            "can't open config",     # redis
+            "config error",
+            "wrong group definition", # mysql option file parse failure
+            "includedir directive",   # mysql option file parse failure
+            "invalid datadir",        # mysql lab bad config
+            "data dir not found",     # mysql-systemd-start sanity check
+            "could not open configuration",
+            "configuration file",
+        )
+        is_config_error = any(k in messages for k in config_signatures)
+
+        def remove_existing_node_commands(pairs: set):
+            if not pairs:
+                return
+            for step in plan.execution_steps:
+                if step.phase != "Execute":
+                    continue
+                step.commands = [command for command in step.commands if (command.target, command.operation) not in pairs]
+            existing_ids.difference_update(pairs)
+
+        if is_config_error:
+            if is_nginx:
+                remove_existing_node_commands({("nginx", "start"), ("nginx", "reload")})
+            if is_pg:
+                remove_existing_node_commands({("postgresql", "restart"), ("postgresql", "reload")})
+            if is_redis:
+                remove_existing_node_commands({("redis", "restart"), ("redis", "reload")})
+            if is_mysql:
+                remove_existing_node_commands({("mysql", "restart"), ("mysql", "reload")})
+
+        if is_nginx:
+            add_step("Check nginx status", "status", "Explore",
+                     "Confirm whether nginx is running.", target="nginx")
+            if is_config_error:
+                add_step("Restore known-good nginx config", "restore_config", "Execute",
+                         "Recover the lab nginx configuration from the trusted local snapshot.",
+                         target="nginx",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            else:
+                add_step("Start nginx service", "start", "Execute",
+                         "Bring nginx back online for the lab target.", target="nginx",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            add_step("Verify nginx config", "config_test", "Verify",
+                     "Validate nginx configuration after remediation.", target="nginx")
+
+        if is_pg:
+            add_step("Check PostgreSQL status", "status", "Explore",
+                     "Confirm whether PostgreSQL is running.", target="postgresql")
+            if is_config_error:
+                add_step("Restore known-good PostgreSQL config", "restore_config", "Execute",
+                         "Recover PostgreSQL configuration from the trusted local snapshot.",
+                         target="postgresql",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            else:
+                add_step("Restart PostgreSQL service", "restart", "Execute",
+                         "Restart PostgreSQL to recover from crash or OOM kill.", target="postgresql",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            add_step("Test PostgreSQL connection", "connection_test", "Verify",
+                     "Verify PostgreSQL is accepting connections after remediation.", target="postgresql")
+
+        if is_redis:
+            add_step("Check Redis status", "status", "Explore",
+                     "Confirm whether Redis is running.", target="redis")
+            if is_config_error:
+                add_step("Restore known-good Redis config", "restore_config", "Execute",
+                         "Recover Redis configuration from the trusted local snapshot.",
+                         target="redis",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            else:
+                add_step("Restart Redis service", "restart", "Execute",
+                         "Restart Redis to recover from crash or OOM kill.", target="redis",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            add_step("Ping Redis", "ping", "Verify",
+                     "Verify Redis is responding after remediation.", target="redis")
+
+        if is_mysql:
+            add_step("Check MySQL status", "status", "Explore",
+                     "Confirm whether MySQL/MariaDB is running.", target="mysql")
+            if is_config_error:
+                add_step("Restore known-good MySQL config", "restore_config", "Execute",
+                         "Recover MySQL configuration from the trusted local snapshot.",
+                         target="mysql",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            else:
+                add_step("Restart MySQL service", "restart", "Execute",
+                         "Restart MySQL/MariaDB to recover from crash or OOM kill.", target="mysql",
+                         requires_approval=self.force_gate_approval or self.default_node_environment != "test")
+            add_step("Test MySQL connection", "connection_test", "Verify",
+                     "Verify MySQL/MariaDB is accepting connections after remediation.", target="mysql")
+
         return plan
 
     async def _recent_failed_plan_paths(self, cluster) -> List[Dict[str, Any]]:
@@ -648,8 +758,21 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
 
     def _build_root_cause_report(self, action_plan: ClaudeStylePlan, cluster, diagnosis_id: str) -> RootCauseReport:
         containers = self._stable_values(cluster.containers)
-        templates = self._stable_values(cluster.templates)
-        affected_service = containers[0] if containers else "nginx"
+        services   = self._stable_values(getattr(cluster, "services", None) or [])
+        templates  = self._stable_values(cluster.templates)
+        # Filter empty strings; containers may be empty when logs come from
+        # file-based sources without a container label (e.g. syslog, pg logs).
+        valid_containers = [c for c in containers if c.strip()]
+        valid_services   = [s for s in services if s.strip()]
+        affected_service = (
+            next(iter(valid_containers), None)
+            or next((s for s in valid_services if s not in ("system", "syslog")), None)
+            or next(iter(valid_services), None)
+            or "unknown"
+        )
+        root_cause = (action_plan.root_cause or action_plan.context_analysis or "").strip()
+        if not root_cause:
+            root_cause = "Root cause could not be determined from available log data."
         evidence = [
             {
                 "source": "log",
@@ -663,7 +786,7 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
             "report_id": f"rca_{diagnosis_id}",
             "target_node_id": self.default_node_id,
             "affected_service": affected_service,
-            "root_cause": action_plan.root_cause or action_plan.context_analysis,
+            "root_cause": root_cause,
             "confidence": action_plan.confidence_score,
             "evidence": evidence,
             "recommended_capabilities": self._extract_node_agent_command_ids(action_plan),
@@ -674,12 +797,23 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
         return sorted(str(value) for value in (values or []) if value is not None)
 
     def _extract_node_agent_command_ids(self, action_plan: ClaudeStylePlan) -> List[str]:
-        command_ids: List[str] = []
+        """Service.operation labels of node_agent commands (replaces command_id)."""
+        labels: List[str] = []
         for step in action_plan.execution_steps:
             for command in step.commands:
-                if command.tool_name == "node_agent" and command.command_id:
-                    command_ids.append(command.command_id)
-        return sorted(set(command_ids))
+                if command.tool_name == "node_agent" and command.operation:
+                    labels.append(f"{command.target}.{command.operation}")
+        return sorted(set(labels))
+
+    @staticmethod
+    def _step_label(step: FixingPlanStep) -> str:
+        context = step.context or {}
+        service = context.get("service")
+        operation = context.get("operation")
+        if service and operation:
+            return f"{service}.{operation}"
+        argv = step.runner.argv if step.runner else []
+        return argv[0] if argv else "runner"
 
     def _to_fixing_plan(
         self,
@@ -688,7 +822,7 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
         diagnosis_id: str,
         rca_report: RootCauseReport,
     ) -> FixingPlan:
-        """Convert the display plan into the v2 executable FixingPlan contract."""
+        """Convert the display plan into the executable FixingPlan 3.0 contract."""
         environment_policy = {
             "environment": self.default_node_environment,
             "auto_execute_allowed": self.default_node_environment == "test" and not self.force_gate_approval,
@@ -699,7 +833,7 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
             if step.phase != "Execute":
                 continue
             for command in step.commands:
-                if command.tool_name == "node_agent" and command.command_id:
+                if command.tool_name == "node_agent" and command.operation:
                     executable_commands.append(command)
 
         if not executable_commands:
@@ -707,24 +841,30 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
 
         fixing_steps = []
         for index, command in enumerate(executable_commands, start=1):
+            service = command.target
+            operation = command.operation
             fixing_steps.append(
                 FixingPlanStep(
                     step_id=index,
                     order=index,
-                    command_id=command.command_id or command.command,
-                    schema_version=command.schema_version,
-                    args=command.args,
-                    expected_outcome=self._expected_outcome_for(command.command_id or command.command),
+                    runner=runner_catalog.runner_for(service, operation),
+                    context={"purpose": "repair", "service": service, "operation": operation},
+                    idempotency=runner_catalog.idempotency_for(service, operation),
+                    expected_outcome=self._expected_outcome_for(service, operation),
                     on_failure="rollback",
-                    verification=self._verification_for(command.command_id or command.command),
+                    verification=runner_catalog.verification_for(service, operation),
                 )
             )
 
-        final_verification = VerificationSpec(
-            command_id="nginx.http_check",
-            args={"url": "http://127.0.0.1/", "expected_status": 200},
-            expected={"status": "success", "http_status": 200},
-        )
+        repair_services = [cmd.target for cmd in executable_commands]
+        primary = runner_catalog.primary_service(repair_services)
+
+        # Final verification, snapshot and rollback must all match the service
+        # being repaired. Using the nginx HTTP check for a PostgreSQL/Redis/MySQL
+        # repair would always fail.
+        final_verification = runner_catalog.final_verification_for(repair_services)
+        snapshot_runner, snapshot_scope = runner_catalog.snapshot_for(primary)
+        rollback_runner = runner_catalog.rollback_for(primary)
 
         return FixingPlan(
             plan_id=diagnosis_id,
@@ -735,45 +875,41 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
             environment_policy=environment_policy,
             pre_execution_snapshot=PreExecutionSnapshot(
                 enabled=True,
-                command_id="nginx.ensure_known_good_snapshot",
-                scope="nginx_config",
+                runner=snapshot_runner,
+                scope=snapshot_scope,
                 on_failure="block",
             ),
+            rollback=RollbackSpec(enabled=rollback_runner is not None, runner=rollback_runner),
             steps=fixing_steps,
             final_verification=final_verification,
             self_check=PlanSelfCheck(
                 passed=True,
-                rationale="FixingPlan uses only registered node catalog commands and deterministic probes.",
+                rationale="FixingPlan uses argv runner specs with declarative structured verification.",
                 checked_items=[
-                    "schema_version=2.0",
+                    "schema_version=3.0",
                     "ordered steps",
-                    "catalog probes for verification",
+                    "runner specs with side_effect",
+                    "extractor-based verification",
                     "environment policy injected",
                 ],
             ),
         )
 
-    def _expected_outcome_for(self, command_id: str) -> str:
-        if command_id == "nginx.start":
-            return "nginx service is active"
-        if command_id == "nginx.restore_known_good_config":
-            return "known-good nginx config is restored and reload succeeds"
-        if command_id == "nginx.reload":
-            return "nginx config validates and reload succeeds"
-        return f"{command_id} completes successfully"
-
-    def _verification_for(self, command_id: str) -> VerificationSpec:
-        if command_id == "nginx.start":
-            return VerificationSpec(
-                command_id="nginx.status",
-                args={},
-                expected={"status": "success", "active": True},
-            )
-        return VerificationSpec(
-            command_id="nginx.config_test",
-            args={},
-            expected={"status": "success", "returncode": 0},
-        )
+    def _expected_outcome_for(self, service: str, operation: str) -> str:
+        outcomes = {
+            ("nginx", "start"): "nginx service is active",
+            ("nginx", "restore_config"): "known-good nginx config is restored and reload succeeds",
+            ("nginx", "reload"): "nginx config validates and reload succeeds",
+            ("postgresql", "restart"): "postgresql service is active and accepting connections",
+            ("postgresql", "restore_config"): "known-good postgresql config is restored and service reloads",
+            ("postgresql", "reload"): "postgresql config reloaded successfully",
+            ("redis", "restart"): "redis service is active and responding to PING",
+            ("redis", "restore_config"): "known-good redis config is restored and service restarts",
+            ("mysql", "restart"): "mysql/mariadb service is active and accepting connections",
+            ("mysql", "restore_config"): "known-good mysql config is restored and service restarts",
+            ("mysql", "reload"): "mysql/mariadb config reloaded successfully",
+        }
+        return outcomes.get((service, operation), f"{service}.{operation} completes successfully")
 
     async def _run_layer3(self, diagnosis: Dict[str, Any]) -> Dict[str, Any]:
         """

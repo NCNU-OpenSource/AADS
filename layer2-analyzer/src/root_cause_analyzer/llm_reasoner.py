@@ -106,6 +106,40 @@ Your task is to analyze anomalous logs and system metrics to determine:
 2. Why it happened (contributing factors)
 3. What should be done (recommended actions)
 
+## Supported Services and Repair Actions
+
+### nginx
+- Stopped/inactive → recommended_action: "nginx.start"
+- Config syntax error → recommended_action: "nginx.restore_known_good_config"
+- Probe before repair: "nginx.status", "nginx.config_test", "nginx.http_check"
+
+### PostgreSQL
+- Service stopped/crashed (OOM kill, SIGKILL from kernel) → recommended_action: "postgresql.restart"
+- Config syntax error (FATAL in pg logs, reload failed) → recommended_action: "postgresql.restore_known_good_config"
+- Connection refused but service active → recommended_action: "postgresql.reload" (may be pg_hba.conf issue)
+- Probe before repair: "postgresql.status", "postgresql.connection_test", "postgresql.config_test"
+- Use "postgresql.reload" for config-only changes; "postgresql.restart" for crash/OOM recovery
+- Do NOT recommend repair if logs indicate disk full or data corruption — mark severity=critical with no action
+
+### Redis
+- Service stopped/OOM killed → recommended_action: "redis.restart"
+- Config error (failed to load, bind failed) → recommended_action: "redis.restore_known_good_config"
+- Probe before repair: "redis.status", "redis.ping", "redis.config_test"
+- Do NOT recommend flushing data — data loss is irreversible
+
+### Docker Container
+- Container exited/stopped (non-zero exit code, OOM kill) → recommended_action: "docker.container_restart"
+- Container never started → recommended_action: "docker.container_start"
+- Probe before repair: "docker.container_status"
+- The container arg MUST be one of the node's allowed containers (from catalog arg_allowlist)
+
+### MySQL / MariaDB
+- Service stopped/crashed → recommended_action: "mysql.restart"
+- Config syntax error (Can't open config file, unknown option) → recommended_action: "mysql.restore_known_good_config"
+- Connection refused but service active → recommended_action: "mysql.reload"
+- Probe before repair: "mysql.status", "mysql.connection_test", "mysql.config_test"
+- Do NOT recommend repair if logs indicate InnoDB corruption or disk full
+
 Provide your analysis in JSON format with the following structure:
 {
   "severity": "low|medium|high|critical",

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+mysql_server_config() {
+  local candidate
+  for candidate in \
+    "${AADS_MYSQL_CONF:-}" \
+    /etc/mysql/mysql.conf.d/mysqld.cnf \
+    /etc/mysql/mariadb.conf.d/50-server.cnf \
+    /etc/mysql/my.cnf; do
+    [[ -n "$candidate" && -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+  done
+
+  find /etc/mysql -type f -name "*.cnf" \
+    \( -name "mysqld.cnf" -o -name "*server*.cnf" -o -path "*/mariadb.conf.d/*.cnf" \) \
+    2>/dev/null | sort | head -1
+}
+
+MYSQL_CONF="$(mysql_server_config)"
+
+if [[ -z "$MYSQL_CONF" ]]; then
+  echo "blocked: mysql_config_not_found" >&2
+  exit 42
+fi
+
+# MySQL 8.0+ and MariaDB 10.4+ support --validate-config
+if mysqld --validate-config 2>/dev/null; then
+  echo "config_valid=true config_file=$MYSQL_CONF"
+  exit 0
+fi
+
+# MariaDB fallback
+if mariadbd --validate-config 2>/dev/null; then
+  echo "config_valid=true config_file=$MYSQL_CONF"
+  exit 0
+fi
+
+# If validate-config not supported, check file exists and is readable
+[[ -s "$MYSQL_CONF" ]] && echo "config_valid=unknown config_file=$MYSQL_CONF" || { echo "blocked: config_empty" >&2; exit 42; }

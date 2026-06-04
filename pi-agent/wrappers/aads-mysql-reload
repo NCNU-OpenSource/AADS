@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if systemctl cat mysql >/dev/null 2>&1; then
+  systemctl reload mysql 2>/dev/null || systemctl restart mysql
+  systemctl is-active --quiet mysql
+else
+  systemctl reload mariadb 2>/dev/null || systemctl restart mariadb
+  systemctl is-active --quiet mariadb
+fi
+echo "reloaded=true"

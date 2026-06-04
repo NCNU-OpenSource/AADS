@@ -14,7 +14,7 @@ Design Philosophy (ADR-004):
 Related: ADR-002 Structured Output Decision, ADR-004 Claude Style Plan Design
 """
 from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ============================================================
@@ -47,18 +47,66 @@ class RootCauseReport(BaseModel):
     recommended_capabilities: List[str] = Field(default_factory=list)
 
 
+class RunnerSpec(BaseModel):
+    """
+    argv-first command runner spec executed on the target by the On-Device Agent.
+
+    Replaces the legacy catalog ``command_id`` contract. The safety boundary is no
+    longer "is this command_id in the catalog" but the full per-execution spec +
+    context + hook decision + audit. argv is run with shell=False; there is no
+    implicit shell expansion, pipe, or redirect. ``as_root=true`` routes through a
+    single root runner wrapper. ``side_effect`` (not ``as_root``) tells Layer 4
+    whether the command mutates state and therefore needs a node lock / snapshot.
+    """
+
+    mode: Literal["argv"] = Field(default="argv")
+    argv: List[str] = Field(..., min_length=1)
+    cwd: str = Field(default="/")
+    env: Dict[str, str] = Field(default_factory=dict)
+    timeout_seconds: int = Field(default=30, ge=1, le=600)
+    as_root: bool = Field(default=False)
+    side_effect: Literal["read", "mutate"] = Field(default="read")
+    stdin: Optional[str] = Field(default=None)
+
+    @field_validator("argv")
+    @classmethod
+    def argv_must_be_non_empty_strings(cls, value: List[str]) -> List[str]:
+        if not value or any((not isinstance(arg, str) or arg == "") for arg in value):
+            raise ValueError("runner.argv must be a non-empty list of non-empty strings")
+        return value
+
+
+class ExtractRule(BaseModel):
+    """
+    Declarative extractor that turns one slice of runner output into a single
+    structured ``observed`` field, so verification compares structured values
+    (never free text). ``from`` is the trust boundary: only these five sources.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: Literal["stdout", "stderr", "stdout_stripped", "stderr_stripped", "returncode"] = Field(
+        ..., alias="from"
+    )
+    equals: Optional[str] = Field(default=None, description="-> bool: source == equals")
+    contains: Optional[str] = Field(default=None, description="-> bool: contains in source")
+    regex: Optional[str] = Field(default=None, description="-> bool: re.search matched")
+    as_int: bool = Field(default=False, description="-> int(stripped source)")
+    json_path: Optional[str] = Field(default=None, description="-> value at dotted path in JSON source")
+
+
 class VerificationSpec(BaseModel):
     """
-    Deterministic verification contract.
+    Deterministic verification contract (runner-based).
 
-    Verification must be executed as a catalog probe and judged from structured
-    fields, never by free text or LLM judgement.
+    Verification runs a read-only runner, extracts structured fields via
+    ``extract``, and compares them against ``expected``. Free text / LLM
+    judgement is never allowed.
     """
 
-    type: Literal["catalog_probe"] = Field(default="catalog_probe")
-    command_id: str = Field(..., min_length=1)
-    schema_version: str = Field(default="1.0")
-    args: Dict[str, Any] = Field(default_factory=dict)
+    type: Literal["runner_probe"] = Field(default="runner_probe")
+    runner: RunnerSpec
+    extract: Dict[str, ExtractRule] = Field(default_factory=dict)
     expected: Dict[str, Any] = Field(..., description="Structured expected fields")
 
     @field_validator("expected")
@@ -70,32 +118,57 @@ class VerificationSpec(BaseModel):
             raise ValueError("free-text or LLM verification is not allowed")
         return value
 
+    @model_validator(mode="after")
+    def runner_must_be_read_and_extract_covers_expected(self):
+        if self.runner.side_effect != "read":
+            raise ValueError("verification.runner.side_effect must be 'read'")
+        missing = set(self.expected.keys()) - set(self.extract.keys())
+        if missing:
+            raise ValueError(f"verification.extract must cover expected keys: {sorted(missing)}")
+        return self
+
 
 class PreExecutionSnapshot(BaseModel):
-    enabled: bool = Field(default=True)
-    command_id: str = Field(default="nginx.ensure_known_good_snapshot")
-    scope: Literal["nginx_config"] = Field(default="nginx_config")
-    args: Dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = Field(default=False)
+    runner: Optional[RunnerSpec] = Field(default=None)
+    scope: Literal["nginx_config", "postgresql_config", "redis_config", "mysql_config"] = Field(default="nginx_config")
     on_failure: Literal["block", "continue_if_existing"] = Field(default="block")
+
+    @model_validator(mode="after")
+    def runner_required_when_enabled(self):
+        if self.enabled and self.runner is None:
+            raise ValueError("pre_execution_snapshot.runner is required when enabled")
+        if self.runner is not None and self.runner.side_effect != "mutate":
+            raise ValueError("snapshot runner must be side_effect=mutate")
+        return self
+
+
+class RollbackSpec(BaseModel):
+    enabled: bool = Field(default=False)
+    runner: Optional[RunnerSpec] = Field(default=None)
+
+    @model_validator(mode="after")
+    def runner_required_when_enabled(self):
+        if self.enabled and self.runner is None:
+            raise ValueError("rollback.runner is required when enabled")
+        if self.runner is not None and self.runner.side_effect != "mutate":
+            raise ValueError("rollback runner must be side_effect=mutate")
+        return self
 
 
 class FixingPlanStep(BaseModel):
-    """Single strictly ordered executable step."""
+    """Single strictly ordered executable step (runner-based)."""
 
     step_id: int = Field(..., ge=1)
     order: int = Field(..., ge=1)
-    command_id: str = Field(..., min_length=1)
-    schema_version: str = Field(default="1.0")
-    args: Dict[str, Any] = Field(default_factory=dict)
+    runner: RunnerSpec
+    context: Dict[str, Any] = Field(default_factory=dict)
+    idempotency: Dict[str, Any] = Field(
+        default_factory=lambda: {"mode": "idempotent", "max_attempts": 2}
+    )
     expected_outcome: str = Field(..., min_length=1)
-    on_failure: Literal["abort", "rollback", "continue"] = Field(default="abort")
+    on_failure: Literal["abort", "rollback"] = Field(default="abort")
     verification: VerificationSpec
-
-    @model_validator(mode="after")
-    def reject_continue_for_v1(self):
-        if self.on_failure == "continue":
-            raise ValueError("on_failure=continue is reserved and disabled in v1")
-        return self
 
 
 class PlanSelfCheck(BaseModel):
@@ -108,11 +181,12 @@ class FixingPlan(BaseModel):
     """
     Executable System Agent plan for the controller-side Knowledge Agent.
 
-    This replaces ClaudeStylePlan on the executable path. The Knowledge Agent
-    must execute only this schema and must not infer additional actions.
+    schema 3.0 replaces the legacy catalog ``command_id`` contract with runner
+    specs. The Knowledge Agent must execute only this schema and must not infer
+    additional actions.
     """
 
-    schema_version: Literal["2.0"] = Field(default="2.0")
+    schema_version: Literal["3.0"] = Field(default="3.0")
     plan_id: str = Field(..., min_length=1)
     rca_report_id: str = Field(..., min_length=1)
     target_node_id: str = Field(..., min_length=1)
@@ -120,6 +194,7 @@ class FixingPlan(BaseModel):
     risk_level: Literal["low", "medium", "high", "critical"] = Field(default="low")
     environment_policy: Dict[str, Any] = Field(default_factory=dict)
     pre_execution_snapshot: PreExecutionSnapshot = Field(default_factory=PreExecutionSnapshot)
+    rollback: RollbackSpec = Field(default_factory=RollbackSpec)
     steps: List[FixingPlanStep] = Field(..., min_length=1)
     final_verification: VerificationSpec
     self_check: PlanSelfCheck
@@ -161,9 +236,10 @@ class StepCommand(BaseModel):
         ...,
         description="Tool to use: query_loki, query_prometheus, execute_diagnostic_command, node_agent"
     )
-    command_id: Optional[str] = Field(
+    operation: Optional[str] = Field(
         default=None,
-        description="Catalog command id for node_agent commands"
+        description="Runner operation for node_agent commands (e.g. restart, restore_config, status). "
+                    "Combined with `target` (service) it maps to a RunnerSpec. Replaces legacy command_id."
     )
     target_node_id: Optional[str] = Field(
         default=None,
