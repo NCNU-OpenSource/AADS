@@ -133,7 +133,23 @@ env \
   bash "$SRC/install/install.sh"
 ok "Agent installed (systemd service: aads-agent)"
 
-# ── Wait for the agent and read its facts ───────────────────────────────────
+# ── Verify the service actually entered active (running) ────────────────────
+log "Verifying service started"
+SERVICE_UP=false
+for _ in $(seq 1 15); do
+  if systemctl is-active --quiet aads-agent 2>/dev/null; then
+    SERVICE_UP=true; break
+  fi
+  sleep 1
+done
+if ! $SERVICE_UP; then
+  warn "aads-agent.service failed to start. Journal output:"
+  journalctl -u aads-agent -n 30 --no-pager 2>/dev/null || true
+  die "Fix the service error above, then re-run this installer."
+fi
+ok "aads-agent.service is active"
+
+# ── Wait for the agent HTTP API to become ready ─────────────────────────────
 log "Waiting for agent to become ready"
 FACTS=""
 for _ in $(seq 1 30); do
@@ -143,7 +159,7 @@ for _ in $(seq 1 30); do
   fi
   sleep 1
 done
-[[ -n "$FACTS" ]] || die "Agent did not come up on port ${AGENT_PORT}. Check: journalctl -u aads-agent -n 40"
+[[ -n "$FACTS" ]] || die "Agent did not respond on port ${AGENT_PORT}. Check: journalctl -u aads-agent -n 40"
 NODE_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["node_id"])' <<<"$FACTS")"
 ok "Agent ready — node_id=$NODE_ID"
 
