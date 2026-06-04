@@ -152,7 +152,6 @@ fi
 
 # ── Summary + agent install command ─────────────────────────────────────────
 GITHUB_RELEASE_BASE="https://github.com/bs10081/AADS/releases/latest/download"
-GITHUB_SCRIPT_URL="https://raw.githubusercontent.com/bs10081/AADS/main/dist/install-agent.sh"
 
 cat <<EOF
 
@@ -165,7 +164,7 @@ cat <<EOF
 
  ── Install On-Device Agent (HTTPS, public GitHub — no server dependency) ──
 
-   curl -fsSL ${GITHUB_SCRIPT_URL} | sudo \\
+   curl -fsSL ${GITHUB_RELEASE_BASE}/install-agent.sh | sudo \\
      AADS_SERVER=${AADS_SERVER_IP} \\
      AADS_AGENT_TOKEN=${PI_AGENT_TOKEN} \\
      AADS_ADMIN_API_KEY=${AADS_ADMIN_API_KEY} \\

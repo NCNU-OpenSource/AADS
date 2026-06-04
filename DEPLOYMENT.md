@@ -11,7 +11,7 @@ Deploy the server first — it mints the token the agents need.
 **HTTPS — pull directly from GitHub (no repo checkout needed):**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bs10081/AADS/main/dist/install-server.sh | bash
+curl -fsSL https://github.com/bs10081/AADS/releases/latest/download/install-server.sh | bash
 ```
 
 Downloads `aads-server.tgz` from GitHub Releases, extracts it to `~/aads`
@@ -19,7 +19,7 @@ Downloads `aads-server.tgz` from GitHub Releases, extracts it to `~/aads`
 Fully non-interactive if all vars are pre-set:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bs10081/AADS/main/dist/install-server.sh | \
+curl -fsSL https://github.com/bs10081/AADS/releases/latest/download/install-server.sh | \
   AADS_LITELLM_UPSTREAM_API_KEY=sk-... bash
 ```
 
@@ -45,7 +45,7 @@ Pick whichever fits your network:
 **HTTPS (recommended — pulls from public GitHub, no server port needed):**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bs10081/AADS/main/dist/install-agent.sh | sudo \
+curl -fsSL https://github.com/bs10081/AADS/releases/latest/download/install-agent.sh | sudo \
   AADS_SERVER=<server-ip> \
   AADS_AGENT_TOKEN=<token> \
   AADS_ADMIN_API_KEY=<admin-key> \
