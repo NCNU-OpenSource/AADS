@@ -77,6 +77,23 @@ docker compose version >/dev/null 2>&1 || die "'docker compose' v2 plugin not av
 DOCKER="docker"; docker info >/dev/null 2>&1 || DOCKER="sudo docker"
 ok "Docker ready ($DOCKER)"
 
+# Harden the daemon for large image pulls over unstable links. Some service
+# images (PyTorch-based) are multi-GB; the default 5 blob-download attempts
+# can be exhausted by transient CDN EOFs. Bump to 10. Merge into any existing
+# daemon.json (e.g. DNS settings) rather than clobbering it.
+tune_docker_daemon() {
+  local djson=/etc/docker/daemon.json current merged
+  command -v jq >/dev/null 2>&1 || { sudo apt-get install -y jq >/dev/null 2>&1 || return 0; }
+  current="$(sudo cat "$djson" 2>/dev/null || echo '{}')"
+  echo "$current" | jq -e '.["max-download-attempts"] == 10' >/dev/null 2>&1 && return 0
+  merged="$(echo "$current" | jq '. + {"max-download-attempts": 10}')" || return 0
+  echo "$merged" | sudo tee "$djson" >/dev/null
+  sudo systemctl restart docker 2>/dev/null || sudo service docker restart 2>/dev/null || true
+  sleep 3
+  ok "Docker daemon tuned (max-download-attempts=10)"
+}
+tune_docker_daemon
+
 AADS_IMAGE_REGISTRY="${AADS_IMAGE_REGISTRY:-ghcr.io/bs10081}"
 AADS_IMAGE_TAG="${AADS_IMAGE_TAG:-latest}"
 
@@ -129,8 +146,12 @@ cleanup_pull() { rm -f "$PULL_ERR"; }
 trap cleanup_pull EXIT
 
 PULL_OK=false
-MAX_PULL_ATTEMPTS=5
-log "Pulling service images ($AADS_IMAGE_REGISTRY :$AADS_IMAGE_TAG)"
+MAX_PULL_ATTEMPTS=8
+# Serialize blob downloads: on an unstable link, one image at a time finishes
+# each large blob inside the connection's stable window instead of splitting
+# bandwidth across many concurrent (and individually slower) transfers.
+export COMPOSE_PARALLEL_LIMIT=1
+log "Pulling service images ($AADS_IMAGE_REGISTRY :$AADS_IMAGE_TAG, serialized)"
 for attempt in $(seq 1 "$MAX_PULL_ATTEMPTS"); do
   if $DOCKER compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" pull 2>"$PULL_ERR"; then
     PULL_OK=true
