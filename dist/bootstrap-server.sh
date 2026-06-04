@@ -123,16 +123,48 @@ log "Building agent payload for self-serve install"
 bash "$ROOT/dist/build-agent-payload.sh" "$ROOT/dist/aads-agent.tgz"
 ok "dist/aads-agent.tgz ready (served at http://${AADS_SERVER_IP}:5000/aads-agent.tgz)"
 
-# ── Pull images + start ─────────────────────────────────────────────────────
+# ── Pull images + start (fallback to local build if GHCR is private) ────────
+PULL_ERR="$(mktemp)"
+cleanup_pull() { rm -f "$PULL_ERR"; }
+trap cleanup_pull EXIT
+
 log "Pulling service images ($AADS_IMAGE_REGISTRY :$AADS_IMAGE_TAG)"
-if ! $DOCKER compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" pull; then
-  warn "Image pull failed. If the registry is private, authenticate first:"
-  warn "  echo \$GHCR_TOKEN | $DOCKER login ghcr.io -u <github-user> --password-stdin"
-  die "Resolve the pull error and re-run this script."
+if $DOCKER compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" pull 2>"$PULL_ERR"; then
+  log "Starting the stack"
+  $DOCKER compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
+  ok "Containers started"
+else
+  # GHCR packages default to private even on public repos. Fall back to
+  # building locally from a shallow clone of the public repository.
+  if grep -qi "unauthorized\|denied\|authentication required" "$PULL_ERR"; then
+    warn "GHCR pull unauthorized — packages are private by default."
+    warn "Falling back to local build from the public repository (takes ~5 min)."
+    warn "To skip this next time: make packages public at https://github.com/bs10081?tab=packages"
+
+    SRC_DIR="$(mktemp -d /tmp/aads-src.XXXXXX)"
+    cleanup_src() { rm -rf "$SRC_DIR"; }
+    trap cleanup_src EXIT
+
+    log "Cloning public repository"
+    command -v git >/dev/null 2>&1 || { sudo apt-get install -y git >/dev/null; }
+    git clone --depth 1 https://github.com/bs10081/AADS.git "$SRC_DIR"
+
+    # Overlay our already-generated .env and config dirs from the bundle
+    cp "$ENV_FILE" "$SRC_DIR/.env"
+
+    log "Building images locally"
+    $DOCKER compose -f "$SRC_DIR/docker-compose.yaml" --env-file "$SRC_DIR/.env" \
+      up -d --build
+    ok "Containers started (built locally)"
+
+    # Point COMPOSE_FILE at the dev compose so the DB check below works
+    COMPOSE_FILE="$SRC_DIR/docker-compose.yaml"
+    ENV_FILE="$SRC_DIR/.env"
+  else
+    cat "$PULL_ERR" >&2
+    die "Image pull failed (see error above). Fix the issue and re-run."
+  fi
 fi
-log "Starting the stack"
-$DOCKER compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
-ok "Containers started"
 
 # ── Verify database ─────────────────────────────────────────────────────────
 log "Waiting for TimescaleDB migrations"
