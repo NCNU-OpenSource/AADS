@@ -36,6 +36,77 @@ die()     { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 svc_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
 svc_exists() { systemctl list-units --all --no-legend "$1.service" 2>/dev/null | grep -q .; }
 
+# ── auto-install helpers ─────────────────────────────────────────────────────
+apt_install() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y "$@" >/dev/null
+}
+
+ensure_nginx() {
+  command -v nginx >/dev/null 2>&1 && return
+  log "nginx not found — installing"
+  apt_install nginx
+  systemctl enable --now nginx
+  ok "nginx installed and started"
+  # Give the AADS agent a chance to capture a fresh known-good snapshot.
+  # If the agent isn't installed yet, skip gracefully.
+  if [[ -x /usr/local/sbin/aads-nginx-ensure-known-good-snapshot ]]; then
+    /usr/local/sbin/aads-nginx-ensure-known-good-snapshot 2>/dev/null || true
+  fi
+}
+
+ensure_mysql() {
+  mysql_service_name() {
+    for s in mysql mariadb mysqld; do
+      svc_exists "$s" && { echo "$s"; return; }
+    done
+    echo ""
+  }
+  [[ -n "$(mysql_service_name)" ]] && return
+  log "MySQL/MariaDB not found — installing mariadb-server"
+  apt_install mariadb-server
+  systemctl enable --now mariadb
+  ok "MariaDB installed and started"
+  if [[ -x /usr/local/sbin/aads-mysql-ensure-config-snapshot ]]; then
+    /usr/local/sbin/aads-mysql-ensure-config-snapshot 2>/dev/null || true
+  fi
+}
+
+ensure_redis() {
+  redis_service_name() {
+    for s in redis redis-server redis@6379; do
+      svc_exists "$s" && { echo "$s"; return; }
+    done
+    echo ""
+  }
+  [[ -n "$(redis_service_name)" ]] && return
+  log "Redis not found — installing redis-server"
+  apt_install redis-server
+  systemctl enable --now redis-server
+  ok "Redis installed and started"
+  if [[ -x /usr/local/sbin/aads-redis-ensure-config-snapshot ]]; then
+    /usr/local/sbin/aads-redis-ensure-config-snapshot 2>/dev/null || true
+  fi
+}
+
+ensure_postgresql() {
+  pg_service_name() {
+    for s in postgresql postgresql@14-main postgresql@16-main; do
+      svc_exists "$s" && { echo "$s"; return; }
+    done
+    echo ""
+  }
+  [[ -n "$(pg_service_name)" ]] && return
+  log "PostgreSQL not found — installing postgresql"
+  apt_install postgresql
+  systemctl enable --now postgresql
+  ok "PostgreSQL installed and started"
+  if [[ -x /usr/local/sbin/aads-postgresql-ensure-config-snapshot ]]; then
+    /usr/local/sbin/aads-postgresql-ensure-config-snapshot 2>/dev/null || true
+  fi
+}
+
 # ── nginx helpers ────────────────────────────────────────────────────────────
 nginx_restore() {
   local snap=/var/lib/aads-agent/snapshots/nginx
@@ -51,6 +122,7 @@ nginx_restore() {
 }
 
 inject_nginx_bad_config() {
+  ensure_nginx
   log "nginx-bad-config: injecting broken nginx.conf"
   nginx_restore
   cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak-"${MARKER}"
@@ -65,6 +137,7 @@ inject_nginx_bad_config() {
 }
 
 inject_nginx_stopped() {
+  ensure_nginx
   log "nginx-stopped: stopping nginx"
   nginx_restore
   systemctl stop nginx
@@ -108,6 +181,7 @@ mysql_restore() {
 }
 
 inject_mysql_bad_config() {
+  ensure_mysql
   local svc conf
   svc="$(mysql_service)"; conf="$(mysql_conf_file)"
   [[ -n "$svc" ]] || { warn "MySQL/MariaDB not found — skipping"; return; }
@@ -123,6 +197,7 @@ inject_mysql_bad_config() {
 }
 
 inject_mysql_stopped() {
+  ensure_mysql
   local svc; svc="$(mysql_service)"
   [[ -n "$svc" ]] || { warn "MySQL/MariaDB not found — skipping"; return; }
   log "mysql-stopped: stopping $svc"
@@ -163,6 +238,7 @@ redis_restore() {
 }
 
 inject_redis_bad_config() {
+  ensure_redis
   local svc conf
   svc="$(redis_service)"; conf="$(redis_conf_file)"
   [[ -n "$svc" ]] || { warn "Redis not found — skipping"; return; }
@@ -178,6 +254,7 @@ inject_redis_bad_config() {
 }
 
 inject_redis_stopped() {
+  ensure_redis
   local svc; svc="$(redis_service)"
   [[ -n "$svc" ]] || { warn "Redis not found — skipping"; return; }
   log "redis-stopped: stopping $svc"
@@ -217,6 +294,7 @@ pg_restore() {
 }
 
 inject_pg_bad_config() {
+  ensure_postgresql
   local svc conf
   svc="$(pg_service)"; conf="$(pg_conf_dir)"
   [[ -n "$svc" ]] || { warn "PostgreSQL not found — skipping"; return; }
@@ -232,6 +310,7 @@ inject_pg_bad_config() {
 }
 
 inject_pg_stopped() {
+  ensure_postgresql
   local svc; svc="$(pg_service)"
   [[ -n "$svc" ]] || { warn "PostgreSQL not found — skipping"; return; }
   log "pg-stopped: stopping $svc"
@@ -243,7 +322,11 @@ inject_pg_stopped() {
 
 # ── composite ────────────────────────────────────────────────────────────────
 restore_all() {
-  log "restore-all: bringing everything back to a healthy baseline"
+  log "restore-all: ensuring all services are installed and healthy"
+  ensure_nginx
+  ensure_mysql
+  ensure_redis
+  ensure_postgresql
   nginx_restore
   mysql_restore
   redis_restore
@@ -259,7 +342,11 @@ restore_all() {
 }
 
 inject_all_stopped() {
-  log "all-stopped: stopping every detected service"
+  log "all-stopped: ensuring all services are installed, then stopping them"
+  ensure_nginx
+  ensure_mysql
+  ensure_redis
+  ensure_postgresql
   inject_nginx_stopped
   local msvc; msvc="$(mysql_service)"; [[ -n "$msvc" ]] && inject_mysql_stopped
   local rsvc; rsvc="$(redis_service)"; [[ -n "$rsvc" ]] && inject_redis_stopped
@@ -270,6 +357,8 @@ inject_all_stopped() {
 # ── interactive menu ─────────────────────────────────────────────────────────
 show_menu() {
   section "AADS Demo — Fault Injection"
+  echo "  (Services not yet installed will be auto-installed via apt before injection.)"
+  echo
   echo "  Nginx"
   echo "    1) nginx-bad-config   (corrupt config → config test fails)"
   echo "    2) nginx-stopped      (service killed)"
