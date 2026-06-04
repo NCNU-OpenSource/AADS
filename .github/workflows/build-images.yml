@@ -1,8 +1,13 @@
 name: build-images
 
 # Build & push the 6 custom AADS service images to GHCR, and publish the
-# On-Device Agent payload as a release asset. The server bootstrap
-# (dist/bootstrap-server.sh) pulls these images; targets download the payload.
+# On-Device Agent payload and server bundle as release assets.
+#
+# Release assets (tag push):
+#   aads-agent.tgz    — On-Device Agent payload (downloaded by install-agent.sh)
+#   aads-server.tgz   — Full server bundle (downloaded by install-server.sh)
+#   install-agent.sh  — agent installer (curl | bash)
+#   install-server.sh — server installer (curl | bash)
 #
 # Triggers on version tags (v*) and can be run manually (pushes :latest).
 
@@ -63,7 +68,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-  agent-payload:
+  release-assets:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -73,10 +78,15 @@ jobs:
       - name: Build agent payload
         run: bash dist/build-agent-payload.sh "$GITHUB_WORKSPACE/dist/aads-agent.tgz"
 
+      - name: Build server bundle
+        run: bash dist/build-server-bundle.sh "$GITHUB_WORKSPACE/dist/aads-server.tgz"
+
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/aads-agent.tgz
+            dist/aads-server.tgz
             dist/install-agent.sh
+            dist/install-server.sh

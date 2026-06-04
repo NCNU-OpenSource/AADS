@@ -8,15 +8,30 @@ Deploy the server first — it mints the token the agents need.
 
 ### 1. Server (run on the controller host)
 
-From a repo checkout or the server bundle:
+**HTTPS — pull directly from GitHub (no repo checkout needed):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bs10081/AADS/main/dist/install-server.sh | bash
+```
+
+Downloads `aads-server.tgz` from GitHub Releases, extracts it to `~/aads`
+(or `/opt/aads` when run as root), then runs the interactive bootstrap.
+Fully non-interactive if all vars are pre-set:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bs10081/AADS/main/dist/install-server.sh | \
+  AADS_LITELLM_UPSTREAM_API_KEY=sk-... bash
+```
+
+**From a repo checkout (local / dev):**
 
 ```bash
 bash dist/bootstrap-server.sh
 ```
 
-It interactively collects the upstream LLM API key (the only required value),
-auto-generates the remaining secrets, pulls the prebuilt images
-(`ghcr.io/bs10081/aads-*`), starts the stack, verifies the database, and prints
+Both paths interactively collect the upstream LLM API key (the only required
+value), auto-generate all other secrets, pull the prebuilt images
+(`ghcr.io/bs10081/aads-*`), start the stack, verify the database, and print
 the exact agent install command — with the token already filled in.
 
 > Private registry? Authenticate once before running:
