@@ -24,7 +24,20 @@ the exact agent install command — with the token already filled in.
 
 ### 2. On-Device Agent (run on each target)
 
-Copy-paste the command the server printed. It looks like:
+The server bootstrap prints both variants with the token already filled in.
+Pick whichever fits your network:
+
+**HTTPS (recommended — pulls from public GitHub, no server port needed):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bs10081/AADS/main/dist/install-agent.sh | sudo \
+  AADS_SERVER=<server-ip> \
+  AADS_AGENT_TOKEN=<token> \
+  AADS_ADMIN_API_KEY=<admin-key> \
+  AADS_RELEASE_BASE_URL=https://github.com/bs10081/AADS/releases/latest/download bash
+```
+
+**HTTP / air-gapped (payload served by the AADS dashboard itself):**
 
 ```bash
 curl -fsSL http://<server>:5000/install-agent.sh | sudo \
@@ -33,11 +46,9 @@ curl -fsSL http://<server>:5000/install-agent.sh | sudo \
   AADS_ADMIN_API_KEY=<admin-key> bash
 ```
 
-This installs the On-Device Agent (V2 runner), auto-registers the node with the
-server, and installs the Alloy log forwarder pointed at the server's Loki. The
-installer downloads its payload (`aads-agent.tgz`) from the server itself — no
-external/GitHub access needed. Every prompt can be pre-set via environment
-variables (see the header of `dist/install-agent.sh`).
+Both commands install the On-Device Agent (V2 runner), auto-register the node,
+and install the Alloy log forwarder. Every prompt can be pre-set via environment
+variable (see the header of `dist/install-agent.sh`).
 
 ### 3. Verify
 

@@ -151,6 +151,9 @@ else
 fi
 
 # ── Summary + agent install command ─────────────────────────────────────────
+GITHUB_RELEASE_BASE="https://github.com/bs10081/AADS/releases/latest/download"
+GITHUB_SCRIPT_URL="https://raw.githubusercontent.com/bs10081/AADS/main/dist/install-agent.sh"
+
 cat <<EOF
 
 ============================================================================
@@ -160,14 +163,20 @@ cat <<EOF
    Grafana   : http://${AADS_SERVER_IP}:3000
    Admin key : ${AADS_ADMIN_API_KEY}
 
- Install the On-Device Agent on each target (copy-paste on the target host):
+ ── Install On-Device Agent (HTTPS, public GitHub — no server dependency) ──
+
+   curl -fsSL ${GITHUB_SCRIPT_URL} | sudo \\
+     AADS_SERVER=${AADS_SERVER_IP} \\
+     AADS_AGENT_TOKEN=${PI_AGENT_TOKEN} \\
+     AADS_ADMIN_API_KEY=${AADS_ADMIN_API_KEY} \\
+     AADS_RELEASE_BASE_URL=${GITHUB_RELEASE_BASE} bash
+
+ ── Install On-Device Agent (HTTP, self-hosted — air-gapped friendly) ──────
 
    curl -fsSL http://${AADS_SERVER_IP}:5000/install-agent.sh | sudo \\
      AADS_SERVER=${AADS_SERVER_IP} \\
      AADS_AGENT_TOKEN=${PI_AGENT_TOKEN} \\
      AADS_ADMIN_API_KEY=${AADS_ADMIN_API_KEY} bash
 
- Note: AADS_DEFAULT_NODE_ID in .env is a fallback only — Alloy tags logs with
- each node's real id, so plans target the right node automatically.
 ============================================================================
 EOF
