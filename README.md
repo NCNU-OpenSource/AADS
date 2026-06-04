@@ -1,436 +1,228 @@
-# AI 自動 Debug 系統
+# AADS - AI Auto Debug System
 
-> 完整的多層 AI 驅動自動除錯系統 - 從日誌收集到根因分析再到修復建議
+AADS is a server + on-device agent system for collecting service logs,
+detecting anomalies, generating root-cause analysis, and executing approved
+repair plans through a controlled runner.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python: 3.11](https://img.shields.io/badge/Python-3.11-blue.svg)](https://python.org)
+The recommended deployment path is the release installer pair:
 
-## 🎯 快速導航
+- `install-server.sh` on the controller/server host.
+- `install-agent.sh` on every machine that should be monitored and repaired.
 
-1. [系統概述](#系統概述)
-2. [架構設計](#架構設計)
-3. [快速開始](#快速開始)
-4. [Manual Dashboard Demo](#manual-dashboard-demo)
-5. [配置說明](#配置說明)
-6. [使用指南](#使用指南)
-7. [開發文檔](#開發文檔)
+For the longer deployment guide, see [DEPLOYMENT.md](DEPLOYMENT.md).
 
----
+## Quick Start
 
-## 系統概述
+### 1. Install the Server
 
-完整的四層 AI 自動除錯系統，核心架構設計來自 BlueT (https://github.com/bluet) 的 Side Project，整合日誌收集、異常檢測、根因分析和修復建議。
-
-### 核心功能
-
-- ✅ **Layer 0**: RAW log 永久存儲（TimescaleDB）
-- ✅ **Layer 1**: 多層異常過濾（LogBERT + 預留 RF）
-- ✅ **Layer 2**: AI 根因分析（LLM + RAG）
-- ✅ **Layer 3**: 修復建議與通知（Slack）
-
-### 技術棧
-
-| 類別 | 技術 |
-|------|------|
-| 日誌收集 | Grafana Alloy, Loki |
-| 指標監控 | Prometheus, cAdvisor, DCGM Exporter |
-| 時序資料庫 | TimescaleDB |
-| AI/ML | BERT (LogBERT), OpenAI API, Ollama |
-| 向量資料庫 | ChromaDB |
-| 可視化 | Grafana |
-| 容器化 | Docker Compose |
-
----
-
-## 架構設計
-
-```
-┌───────────────────────────────────────────────────────────────┐
-│                    四層 AI Auto-Debug 架構                     │
-├───────────────────────────────────────────────────────────────┤
-│                                                               │
-│  Layer 0: 數據收集與永久存儲                                   │
-│  ├─ Docker Logs → Alloy → Loki (31天) → TimescaleDB (永久)   │
-│  └─ Prometheus (CPU/Memory/GPU Metrics)                      │
-│                                                               │
-│  Layer 1: 多層異常過濾                                        │
-│  ├─ RFFilter (預留接口)                                       │
-│  ├─ LogBERTFilter (BERT-based, 125 logs/sec GPU)            │
-│  └─ PostgreSQL (異常 log 永久保存)                           │
-│                                                               │
-│  Layer 2: 根因分析                                           │
-│  ├─ 異常聚類 (時間窗口 + 模式識別)                             │
-│  ├─ Metrics 關聯 (Prometheus PromQL)                         │
-│  ├─ 知識庫檢索 (ChromaDB + RAG)                              │
-│  └─ LLM 推理 (OpenAI API / Ollama)                          │
-│                                                               │
-│  Layer 3: 修復建議與通知                                      │
-│  ├─ 建議生成 (規則 + LLM)                                     │
-│  └─ Slack/Webhook 通知                                       │
-│                                                               │
-└───────────────────────────────────────────────────────────────┘
-```
-
-### 資料流
-
-```
-[Docker Logs] → [Alloy] → [Loki raw] → [LogBERT] → [Anomaly DB]
-                              ↓                           ↓
-                        [TimescaleDB]            [Layer 2 Analyzer]
-                         (永久保存)                     ↓
-                                               [Diagnosis Report]
-                                                      ↓
-                                            [Slack Notification]
-```
-
----
-
-## 快速開始
-
-### 前置需求
-
-- Docker 20.10+
-- Docker Compose 2.0+
-- NVIDIA GPU（可選，用於 LogBERT 加速）
-- LLM API Key（OpenAI 或第三方相容 API）
-
-### 1. 克隆專案
+Run this on the controller host. The installer downloads the release bundle,
+starts the Docker Compose stack, generates secrets, and prints the matching
+agent install command.
 
 ```bash
-git clone <repository-url>
-cd ai-auto-debug-system
+curl -fsSL https://github.com/bs10081/AADS/releases/latest/download/install-server.sh | bash
 ```
 
-### 2. 配置環境變數
+For non-interactive setup, provide the upstream LLM key:
 
 ```bash
-cp .env.example .env
+curl -fsSL https://github.com/bs10081/AADS/releases/latest/download/install-server.sh | \
+  AADS_LITELLM_UPSTREAM_API_KEY=sk-... bash
 ```
 
-編輯 `.env` 填入必要配置：
+Useful server environment variables:
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `AADS_INSTALL_DIR` | Server bundle install path | `$HOME/aads`, or `/opt/aads` as root |
+| `AADS_RELEASE_BASE_URL` | Release asset base URL | GitHub latest release |
+| `AADS_LITELLM_UPSTREAM_API_KEY` | Required upstream LLM API key | prompted |
+| `LITELLM_MODEL` | Model used through LiteLLM | `gpt-5.5` |
+| `AADS_ADMIN_API_KEY` | Dashboard/Gate admin key | generated |
+| `PI_AGENT_TOKEN` | Shared server-to-agent bearer token | generated |
+| `TIMESCALEDB_PASSWORD` | TimescaleDB password | generated |
+
+### 2. Install an On-Device Agent
+
+Run this on each target host. The server bootstrap prints a fully populated
+command; the shape is:
 
 ```bash
-# 資料庫密碼
-TIMESCALEDB_PASSWORD=your_secure_password
-
-# LLM 配置（支援自定義 baseURL）
-LLM_BASE_URL=https://api.openai.com/v1  # 或 NEW API 等第三方
-LLM_API_KEY=sk-xxxxx
-LLM_MODEL=gpt-4o-mini
-
-# Slack 通知
-SLACK_WEBHOOK_URL=https://hooks.slack.com/services/xxxxx
+curl -fsSL https://github.com/bs10081/AADS/releases/latest/download/install-agent.sh | sudo \
+  AADS_SERVER=<server-ip> \
+  AADS_AGENT_TOKEN=<token-from-server> \
+  AADS_ADMIN_API_KEY=<admin-key-from-server> \
+  AADS_RELEASE_BASE_URL=https://github.com/bs10081/AADS/releases/latest/download bash
 ```
 
-### 3. 啟動服務
+For an air-gapped or lab install, the Dashboard can serve the installer and
+payload directly:
 
 ```bash
-docker compose up -d
+curl -fsSL http://<server>:5000/install-agent.sh | sudo \
+  AADS_SERVER=<server> \
+  AADS_AGENT_TOKEN=<token-from-server> \
+  AADS_ADMIN_API_KEY=<admin-key-from-server> bash
 ```
 
-### 4. 驗證部署
+The agent installer installs the `aads-agent` systemd service, the `runner.v1`
+Command Runner, root wrapper scripts, optional Alloy log forwarding, and then
+registers the node with the server.
+
+### 3. Verify
 
 ```bash
-# 檢查服務狀態
-docker compose ps
+# Server
+docker compose -f docker-compose.prod.yaml --env-file .env ps
+curl -H "X-Admin-API-Key: <admin-key>" http://<server>:5000/api/agents
 
-# 查看 Layer 2 日誌
-docker compose logs -f layer2-analyzer
-
-# 訪問 Grafana
-open http://localhost:3000  # 預設帳密: admin/admin
+# Target
+curl -H "Authorization: Bearer <token>" http://<target>:8090/v1/node/facts
+systemctl is-active aads-agent alloy
 ```
 
----
+## Package And Version Requirements
+
+Runtime requirements:
+
+| Component | Version / source |
+| --- | --- |
+| Docker Compose | v2 |
+| Custom AADS images | `ghcr.io/bs10081/aads-*:${AADS_IMAGE_TAG:-latest}` |
+| Python service base image | `python:3.11-slim` |
+| Loki | `grafana/loki:3.6.0` |
+| TimescaleDB | `timescale/timescaledb:latest-pg16` |
+| LiteLLM | `ghcr.io/berriai/litellm:main-stable` |
+| DCGM exporter | `nvcr.io/nvidia/k8s/dcgm-exporter:3.3.8-3.6.0-ubuntu22.04` |
+
+Important Python pins:
+
+| Package | Version |
+| --- | --- |
+| FastAPI | `0.109.0` |
+| Uvicorn | `0.27.0` |
+| asyncpg | `0.29.0` |
+| aiohttp | `3.9.3` |
+| Pydantic | controller services `2.7.4`; pi-agent `>=2.12,<3` |
+| OpenAI SDK | `1.60.0` |
+| LangChain | `0.3.18` |
+| LangGraph | `0.2.60` |
+| Flask | `3.0.0` |
+| Torch | `2.1.0` |
+| Transformers | `4.35.0` |
+
+Release tags publish the server bundle, agent payload, installers, and GHCR
+images. For reproducible deployments, pin `AADS_IMAGE_TAG` to a release tag
+instead of using `latest`.
+
+## Architecture
+
+```text
+Target Host(s)                                                  Server / Controller
+────────────────────────────────────────────────────────────────────────────────────────
+
+Layer 0  Alloy tails service logs ───────────────┐              Loki + Prometheus
+         nginx / PostgreSQL / Redis / MySQL      ├────────────► log-archiver
+         syslog / journal                        │              TimescaleDB raw_logs
+                                                  │
+Layer 1                                           └────────────► layer1-filter
+                                                                 pattern filter + LogBERT
+                                                                 anomaly_logs
+
+Layer 2                                                          System Agent
+                                                                 consumes anomalies
+                                                                 queries Loki/Prometheus
+                                                                 RCA through LiteLLM/LLM
+                                                                 emits FixingPlan 3.0
+
+Layer 3                                                          Dashboard / Gate
+                                                                 admin-key approval
+                                                                 notification surface
+                                                                 plan queue
+
+Layer 4  On-Device Agent ◄────────────────────────────────────── Knowledge Agent
+         runner.v1 HTTP API                                     layer4-executor
+         argv-first Command Runner                              node locks
+         root wrappers + audit hook                             per-step execution
+```
+
+Main server ports:
+
+| Service | Port | Purpose |
+| --- | --- | --- |
+| Dashboard / Gate | `5000` | Queue, approval, execution trace, agent registration |
+| Grafana | `3000` | Observability dashboards |
+| Prometheus | `9090` | Metrics |
+| Loki | `3100` | Log query and ingestion |
+| Layer 2 Analyzer | `8080` | System Agent health/API |
+| Ingester | `8000` | Anomaly ingestion helper |
+| TimescaleDB | `5432` | Persistent raw/anomaly/diagnosis DB |
+
+## Agents And Connections
+
+AADS currently uses three agent roles plus the Dashboard Gate:
+
+| Agent | Runs on | Responsibility |
+| --- | --- | --- |
+| System Agent | Server, `layer2-analyzer` | Consumes `anomaly_logs`, clusters events, queries Loki/Prometheus, calls LiteLLM/LLM for RCA, and produces `FixingPlan 3.0`. |
+| Knowledge Agent / Executor | Server, `layer4-executor` | Polls approved/queued plans from TimescaleDB, holds node locks, executes steps in order, records audit/execution state. |
+| On-Device Agent | Target host, `aads-agent` | Exposes `runner.v1`, receives per-step runner requests, executes argv-first commands through hooks and root wrappers. |
+
+Connection model:
+
+- Target Alloy pushes logs to Server Loki.
+- Layer 1 reads Loki and writes anomalies into TimescaleDB.
+- System Agent reads anomalies and stores diagnosis reports + FixingPlans.
+- Dashboard uses `AADS_ADMIN_API_KEY` for admin actions such as approve,
+  reject, execute, and `/api/agents/register`.
+- Knowledge Agent uses `PI_AGENT_TOKEN` to call target
+  `/v1/commands/run`.
+- On-Device Agent reports `runner_capabilities.schema_version="runner.v1"`
+  from `/v1/node/facts`.
+
+The `runner.v1` model intentionally avoids a static command catalog as the
+long-term safety boundary. Runner requests carry argv, context, side-effect
+metadata, and audit-hook output; future safety cards can make contextual
+allow/deny decisions before execution.
 
 ## Manual Dashboard Demo
 
-課堂展示用的手動 Gate demo 入口：
-
-```text
-http://100.72.172.83:5000/
-```
-
-目前推薦展示單一場景：`nginx_bad_config`。這個流程會保留 Dashboard 上的
-**Approve** 與 **Execute** 給操作人員手動按，不會用 API 自動審批或執行。
-
-一鍵準備 demo、注入 Nginx 錯誤並等待 Queue 產生：
+Lab/manual demos should keep the Dashboard approval flow visible. The helper
+prepares a Nginx bad-config scenario and stops before approval/execution:
 
 ```bash
 bash scripts/lab/demo-nginx-manual-gate.sh
 ```
 
-腳本會先檢查 `.env.lab`、Dashboard Admin Key、target runner v1 能力，清掉
-Gate 上 stale 的 pending/approved item，將 Nginx 還原到 known-good baseline，
-再注入壞的 `nginx.conf`。看到輸出的 `diagnosis_id` 後，請到 Dashboard 手動按
-**Approve**，再手動按 **Execute**。
+After the Dashboard shows the restore plan, manually click **Approve** and then
+**Execute**. Prefer a plan whose runner contains
+`aads-nginx-restore-known-good` or operation `nginx.restore_config`; delayed
+logs can create stale `nginx.start` items after a previous repair.
 
-執行後驗證修復結果：
+Verify a demo run:
 
 ```bash
 bash scripts/lab/demo-nginx-manual-gate.sh --verify <DIAGNOSIS_ID>
 ```
 
-成功終態可接受 `kb_skipped`、`final_verified`、`kb_imported`。目前 lab 的
-`ENABLE_KNOWLEDGE_BASE=false`，所以 `kb_skipped` 是正常成功。若 Queue 同時出現多筆，
-請優先執行 runner 包含 `aads-nginx-restore-known-good` / `nginx.restore_config`
-的 restore plan，不要執行延遲 log 造成的 stale `nginx.start` item。
+In the current lab, `ENABLE_KNOWLEDGE_BASE=false`, so a terminal status of
+`kb_skipped` means execution reached the expected post-repair state and skipped
+only the knowledge-base import.
 
----
+## Development Notes
 
-## 配置說明
+Production-like deployment should use the release installers above. For local
+development, use the regular Compose files and deploy helpers documented in
+`docs/runbooks/bootstrap.md` and `docs/service-coverage-handoff.md`.
 
-### 環境變數
-
-| 變數 | 說明 | 預設值 |
-|------|------|--------|
-| `TIMESCALEDB_PASSWORD` | TimescaleDB 密碼 | - |
-| `LLM_BASE_URL` | LLM API baseURL（支援自定義） | `https://api.openai.com/v1` |
-| `LLM_API_KEY` | LLM API Key | - |
-| `LLM_MODEL` | LLM 模型名稱 | `gpt-4o-mini` |
-| `LLM_STRATEGY` | LLM 策略 | `cascade` |
-| `SLACK_WEBHOOK_URL` | Slack Webhook URL | - |
-| `SEVERITY_FILTER` | 通知嚴重程度過濾 | `medium` |
-| `AUTO_REMEDIATION_ENABLED` | 自動修復（安全起見預設關閉） | `false` |
-
-### LLM 策略
-
-- `cascade`: 先用 Ollama 快速分類，再用 OpenAI 深度分析
-- `primary_only`: 僅使用 OpenAI API
-- `local_only`: 僅使用 Ollama
-
-### 第三方 API 支援
-
-系統支援任何 OpenAI 相容 API，設定 `LLM_BASE_URL` 即可：
+Useful local checks:
 
 ```bash
-# NEW API
-LLM_BASE_URL=https://api.newapi.com/v1
-
-# Azure OpenAI
-LLM_BASE_URL=https://your-resource.openai.azure.com/openai/deployments/your-deployment
-
-# DeepSeek
-LLM_BASE_URL=https://api.deepseek.com/v1
+docker compose ps
+docker compose logs -f layer2-analyzer
+docker compose logs -f layer4-executor
 ```
 
----
-
-## 使用指南
-
-### 訪問 Grafana Dashboard
-
-1. 開啟瀏覽器訪問 http://localhost:3000
-2. 登入（admin/admin）
-3. 查看以下 Dashboard：
-   - **System Monitoring**: 系統資源監控
-   - **LogBERT Anomaly**: 異常日誌
-   - **Diagnosis Reports**: AI 診斷報告（新）
-
-### 查詢診斷報告
-
-連接 TimescaleDB：
-
-```bash
-docker exec -it timescaledb psql -U logdb -d logdb
-```
-
-```sql
--- 最近 10 筆診斷
-SELECT diagnosis_id, timestamp, severity, summary
-FROM diagnosis_reports
-ORDER BY timestamp DESC
-LIMIT 10;
-
--- 高嚴重程度診斷
-SELECT * FROM diagnosis_reports
-WHERE severity IN ('high', 'critical')
-ORDER BY timestamp DESC;
-```
-
-### Slack 通知範例
-
-當檢測到異常時，系統會自動發送 Slack 通知：
-
-```
-🔴 AI Debug Alert - HIGH
-
-Summary: steam-headless 容器 NVIDIA 驅動下載失敗
-
-Root Cause:
-- Category: dependency_failure
-- Confidence: 85.0%
-- Description: 無法從 GitHub 下載 NVIDIA 驅動程式
-
-Recommended Actions:
-1. 檢查 NVIDIA_DRIVER_VERSION 環境變數設定
-2. 重新啟動容器讓其重新嘗試下載
-
-Diagnosis ID: diag_cluster_0_1712345678
-```
-
----
-
-## 開發文檔
-
-### 目錄結構
-
-```
-ai-auto-debug-system/
-├── layer0-collector/       # 日誌收集
-├── layer0-storage/         # 持久化存儲
-├── layer1-filter/          # 多層過濾
-├── layer2-analyzer/        # 根因分析 + 通知
-├── layer3-remediation/     # 修復建議（參考）
-├── logbert/                # LogBERT 系統
-├── grafana/                # Grafana 配置
-└── prometheus/             # Prometheus 配置
-```
-
-### 資料庫 Schema
-
-**raw_logs** (TimescaleDB Hypertable)
-```sql
-CREATE TABLE raw_logs (
-    time TIMESTAMPTZ NOT NULL,
-    container TEXT,
-    message TEXT,
-    labels JSONB,
-    PRIMARY KEY (time, container)
-);
-```
-
-**anomaly_logs**
-```sql
-CREATE TABLE anomaly_logs (
-    id SERIAL PRIMARY KEY,
-    time TIMESTAMPTZ,
-    container TEXT,
-    raw_message TEXT,
-    template TEXT,
-    anomaly_score FLOAT,
-    filter_stage TEXT,
-    is_confirmed BOOLEAN
-);
-```
-
-**diagnosis_reports**
-```sql
-CREATE TABLE diagnosis_reports (
-    id SERIAL PRIMARY KEY,
-    diagnosis_id TEXT UNIQUE,
-    timestamp TIMESTAMPTZ,
-    severity TEXT,
-    summary TEXT,
-    root_cause JSONB,
-    recommended_actions JSONB
-);
-```
-
-### 擴展 Layer 1 Filter
-
-實作新的過濾器：
-
-```python
-# layer1-filter/src/filters/custom_filter.py
-from filters.base import BaseFilter, FilterResult
-
-class CustomFilter(BaseFilter):
-    @property
-    def filter_name(self) -> str:
-        return "custom"
-
-    def predict(self, logs: List[Dict]) -> List[FilterResult]:
-        # 實作過濾邏輯
-        pass
-```
-
-在 `filters.yaml` 中啟用：
-
-```yaml
-filters:
-  - name: custom
-    enabled: true
-    threshold: 0.5
-```
-
----
-
-## 效能指標
-
-| 指標 | 數值 |
-|------|------|
-| 端到端延遲 | < 90 秒 |
-| LogBERT 吞吐量 (GPU) | 125 logs/sec |
-| LogBERT 吞吐量 (CPU) | 14.3 logs/sec |
-| Layer 2 分析延遲 | < 40 秒 |
-| RAW log 保留 | 永久（TimescaleDB） |
-| 異常 log 保留 | 永久（PostgreSQL） |
-
----
-
-## 疑難排解
-
-### LogBERT 無法啟動（GPU）
-
-```bash
-# 檢查 NVIDIA runtime
-docker info | grep -i runtime
-
-# 檢查 GPU 可見性
-docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi
-```
-
-### TimescaleDB 連接失敗
-
-```bash
-# 檢查服務健康狀態
-docker compose ps timescaledb
-
-# 查看日誌
-docker compose logs timescaledb
-
-# 測試連接
-docker exec -it timescaledb psql -U logdb -d logdb
-```
-
-### Layer 2 無法取得 LLM 回應
-
-```bash
-# 檢查環境變數
-docker compose exec layer2-analyzer env | grep LLM
-
-# 測試 API 連接
-curl -X POST "${LLM_BASE_URL}/chat/completions" \
-  -H "Authorization: Bearer ${LLM_API_KEY}" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"test"}]}'
-```
-
----
-
-## 授權
+## License
 
 MIT License
-
----
-
-## 貢獻
-
-歡迎提交 Issue 和 Pull Request！
-
----
-
-## 參考資料
-
-- [Metoro.io](https://metoro.io) - 產品靈感來源
-- [LogBERT](https://github.com/logpai/logbert) - 異常檢測演算法
-- [TimescaleDB](https://www.timescale.com/) - 時序資料庫
-- [ChromaDB](https://www.trychroma.com/) - 向量資料庫
-- [Grafana](https://grafana.com/) - 可觀測性平台
-
----
-
-**建立時間**: 2026-04-07  
-**版本**: 1.0.0  
-**作者**: Claude Opus 4.6 + RegChien

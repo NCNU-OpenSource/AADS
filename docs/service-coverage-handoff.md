@@ -130,7 +130,51 @@ the injected failure.
 
 ---
 
-## 4. Deployment workflow
+## 4. Known issue: Nginx partial repair when service is inactive
+
+**Observed**: 2026-06-04 during the manual Nginx demo.
+
+The current `nginx.restore_config` operation can restore a valid
+`/etc/nginx/nginx.conf` while still reporting execution failure if Nginx is
+already inactive. The wrapper `aads-nginx-restore-known-good` validates the
+restored config, then calls `systemctl reload nginx`. When the unit is inactive,
+systemd returns:
+
+```text
+nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+nginx: configuration file /etc/nginx/nginx.conf test is successful
+nginx.service is not active, cannot reload.
+```
+
+In the observed run, the wrapper returned `44`. The target then had a mixed
+state:
+
+```text
+sudo nginx -t                  -> success
+systemctl is-active nginx      -> inactive
+curl http://127.0.0.1/         -> 000
+```
+
+This is a design issue in the repair contract, not only a one-line wrapper
+failure. `restore_config` does not fully represent the desired final state:
+config valid, service active, and HTTP reachable. Short-term workaround:
+execute a follow-up `nginx.start` plan or run `sudo systemctl start nginx` on
+the target after config restore succeeds.
+
+Long-term fix options:
+
+- Make the Nginx restore wrapper state-aware: restore config, run `nginx -t`,
+  then `reload` if active or `start` if inactive.
+- Or make FixingPlan generation state-transition based: for config incidents,
+  emit `restore_config -> start/reload -> config_test -> http_check` instead of
+  treating restore as a complete single-step repair.
+- Update verification so a repair is not considered complete unless the final
+  target state matches the service contract, not merely the per-step command
+  outcome.
+
+---
+
+## 5. Deployment workflow
 
 The VMs run deployed copies, so code changes must be deployed before E2E runs.
 Use the new deploy helpers instead of repeating manual transfer steps.
@@ -157,7 +201,7 @@ is present.
 
 ---
 
-## 5. Test commands
+## 6. Test commands
 
 Full suite:
 
@@ -197,7 +241,7 @@ uv run --with pytest --with asyncpg python -m pytest \
 
 ---
 
-## 6. Fixes completed after the original handoff
+## 7. Fixes completed after the original handoff
 
 ### Deployment automation
 
@@ -274,7 +318,7 @@ SR-RD-02 PASS terminal=kb_skipped, redis=active
 
 ---
 
-## 7. Remaining work
+## 8. Remaining work
 
 1. Install Docker on `aads-target` and create the allowed `aads-test-nginx`
    container so `SR-DC-01` and `SR-DC-02` can run.
@@ -291,10 +335,13 @@ SR-RD-02 PASS terminal=kb_skipped, redis=active
    inside the analyzer container today, so common host commands like
    `journalctl`, `ps`, `ss`, `docker`, and `curl` may be unavailable. Prefer
    target-side runner probes (argv + extractor) for deterministic evidence.
+7. Fix Nginx config repair as a complete state transition. The current
+   `restore_config` operation can leave Nginx inactive after config repair if
+   the wrapper tries to reload an inactive unit.
 
 ---
 
-## 8. Useful debug commands
+## 9. Useful debug commands
 
 Gate-only reset for manual demos:
 
