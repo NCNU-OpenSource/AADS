@@ -123,13 +123,29 @@ log "Building agent payload for self-serve install"
 bash "$ROOT/dist/build-agent-payload.sh" "$ROOT/dist/aads-agent.tgz"
 ok "dist/aads-agent.tgz ready (served at http://${AADS_SERVER_IP}:5000/aads-agent.tgz)"
 
-# ── Pull images + start (fallback to local build if GHCR is private) ────────
+# ── Pull images + start (retry on network errors; fallback to build if private) ──
 PULL_ERR="$(mktemp)"
 cleanup_pull() { rm -f "$PULL_ERR"; }
 trap cleanup_pull EXIT
 
+PULL_OK=false
+MAX_PULL_ATTEMPTS=5
 log "Pulling service images ($AADS_IMAGE_REGISTRY :$AADS_IMAGE_TAG)"
-if $DOCKER compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" pull 2>"$PULL_ERR"; then
+for attempt in $(seq 1 "$MAX_PULL_ATTEMPTS"); do
+  if $DOCKER compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" pull 2>"$PULL_ERR"; then
+    PULL_OK=true
+    break
+  fi
+  # Auth errors won't be fixed by retrying — break immediately.
+  if grep -qi "unauthorized\|denied\|authentication required" "$PULL_ERR"; then
+    break
+  fi
+  warn "Pull attempt $attempt/$MAX_PULL_ATTEMPTS failed (network error) — retrying in 5s"
+  warn "$(tail -1 "$PULL_ERR")"
+  sleep 5
+done
+
+if $PULL_OK; then
   log "Starting the stack"
   $DOCKER compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
   ok "Containers started"
