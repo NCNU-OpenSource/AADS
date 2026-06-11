@@ -45,6 +45,12 @@ python3 -m venv /opt/aads-agent/venv
 /opt/aads-agent/venv/bin/pip install -r "$SRC_DIR/requirements.txt"
 install -o root -g root -m 0644 "$SRC_DIR/src/main.py" /opt/aads-agent/main.py
 
+# Safety cards package (PolicyCard enforces the plan's ExecutionProfile).
+install -d -o root -g root -m 0755 /opt/aads-agent/safety_cards
+for card in "$SRC_DIR"/src/safety_cards/*.py; do
+  install -o root -g root -m 0644 "$card" "/opt/aads-agent/safety_cards/$(basename "$card")"
+done
+
 # V2: install the single root runner wrapper plus every service wrapper. The
 # wrappers are now invoked as plain argv (by the root runner or directly), not as
 # catalog entries. sudoers authorizes ONLY the root runner.

@@ -132,13 +132,21 @@ snapshot / rollback / verification。直接拿掉而不補對應欄位，會打�
 
 ## 6. 安全 trade-off（顯式記錄）
 
+> **Status 2026-06-11：此 trade-off 已關閉。** PolicyCard（ADR-005）、drift 偵測（ADR-006）、log injection 防護（ADR-007）已全部實作並測試。原先遺留的安全缺口詳列如下；各項解法見對應 ADR。
+
 V1→V2 是一次**OS 層防線的刻意降級**：
 
 - **舊**：sudoers 授權 23 個 **exact wrapper 路徑、不帶參數**。agent 被攻陷也只能跑這 23 個。
 - **新**：sudoers 只授權單一 `aads-root-command-runner`，wrapper 本身 full-power（任意 argv as root）。
-  OS 層不再約束 argv；防線改由 **app 層 hook + audit** 承接，safety card 上線後才恢復 deny 能力。
-- v1 的 `AuditHook` 是 **allow-all**：等於「LLM 產生的任意 argv 以 root 執行、只記錄不阻擋」。
-  在 **test lab** 可接受；正式環境前必須補 safety card（deny 規則）。
+  OS 層不再約束 argv；防線由 **app 層 hook + audit** 承接。
+
+原本的三個遺留缺口及現狀：
+
+| 缺口 | 原狀（V2 初版） | 現狀（feature/execution-hardening） |
+|---|---|---|
+| **執行範圍無界** | `AuditHook` allow-all；LLM 幻覺 argv 直接以 root 執行 | `PolicyCard` fail-closed；`ExecutionProfile` 隨 plan 審核、逐 request 強制，見 [ADR-005](ADR/ADR-005-execution-profile-and-policy-card.md) |
+| **Drift 無法通知人工** | 失敗只有終態 abort/rollback；無 pause→通知→resume 路徑 | `paused_for_review` 狀態 + `execution_escalations` + dashboard Resume/Abort UI，見 [ADR-006](ADR/ADR-006-drift-detection-pause-escalate.md) |
+| **Log 污染 prompt injection** | 原始 log 直接進 LLM；唯一防線是 prompt 文字 | `log_guard` 外部 regex 偵測 + data fence + taint 強制人工審查，見 [ADR-007](ADR/ADR-007-log-injection-defense.md) |
 
 ## 7. Tests
 

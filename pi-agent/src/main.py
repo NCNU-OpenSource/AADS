@@ -25,6 +25,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -32,7 +33,15 @@ from typing import Any, Dict, List, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-AGENT_VERSION = "2.0.0"
+try:
+    from safety_cards import ExecutionProfile, HookDecision, PolicyCard
+    from safety_cards import policy_card as _policy_card_module
+except ImportError:  # loaded as a bare file (tests / single-file layouts)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from safety_cards import ExecutionProfile, HookDecision, PolicyCard
+    from safety_cards import policy_card as _policy_card_module
+
+AGENT_VERSION = "2.1.0"
 RUNNER_SCHEMA = "runner.v1"
 NODE_ID_PATH = Path(os.getenv("AADS_NODE_ID_PATH", "/etc/aads-agent/node-id"))
 ENVIRONMENT = os.getenv("AADS_AGENT_ENVIRONMENT", "test")
@@ -69,6 +78,9 @@ class CommandRunRequest(BaseModel):
     runner: RunnerSpec
     context: CommandContext = Field(default_factory=CommandContext)
     idempotency: Dict[str, Any] = Field(default_factory=dict)
+    # ExecutionProfile permission manifest (ADR-005): generated at plan time,
+    # human-approved with the plan, enforced by the PolicyCard per request.
+    execution_profile: Optional[ExecutionProfile] = None
 
 
 class AgentTaskRequest(BaseModel):
@@ -79,19 +91,14 @@ class AgentTaskRequest(BaseModel):
 
 
 # ── Hook pipeline ─────────────────────────────────────────────
-class HookDecision(BaseModel):
-    decision: str  # allow | deny | warn
-    card_id: str
-    reason: str = ""
-    annotations: Dict[str, Any] = Field(default_factory=dict)
+# HookDecision lives in safety_cards.policy_card (shared hook contract).
 
 
 class AuditHook:
     """
-    v1 built-in hook: always allow, fully audit. No safety card is consulted yet,
-    so every runner spec is permitted; the decision + context + argv hash are
-    surfaced so Layer 4 can write the audit trail. Future safety cards may return
-    ``deny`` to block execution.
+    Built-in audit hook: always allow, fully audit. Runs LAST in the pipeline,
+    after the PolicyCard has had the chance to deny; the decision + context +
+    argv hash are surfaced so Layer 4 can write the audit trail.
     """
 
     card_id = "audit.allow_all.v1"
@@ -115,7 +122,8 @@ class AuditHook:
         return HookDecision(decision="allow", card_id=self.card_id, reason=f"error audit: {error}")
 
 
-HOOKS: List[AuditHook] = [AuditHook()]
+# PolicyCard first (can deny), AuditHook last (always allows, always audits).
+HOOKS: List[Any] = [PolicyCard(), AuditHook()]
 
 
 def argv_sha256(argv: List[str]) -> str:
@@ -211,7 +219,8 @@ async def facts(_: None = Depends(require_auth)):
             "schema_version": RUNNER_SCHEMA,
             "modes": ["argv"],
             "supports_as_root": True,
-            "hook_default": "allow_audit",
+            "hook_default": "policy_card+audit",
+            "policy_mode": _policy_card_module.POLICY_MODE,
         },
     }
 
@@ -228,9 +237,10 @@ async def run_command(req: CommandRunRequest, _: None = Depends(require_auth)):
     failures (401) and a hook ``deny`` are the only non-execution outcomes.
     """
     sha = argv_sha256(req.runner.argv)
-    decision: Optional[HookDecision] = None
+    decisions: List[HookDecision] = []
     for hook in HOOKS:
         decision = hook.before_run(req, sha)
+        decisions.append(decision)
         if decision.decision == "deny":
             return {
                 "status": "blocked",
@@ -248,9 +258,13 @@ async def run_command(req: CommandRunRequest, _: None = Depends(require_auth)):
     for hook in HOOKS:
         hook.after_run(req, result)
 
+    # Surface the most significant verdict (warn beats allow) so an audit-mode
+    # policy violation stays visible in the response and the Layer 4 audit trail.
+    surfaced = next((d for d in decisions if d.decision == "warn"), decisions[-1] if decisions else None)
+
     return {
         **result,
-        "hook": _hook_payload(decision, req, sha),
+        "hook": _hook_payload(surfaced, req, sha),
         "context": req.context.model_dump(),
         "retryable": result["status"] != "success",
     }

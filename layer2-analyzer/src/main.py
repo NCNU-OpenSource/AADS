@@ -53,6 +53,7 @@ from schemas.action_plan import (
     StepCommand,
     VerificationSpec,
 )
+import log_guard
 import runner_catalog
 
 logging.basicConfig(
@@ -271,13 +272,30 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
 
         try:
             # Run Agent analysis and validate before storing any plan JSON.
+            # log_guard taints the investigation if any tool output carried
+            # injection-shaped content (ADR-007) — checked after planning.
+            log_guard.start_investigation()
             action_plan: ClaudeStylePlan = await run_agent_analysis(initial_prompt)
+            injection_findings = log_guard.collect()
             action_plan = ClaudeStylePlan.model_validate(action_plan.model_dump())
             action_plan = self._apply_environment_policy(action_plan, cluster)
             action_plan = self._ensure_lab_node_agent_steps(action_plan, cluster)
             diagnosis_id = f"diag_{cluster.cluster_id}_{int(datetime.now().timestamp())}"
             rca_report = self._build_root_cause_report(action_plan, cluster, diagnosis_id)
             fixing_plan = self._to_fixing_plan(action_plan, cluster, diagnosis_id, rca_report)
+
+            if injection_findings:
+                # A tainted investigation can never auto-execute: the human
+                # reviews the findings in the Gate console first.
+                logger.warning(
+                    "Injection-shaped content in tool outputs (%d findings) — forcing human review for %s",
+                    len(injection_findings), diagnosis_id,
+                )
+                fixing_plan.environment_policy.update({
+                    'auto_execute_allowed': False,
+                    'requires_approval': True,
+                    'security_review_required': True,
+                })
 
             logger.info(
                 f"Agent analysis complete: goal={action_plan.goal[:100]}..., "
@@ -296,7 +314,8 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
                 'root_cause': {
                     'description': rca_report.root_cause,
                     'confidence': rca_report.confidence,
-                    'report': rca_report.model_dump()
+                    'report': rca_report.model_dump(),
+                    'injection_findings': injection_findings,
                 },
                 'action_plan': fixing_plan.model_dump(by_alias=True),
                 'affected_services': [
@@ -549,17 +568,8 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
         v1 lab deterministic enough for CI/E2E while preserving the generated
         diagnosis context. Covers: nginx, postgresql, redis, mysql/mariadb.
         """
+        ctx = self._cluster_context_text(cluster)
         messages = " ".join(str(a.get("raw_message", "")) for a in cluster.anomalies).lower()
-        # Also check cluster metadata: containers, services, and individual anomaly labels
-        # so service detection works even when log lines don't name the service explicitly
-        # (e.g. PostgreSQL logs say "database system is shut down", not "postgresql").
-        containers = " ".join(str(c) for c in (getattr(cluster, "containers", None) or [])).lower()
-        services   = " ".join(str(s) for s in (getattr(cluster, "services", None) or [])).lower()
-        labels     = " ".join(
-            str(a.get("service", "")) + " " + str(a.get("container", "")) + " " + str(a.get("job", ""))
-            for a in cluster.anomalies
-        ).lower()
-        ctx = " ".join([messages, containers, services, labels])
 
         # Detect which service is affected
         is_nginx = "nginx" in ctx
@@ -796,6 +806,46 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
     def _stable_values(values) -> List[str]:
         return sorted(str(value) for value in (values or []) if value is not None)
 
+    @staticmethod
+    def _cluster_context_text(cluster) -> str:
+        """Lowercased text of everything the cluster observed (logs + labels)."""
+        messages = " ".join(str(a.get("raw_message", "")) for a in cluster.anomalies).lower()
+        # Also check cluster metadata: containers, services, and individual anomaly labels
+        # so service detection works even when log lines don't name the service explicitly
+        # (e.g. PostgreSQL logs say "database system is shut down", not "postgresql").
+        containers = " ".join(str(c) for c in (getattr(cluster, "containers", None) or [])).lower()
+        services   = " ".join(str(s) for s in (getattr(cluster, "services", None) or [])).lower()
+        labels     = " ".join(
+            str(a.get("service", "")) + " " + str(a.get("container", "")) + " " + str(a.get("job", ""))
+            for a in cluster.anomalies
+        ).lower()
+        return " ".join([messages, containers, services, labels])
+
+    # Aliases that count as evidence a service was actually observed in the
+    # cluster (mirrors the detection logic in _ensure_lab_node_agent_steps).
+    _SERVICE_EVIDENCE_ALIASES = {
+        "nginx": ("nginx",),
+        "postgresql": ("postgresql", "postgres", " pg ", "pg_ctl"),
+        "redis": ("redis",),
+        "mysql": ("mysql", "mariadb", "mysqld", "mariadbd"),
+    }
+
+    def _assert_plan_matches_evidence(self, repair_services: List[str], cluster) -> None:
+        """
+        Deterministic plan-vs-evidence consistency check (ADR-007).
+
+        A repair step targeting a service never observed in the cluster is a
+        drift signal — e.g. a prompt-injected log luring the planner into
+        touching an unrelated service — and blocks plan storage outright.
+        """
+        ctx = self._cluster_context_text(cluster)
+        for service in set(repair_services):
+            aliases = self._SERVICE_EVIDENCE_ALIASES.get(service, (service.lower(),))
+            if not any(alias in ctx for alias in aliases):
+                raise ValueError(
+                    f"plan targets service '{service}' but the cluster evidence never mentions it"
+                )
+
     def _extract_node_agent_command_ids(self, action_plan: ClaudeStylePlan) -> List[str]:
         """Service.operation labels of node_agent commands (replaces command_id)."""
         labels: List[str] = []
@@ -822,7 +872,7 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
         diagnosis_id: str,
         rca_report: RootCauseReport,
     ) -> FixingPlan:
-        """Convert the display plan into the executable FixingPlan 3.0 contract."""
+        """Convert the display plan into the executable FixingPlan 3.1 contract."""
         environment_policy = {
             "environment": self.default_node_environment,
             "auto_execute_allowed": self.default_node_environment == "test" and not self.force_gate_approval,
@@ -857,6 +907,7 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
             )
 
         repair_services = [cmd.target for cmd in executable_commands]
+        self._assert_plan_matches_evidence(repair_services, cluster)
         primary = runner_catalog.primary_service(repair_services)
 
         # Final verification, snapshot and rollback must all match the service
@@ -866,6 +917,15 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
         snapshot_runner, snapshot_scope = runner_catalog.snapshot_for(primary)
         rollback_runner = runner_catalog.rollback_for(primary)
 
+        profile_runners = [step.runner for step in fixing_steps]
+        profile_runners += [step.verification.runner for step in fixing_steps]
+        profile_runners.append(final_verification.runner)
+        profile_runners.append(snapshot_runner)
+        if rollback_runner is not None:
+            profile_runners.append(rollback_runner)
+        profile_services = sorted({primary, *repair_services})
+        execution_profile = runner_catalog.execution_profile_for(profile_runners, profile_services)
+
         return FixingPlan(
             plan_id=diagnosis_id,
             rca_report_id=rca_report.report_id,
@@ -873,6 +933,7 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
             goal=action_plan.goal,
             risk_level="low",
             environment_policy=environment_policy,
+            execution_profile=execution_profile,
             pre_execution_snapshot=PreExecutionSnapshot(
                 enabled=True,
                 runner=snapshot_runner,
@@ -886,11 +947,13 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
                 passed=True,
                 rationale="FixingPlan uses argv runner specs with declarative structured verification.",
                 checked_items=[
-                    "schema_version=3.0",
+                    "schema_version=3.1",
                     "ordered steps",
                     "runner specs with side_effect",
                     "extractor-based verification",
                     "environment policy injected",
+                    "execution_profile covers all plan runners",
+                    "plan services observed in cluster evidence",
                 ],
             ),
         )
@@ -976,6 +1039,8 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
             schema_version = plan_dict.get('schema_version', '1.0') if plan_dict else '1.0'
             plan_status = 'queued' if self._plan_auto_allowed(plan_dict) else 'pending_approval'
 
+            injection_findings = (diagnosis.get('root_cause') or {}).get('injection_findings') or []
+
             async with conn.transaction():
                 await conn.execute(
                     """
@@ -997,6 +1062,19 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
                     schema_version,
                     plan_status
                 )
+                if injection_findings:
+                    await conn.execute(
+                        """
+                        INSERT INTO audit_events
+                        (actor, event_type, plan_id, schema_version,
+                         policy_decision, retry_count, result, metadata)
+                        VALUES ('layer2-analyzer', 'security.injection_suspected', $1, $2,
+                                'flagged', 0, 'pending_approval', $3)
+                        """,
+                        diagnosis['diagnosis_id'],
+                        schema_version,
+                        json.dumps({'findings': injection_findings}, default=json_serial),
+                    )
                 if plan_status == 'queued':
                     await self._queue_auto_execution(conn, diagnosis['diagnosis_id'], plan_dict, schema_version)
 
@@ -1019,13 +1097,14 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
     def _plan_auto_allowed(self, plan: Dict[str, Any]) -> bool:
         if not plan:
             return False
-        if plan.get('schema_version') == '2.0':
+        if plan.get('schema_version') in ('2.0', '3.0', '3.1'):
             policy = plan.get('environment_policy') or {}
             return (
                 plan.get('risk_level') == 'low'
                 and bool(plan.get('steps'))
                 and policy.get('environment') == 'test'
                 and policy.get('auto_execute_allowed') is True
+                and not policy.get('security_review_required')
             )
 
         # Backward compatibility for non-executable display plans.
@@ -1043,7 +1122,7 @@ Time range: {summary['time_range']['start']} to {summary['time_range']['end']}
         return False
 
     def _first_plan_target_node(self, plan: Dict[str, Any]) -> str | None:
-        if plan.get('schema_version') == '2.0':
+        if plan.get('schema_version') in ('2.0', '3.0', '3.1'):
             return plan.get('target_node_id')
         for step in plan.get('execution_steps', []):
             for command in step.get('commands') or []:

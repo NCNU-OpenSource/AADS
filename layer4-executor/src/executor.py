@@ -1,11 +1,19 @@
 """
 Knowledge Agent executor.
 
-Consumes queued FixingPlan 3.0 executions, validates Gate/policy, calls the
+Consumes queued FixingPlan 3.0/3.1 executions, validates Gate/policy, calls the
 On-Device Agent runner API (``POST /v1/commands/run``) one step at a time,
 verifies each step by running a read-only runner and extracting structured
 fields, and records append-only audit events. This process is deterministic and
 intentionally imports no LLM client.
+
+Drift detection (ADR-006): the executor binds execution to the human approval
+via a canonical plan hash (``plan_approvals.plan_sha256``) and routes
+post-mutation failures to a non-terminal ``paused_for_review`` state with an
+``execution_escalations`` row + optional webhook, instead of silently dying.
+A human resolves the escalation in the Gate console (Re-approve & Resume /
+Abort / Rediagnose). Future dynamic plan adjustment must flow through the same
+seam: an adjusted plan hashes differently, forcing pause -> re-approval.
 
 Removal note (legacy): this previously consumed FixingPlan 2.0 ``command_id``
 steps and looked up catalog metadata (``scope`` / ``idempotent`` /
@@ -15,6 +23,7 @@ locking, ``step.idempotency`` drives retry, ``verification.extract`` drives
 structured verification, and ``plan.rollback.runner`` drives rollback.
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -26,13 +35,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 import asyncpg
 
+from notify import post_escalation_webhook
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("knowledge-agent")
 
-SUPPORTED_PLAN_SCHEMA = "3.0"
+SUPPORTED_PLAN_SCHEMA = "3.1"
+SUPPORTED_PLAN_SCHEMAS = {"3.0", "3.1"}
 POLL_INTERVAL = int(os.getenv("EXECUTOR_POLL_INTERVAL", "5"))
 DEFAULT_LOCK_TTL_SECONDS = int(os.getenv("NODE_LOCK_TTL_SECONDS", "120"))
 ON_DEVICE_AGENT_TOKEN = os.getenv("PI_AGENT_TOKEN", os.getenv("AADS_AGENT_TOKEN", ""))
@@ -172,6 +184,26 @@ class Executor:
                 await self.finish_execution(conn, execution_id, "blocked", {"reason": "approval_required_or_expired"})
                 return
 
+            # Drift signal 0 (ADR-006): the stored plan must still hash to what
+            # the human approved. Catches TOCTOU edits of action_plan and is the
+            # designed seam for future dynamic adjustment (adjusted plan -> new
+            # hash -> pause -> re-approve -> resume).
+            approved_hash = await self.approval_plan_hash(conn, plan_id)
+
+        if approved_hash:
+            current_hash = self.plan_sha256(plan)
+            if current_hash != approved_hash:
+                await self.pause_execution(
+                    execution_id,
+                    plan_id,
+                    target_node_id,
+                    "approved_plan_hash_mismatch",
+                    {"approved_sha256": approved_hash, "current_sha256": current_hash},
+                    idempotency_key,
+                    schema_version,
+                )
+                return
+
         node = await self.load_node(plan_id, target_node_id, idempotency_key)
         if not node:
             async with self.pool.acquire() as conn:
@@ -191,14 +223,25 @@ class Executor:
             snapshot_status, snapshot_result = await self.ensure_snapshot(execution_id, plan_id, idempotency_key, schema_version, plan, node)
             final_result["pre_execution_snapshot"] = snapshot_result
             if snapshot_status != "step_verified":
+                if snapshot_result.get("reason") == "hook_denied":
+                    # PolicyCard denied the snapshot command of an approved plan.
+                    await self.pause_execution(execution_id, plan_id, target_node_id, "policy_violation", {"phase": "snapshot", **final_result}, idempotency_key, schema_version)
+                    return
                 async with self.pool.acquire() as conn:
                     await self.finish_execution(conn, execution_id, "blocked", {"reason": "snapshot_failed", **final_result})
                 return
 
         resume_index = await self.recovery_start_index(execution_id, plan, node, idempotency_key)
         if resume_index == -1:
-            async with self.pool.acquire() as conn:
-                await self.finish_execution(conn, execution_id, "execution_failed_unknown_state", {"reason": "running_step_not_recoverable"})
+            await self.pause_execution(
+                execution_id,
+                plan_id,
+                target_node_id,
+                "unrecoverable_step_state",
+                {"reason": "running_step_not_recoverable"},
+                idempotency_key,
+                schema_version,
+            )
             return
 
         for step in plan["steps"][resume_index:]:
@@ -213,11 +256,26 @@ class Executor:
             )
             final_result["steps"].append({"step_id": step["step_id"], "status": step_status, "result": step_result})
             if step_status != "step_verified":
+                # Auto-rollback first (it is part of the approved plan), then
+                # route via the drift matrix: mid-flight disagreement pauses for
+                # a human; pure contention stays terminal blocked (ADR-006).
                 if step_status == "step_failed_aborted" and (plan.get("rollback") or {}).get("enabled", False):
                     rollback_status, rollback_result = await self.rollback(execution_id, plan_id, idempotency_key, schema_version, plan, node)
                     final_result["rollback"] = {"status": rollback_status, "result": rollback_result}
+                action, drift_type = self.classify_step_failure(step_status, step_result)
+                if action == "pause":
+                    await self.pause_execution(
+                        execution_id,
+                        plan_id,
+                        target_node_id,
+                        drift_type,
+                        {"step_id": step["step_id"], **final_result},
+                        idempotency_key,
+                        schema_version,
+                    )
+                    return
                 async with self.pool.acquire() as conn:
-                    terminal = "blocked" if step_status == "step_failed_blocked" else "execution_failed"
+                    terminal = "blocked" if action == "terminal_blocked" else "execution_failed"
                     await self.finish_execution(conn, execution_id, terminal, final_result)
                 return
 
@@ -226,11 +284,18 @@ class Executor:
             await conn.execute("UPDATE diagnosis_reports SET plan_status = 'final_verifying' WHERE diagnosis_id = $1", plan_id)
             await self.audit(conn, "execution.final_verifying", plan_id, None, target_node_id, schema_version, "allowed", idempotency_key, 0, "final_verifying", {})
 
-        final_status, final_payload = await self.run_verification(plan["final_verification"], plan_id, None, idempotency_key, schema_version, node, event_prefix="final_verification", execution_id=None)
+        final_status, final_payload = await self.run_verification(plan["final_verification"], plan_id, None, idempotency_key, schema_version, node, event_prefix="final_verification", execution_id=None, execution_profile=plan.get("execution_profile"))
         final_result["final_verification"] = final_payload
         if final_status != "step_verified":
-            async with self.pool.acquire() as conn:
-                await self.finish_execution(conn, execution_id, "execution_failed", final_result)
+            await self.pause_execution(
+                execution_id,
+                plan_id,
+                target_node_id,
+                "final_verification_failed",
+                final_result,
+                idempotency_key,
+                schema_version,
+            )
             return
 
         async with self.pool.acquire() as conn:
@@ -262,6 +327,7 @@ class Executor:
             step.get("context") or {},
             step.get("idempotency") or {},
             execution_id,
+            execution_profile=plan.get("execution_profile"),
         )
         if status == "blocked":
             async with self.pool.acquire() as conn:
@@ -281,6 +347,7 @@ class Executor:
             node,
             event_prefix="step_verification",
             execution_id=execution_id,
+            execution_profile=plan.get("execution_profile"),
         )
         result = {"command": command_result, "verification": verification_result}
         if verification_status == "step_verified":
@@ -314,6 +381,7 @@ class Executor:
         context: Dict[str, Any],
         idempotency: Dict[str, Any],
         execution_id: str,
+        execution_profile: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Execute one runner spec via the agent's ``/v1/commands/run``.
@@ -322,7 +390,9 @@ class Executor:
         ``as_root``. Retry count comes from ``idempotency``, not catalog metadata.
         The agent returns HTTP 200 with a structured body even when the command
         exits non-zero, so the body (returncode/stdout/stderr) is always returned
-        to the caller for extraction/verification.
+        to the caller for extraction/verification. The plan's execution_profile
+        rides along on every request so the On-Device PolicyCard can enforce the
+        approved command/path scope (ADR-005).
         """
         base_url = node["base_url"].rstrip("/")
         node_id = node["node_id"]
@@ -340,6 +410,8 @@ class Executor:
                     return "blocked", {"reason": "node_locked", "retry_count": 0}
 
         body = {"schema_version": "runner.v1", "runner": runner, "context": context, "idempotency": idempotency}
+        if execution_profile:
+            body["execution_profile"] = execution_profile
         try:
             last_payload: Dict[str, Any] = {}
             for attempt in range(1, attempts + 1):
@@ -390,6 +462,7 @@ class Executor:
         node,
         event_prefix: str,
         execution_id: Optional[str],
+        execution_profile: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         runner = verification.get("runner") or {}
         if not runner.get("argv"):
@@ -414,6 +487,7 @@ class Executor:
             verification.get("context") or {"purpose": "verify", **{k: v for k, v in (verification.get("context") or {}).items()}},
             {"mode": "idempotent", "max_attempts": 1},
             execution_id or f"verify_{plan_id}_{step_id or 0}",
+            execution_profile=execution_profile,
         )
         if status == "blocked":
             await self.audit_event(plan_id, step_id, node["node_id"], schema_version, f"{event_prefix}.blocked", idempotency_key, payload.get("retry_count", 0), "blocked", payload)
@@ -505,7 +579,7 @@ class Executor:
         label = f"{(spec.get('scope') or 'snapshot')}.ensure_snapshot"
         if not runner.get("argv"):
             return "step_failed_blocked", {"reason": "snapshot_runner_invalid"}
-        status, result = await self.run_runner_command(plan_id, 0, idempotency_key, schema_version, node, runner, {"purpose": "snapshot", "operation": "ensure_snapshot"}, spec.get("idempotency") or {"mode": "idempotent", "max_attempts": 2}, execution_id)
+        status, result = await self.run_runner_command(plan_id, 0, idempotency_key, schema_version, node, runner, {"purpose": "snapshot", "operation": "ensure_snapshot"}, spec.get("idempotency") or {"mode": "idempotent", "max_attempts": 2}, execution_id, execution_profile=plan.get("execution_profile"))
         if status == "success":
             async with self.pool.acquire() as conn:
                 await self.upsert_step(conn, execution_id, 0, "step_verified", label, node["node_id"], idempotency_key, result.get("retry_count", 0), result)
@@ -523,7 +597,7 @@ class Executor:
         if not spec.get("enabled") or not runner.get("argv"):
             return "rollback_skipped", {"reason": "rollback_runner_not_configured"}
         await self.audit_event(plan_id, None, node["node_id"], schema_version, "rollback.running", idempotency_key, 0, "rollback_running", {})
-        status, result = await self.run_runner_command(plan_id, None, idempotency_key, schema_version, node, runner, {"purpose": "rollback", "operation": "restore_config"}, {"mode": "idempotent", "max_attempts": 1}, execution_id)
+        status, result = await self.run_runner_command(plan_id, None, idempotency_key, schema_version, node, runner, {"purpose": "rollback", "operation": "restore_config"}, {"mode": "idempotent", "max_attempts": 1}, execution_id, execution_profile=plan.get("execution_profile"))
         rollback_status = "rollback_completed" if status == "success" else "rollback_failed"
         await self.audit_event(plan_id, None, node["node_id"], schema_version, f"rollback.{rollback_status}", idempotency_key, result.get("retry_count", 0), rollback_status, result)
         return rollback_status, result
@@ -547,7 +621,7 @@ class Executor:
             if row["status"] == "step_verified":
                 continue
             if row["status"] == "step_running":
-                verification_status, _ = await self.run_verification(step["verification"], plan["plan_id"], step["step_id"], idempotency_key, plan["schema_version"], node, "recovery_verification", execution_id=execution_id)
+                verification_status, _ = await self.run_verification(step["verification"], plan["plan_id"], step["step_id"], idempotency_key, plan["schema_version"], node, "recovery_verification", execution_id=execution_id, execution_profile=plan.get("execution_profile"))
                 if verification_status == "step_verified":
                     async with self.pool.acquire() as conn:
                         await self.upsert_step(conn, execution_id, step["step_id"], "step_verified", self.step_label(step), node["node_id"], idempotency_key, row["retry_count"], {"recovered": True})
@@ -556,6 +630,12 @@ class Executor:
                 if idempotency.get("mode") == "idempotent" and row["retry_count"] < self.max_attempts(idempotency) - 1:
                     return index
                 return -1
+            if row["status"] in ("step_failed_aborted", "step_failed_blocked"):
+                # Human resume path (ADR-006): a paused execution re-queued by
+                # the Gate console retries from the failed step; verified steps
+                # stay skipped. Only the resume endpoint can re-queue, so this
+                # never auto-retries a failure.
+                return index
             return -1
         return len(plan["steps"])
 
@@ -574,8 +654,12 @@ class Executor:
         return node
 
     def validate_plan(self, plan: Dict[str, Any], schema_version: str) -> Optional[str]:
-        if schema_version != SUPPORTED_PLAN_SCHEMA or plan.get("schema_version") != SUPPORTED_PLAN_SCHEMA:
+        if schema_version not in SUPPORTED_PLAN_SCHEMAS or plan.get("schema_version") not in SUPPORTED_PLAN_SCHEMAS:
             return "unsupported_schema"
+        if plan.get("schema_version") == "3.1":
+            profile = plan.get("execution_profile") or {}
+            if not profile.get("allowed_commands"):
+                return "missing_execution_profile"
         required = ["plan_id", "rca_report_id", "target_node_id", "goal", "risk_level", "environment_policy", "pre_execution_snapshot", "steps", "final_verification", "self_check"]
         for field in required:
             if field not in plan:
@@ -647,7 +731,37 @@ class Executor:
             plan.get("risk_level") == "low"
             and policy.get("environment") == "test"
             and policy.get("auto_execute_allowed") is True
+            and not policy.get("security_review_required")
         )
+
+    @staticmethod
+    def plan_sha256(plan: Dict[str, Any]) -> str:
+        """Canonical hash binding an execution to the exact approved plan content."""
+        canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def classify_step_failure(step_status: str, step_result: Dict[str, Any]) -> Tuple[str, Optional[str]]:
+        """
+        Drift routing matrix (ADR-006): map a failed step to a terminal action
+        or a pause drift_type. Pre-execution policy failures stay terminal;
+        anything that means "the approved plan and reality disagree mid-flight"
+        pauses for a human.
+
+        Returns ("terminal_blocked"|"terminal_failed"|"pause", drift_type).
+        """
+        if step_status == "step_failed_blocked":
+            reason = step_result.get("reason")
+            if reason == "hook_denied":
+                # The On-Device PolicyCard denied a command inside an approved
+                # plan: the chain disagrees with itself — a human must look.
+                return "pause", "policy_violation"
+            return "terminal_blocked", None  # e.g. node_locked: contention, not drift
+        if step_status == "step_failed_aborted":
+            if "verification" in step_result:
+                return "pause", "verification_failed"
+            return "pause", "step_retries_exhausted"
+        return "terminal_failed", None
 
     def max_attempts(self, idempotency: Dict[str, Any]) -> int:
         idempotency = idempotency or {}
@@ -711,6 +825,20 @@ class Executor:
             deleted = await conn.execute("DELETE FROM node_locks WHERE expires_at < NOW()")
             if deleted != "DELETE 0":
                 logger.info("swept expired locks: %s", deleted)
+
+    async def approval_plan_hash(self, conn, plan_id: str) -> Optional[str]:
+        """plan_sha256 recorded with the latest approval (None when absent)."""
+        row = await conn.fetchrow(
+            """
+            SELECT plan_sha256
+            FROM plan_approvals
+            WHERE plan_id = $1 AND decision = 'approved'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            plan_id,
+        )
+        return row["plan_sha256"] if row else None
 
     async def approval_valid(self, conn, plan_id: str) -> bool:
         row = await conn.fetchrow(
@@ -801,6 +929,72 @@ class Executor:
         except Exception as e:
             await self.audit(conn, "kb.import_failed", plan_id, None, plan["target_node_id"], SUPPORTED_PLAN_SCHEMA, "allowed", None, 0, "kb_import_failed", {"error": str(e)})
             return "kb_import_failed", {"status": "kb_import_failed", "error": str(e)}
+
+    async def pause_execution(
+        self,
+        execution_id: str,
+        plan_id: str,
+        node_id: Optional[str],
+        drift_type: str,
+        details: Dict[str, Any],
+        idempotency_key: Optional[str] = None,
+        schema_version: str = SUPPORTED_PLAN_SCHEMA,
+    ):
+        """
+        Drift detected: stop executing, surface an open escalation to the Gate
+        console, and wait for a human (ADR-006). ``paused_for_review`` is
+        non-terminal but excluded from the poller's WHERE clause, so nothing
+        runs again until the dashboard resume endpoint re-queues it.
+        """
+        assert self.pool
+        escalation_id = f"esc_{uuid.uuid4()}"
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO execution_escalations
+                (escalation_id, execution_id, plan_id, node_id, drift_type, severity, details, status)
+                VALUES ($1, $2, $3, $4, $5, 'high', $6, 'open')
+                """,
+                escalation_id,
+                execution_id,
+                plan_id,
+                node_id,
+                drift_type,
+                json.dumps(details),
+            )
+            await conn.execute(
+                "UPDATE plan_executions SET status = 'paused_for_review' WHERE execution_id = $1",
+                execution_id,
+            )
+            await conn.execute(
+                "UPDATE diagnosis_reports SET plan_status = 'paused_for_review' WHERE diagnosis_id = $1",
+                plan_id,
+            )
+            await self.audit(
+                conn,
+                "execution.paused",
+                plan_id,
+                None,
+                node_id,
+                schema_version,
+                "paused",
+                idempotency_key,
+                0,
+                "paused_for_review",
+                {"escalation_id": escalation_id, "drift_type": drift_type, "details": details},
+            )
+        logger.warning("execution %s paused for review: %s (%s)", execution_id, drift_type, escalation_id)
+        await post_escalation_webhook(
+            {
+                "event_type": "execution_paused",
+                "escalation_id": escalation_id,
+                "execution_id": execution_id,
+                "plan_id": plan_id,
+                "node_id": node_id,
+                "drift_type": drift_type,
+                "details": details,
+            }
+        )
 
     async def finish_execution(self, conn, execution_id: str, status: str, result: Dict[str, Any]):
         execution = await conn.fetchrow(

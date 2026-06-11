@@ -29,6 +29,7 @@ fi
 # Pack only the files the target needs.
 COPYFILE_DISABLE=1 tar --exclude='._*' -C "$ROOT" -czf "$ARCHIVE" \
   pi-agent/src/main.py \
+  pi-agent/src/safety_cards \
   pi-agent/systemd/aads-agent.service \
   pi-agent/wrappers
 
@@ -57,6 +58,10 @@ install -d -o root -g aads-agent -m 0750 \
   /var/lib/aads-agent/snapshots/mysql
 
 install -o root -g root -m 0644 "$SRC/src/main.py" /opt/aads-agent/main.py
+install -d -o root -g root -m 0755 /opt/aads-agent/safety_cards
+for card in "$SRC"/src/safety_cards/*.py; do
+  install -o root -g root -m 0644 "$card" "/opt/aads-agent/safety_cards/$(basename "$card")"
+done
 install -o root -g root -m 0644 "$SRC/systemd/aads-agent.service" /etc/systemd/system/aads-agent.service
 
 # Install root runner + all service wrappers (V2: argv targets, not catalog entries).

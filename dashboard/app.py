@@ -22,8 +22,17 @@ DB_USER = os.getenv('DB_USER', 'logdb')
 DB_PASSWORD = os.getenv('DB_PASSWORD', 'logdb_password')
 ADMIN_API_KEY = os.getenv('AADS_ADMIN_API_KEY', 'change-me-admin-key')
 APPROVAL_EXPIRY_MINUTES = int(os.getenv('APPROVAL_EXPIRY_MINUTES', '30'))
-SUPPORTED_EXECUTION_SCHEMA = '3.0'
+SUPPORTED_EXECUTION_SCHEMA = '3.1'
+SUPPORTED_EXECUTION_SCHEMAS = frozenset(['3.0', '3.1'])
 IDEMPOTENCY_TTL_MINUTES = int(os.getenv('AADS_IDEMPOTENCY_TTL_MINUTES', '30'))
+
+
+def plan_sha256(plan):
+    """Canonical plan hash binding an approval to exact plan content (ADR-006).
+
+    Must stay byte-identical to Executor.plan_sha256 in layer4."""
+    canonical = json.dumps(plan, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
 
 
 async def get_db_connection():
@@ -516,24 +525,29 @@ async def approve_plan(plan_id, reason=None):
 
         plan_dict = parse_jsonb(plan_row['action_plan']) or {}
         effective_schema = plan_dict.get('schema_version') or plan_row['schema_version'] or '1.0'
-        if effective_schema != SUPPORTED_EXECUTION_SCHEMA:
+        if effective_schema not in SUPPORTED_EXECUTION_SCHEMAS:
             await audit(conn, 'policy.blocked', 'admin', plan_id, None, None,
                         'unsupported_schema', None, 'blocked', {}, effective_schema)
-            return {'error': 'cannot approve — plan has no executable steps (schema != 2.0)'}, 400
+            return {'error': 'cannot approve — plan has no executable steps (unsupported schema)'}, 400
 
+        # The approval records the canonical hash of the exact plan content the
+        # human saw (including its execution_profile); the executor refuses to
+        # run anything that hashes differently (ADR-006 drift signal 0).
+        approved_hash = plan_sha256(plan_dict)
         approved_until = datetime.now(timezone.utc) + timedelta(minutes=APPROVAL_EXPIRY_MINUTES)
         await conn.execute(
             """
-            INSERT INTO plan_approvals (plan_id, actor, decision, approved_until, reason)
-            VALUES ($1, 'admin', 'approved', $2, $3)
+            INSERT INTO plan_approvals (plan_id, actor, decision, approved_until, reason, plan_sha256)
+            VALUES ($1, 'admin', 'approved', $2, $3, $4)
             """,
             plan_id,
             approved_until,
             reason,
+            approved_hash,
         )
         await conn.execute("UPDATE diagnosis_reports SET plan_status = 'approved' WHERE diagnosis_id = $1", plan_id)
-        await audit(conn, 'plan.approved', 'admin', plan_id, None, None, 'allowed', None, 'approved', {'approved_until': approved_until.isoformat(), 'reason': reason})
-        return {'status': 'approved', 'plan_id': plan_id, 'approved_until': approved_until.isoformat()}
+        await audit(conn, 'plan.approved', 'admin', plan_id, None, None, 'allowed', None, 'approved', {'approved_until': approved_until.isoformat(), 'reason': reason, 'plan_sha256': approved_hash})
+        return {'status': 'approved', 'plan_id': plan_id, 'approved_until': approved_until.isoformat(), 'plan_sha256': approved_hash}
     finally:
         await conn.close()
 
@@ -552,6 +566,163 @@ async def reject_plan(plan_id, reason=None):
         await conn.execute("UPDATE diagnosis_reports SET plan_status = 'rejected' WHERE diagnosis_id = $1", plan_id)
         await audit(conn, 'plan.rejected', 'admin', plan_id, None, None, 'blocked', None, 'rejected', {'reason': reason})
         return {'status': 'rejected', 'plan_id': plan_id}
+    finally:
+        await conn.close()
+
+
+@app.route('/api/plans/<plan_id>/resume', methods=['POST'])
+def api_resume_plan(plan_id):
+    auth = require_admin()
+    if auth:
+        return auth
+    result = run_async(resume_plan(plan_id))
+    if isinstance(result, tuple):
+        return jsonify(result[0]), result[1]
+    return jsonify(result)
+
+
+@app.route('/api/plans/<plan_id>/abort', methods=['POST'])
+def api_abort_plan(plan_id):
+    auth = require_admin()
+    if auth:
+        return auth
+    payload = request.get_json(silent=True) or {}
+    result = run_async(abort_plan(plan_id, payload.get('reason')))
+    if isinstance(result, tuple):
+        return jsonify(result[0]), result[1]
+    return jsonify(result)
+
+
+@app.route('/api/plans/<plan_id>/escalations')
+def api_plan_escalations(plan_id):
+    return jsonify(run_async(get_escalations(plan_id=plan_id)))
+
+
+@app.route('/api/escalations')
+def api_escalations():
+    status = request.args.get('status', 'open')
+    return jsonify(run_async(get_escalations(status=status)))
+
+
+async def get_escalations(plan_id=None, status=None):
+    conn = await get_db_connection()
+    try:
+        clauses, params = [], []
+        if plan_id:
+            params.append(plan_id)
+            clauses.append(f"plan_id = ${len(params)}")
+        if status:
+            params.append(status)
+            clauses.append(f"status = ${len(params)}")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = await conn.fetch(
+            f"""
+            SELECT escalation_id, execution_id, plan_id, node_id, drift_type, severity,
+                   details, status, resolution, resolved_by, created_at, resolved_at
+            FROM execution_escalations
+            {where}
+            ORDER BY created_at DESC
+            LIMIT 100
+            """,
+            *params,
+        )
+        return [
+            {
+                **dict(row),
+                'details': parse_jsonb(row['details']),
+                'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+                'resolved_at': row['resolved_at'].isoformat() if row['resolved_at'] else None,
+            }
+            for row in rows
+        ]
+    finally:
+        await conn.close()
+
+
+async def resume_plan(plan_id):
+    """
+    Re-queue a paused execution (ADR-006). Flow is "Re-approve & Resume": the
+    pause invalidates trust in the old approval window, so a currently valid
+    approval (fresh plan_sha256 binding) is required before anything re-runs.
+    """
+    conn = await get_db_connection()
+    try:
+        async with conn.transaction():
+            execution = await conn.fetchrow(
+                """
+                SELECT execution_id, status FROM plan_executions
+                WHERE plan_id = $1
+                ORDER BY requested_at DESC
+                LIMIT 1
+                """,
+                plan_id,
+            )
+            if not execution:
+                return {'error': 'no execution found for plan'}, 404
+            if execution['status'] != 'paused_for_review':
+                return {'error': f"latest execution is '{execution['status']}', not paused_for_review"}, 409
+            if not await approval_valid(conn, plan_id):
+                return {'error': 'a currently valid approval is required — re-approve the plan first'}, 403
+
+            await conn.execute(
+                """
+                UPDATE execution_escalations
+                SET status = 'resolved', resolution = 'resumed', resolved_by = 'admin', resolved_at = NOW()
+                WHERE execution_id = $1 AND status = 'open'
+                """,
+                execution['execution_id'],
+            )
+            await conn.execute(
+                "UPDATE plan_executions SET status = 'queued', finished_at = NULL WHERE execution_id = $1",
+                execution['execution_id'],
+            )
+            await conn.execute("UPDATE diagnosis_reports SET plan_status = 'queued' WHERE diagnosis_id = $1", plan_id)
+            await audit(conn, 'execution.resumed', 'admin', plan_id, None, None, 'allowed', None, 'queued', {'execution_id': execution['execution_id']})
+            return {'status': 'queued', 'plan_id': plan_id, 'execution_id': execution['execution_id']}
+    finally:
+        await conn.close()
+
+
+async def abort_plan(plan_id, reason=None):
+    """Terminate a paused execution; the open escalation resolves as aborted."""
+    conn = await get_db_connection()
+    try:
+        async with conn.transaction():
+            execution = await conn.fetchrow(
+                """
+                SELECT execution_id, status FROM plan_executions
+                WHERE plan_id = $1
+                ORDER BY requested_at DESC
+                LIMIT 1
+                """,
+                plan_id,
+            )
+            if not execution:
+                return {'error': 'no execution found for plan'}, 404
+            if execution['status'] != 'paused_for_review':
+                return {'error': f"latest execution is '{execution['status']}', not paused_for_review"}, 409
+
+            await conn.execute(
+                """
+                UPDATE execution_escalations
+                SET status = 'resolved', resolution = 'aborted', resolved_by = 'admin', resolved_at = NOW()
+                WHERE execution_id = $1 AND status = 'open'
+                """,
+                execution['execution_id'],
+            )
+            await conn.execute(
+                """
+                UPDATE plan_executions
+                SET status = 'execution_failed', finished_at = NOW(),
+                    result = $2
+                WHERE execution_id = $1
+                """,
+                execution['execution_id'],
+                json.dumps({'reason': 'aborted_by_human', 'detail': reason}),
+            )
+            await conn.execute("UPDATE diagnosis_reports SET plan_status = 'execution_failed' WHERE diagnosis_id = $1", plan_id)
+            await audit(conn, 'execution.aborted', 'admin', plan_id, None, None, 'blocked', None, 'execution_failed', {'execution_id': execution['execution_id'], 'reason': reason})
+            return {'status': 'execution_failed', 'plan_id': plan_id, 'execution_id': execution['execution_id']}
     finally:
         await conn.close()
 
@@ -619,8 +790,9 @@ async def queue_execution(plan_id, idempotency_key):
                 return {'error': 'plan not found'}, 404
 
             plan = parse_jsonb(diagnosis['action_plan']) or {}
-            if plan.get('schema_version', diagnosis['schema_version']) != SUPPORTED_EXECUTION_SCHEMA:
-                await audit(conn, 'policy.blocked', 'admin', plan_id, None, None, 'unsupported_schema', idempotency_key, 'blocked', {}, SUPPORTED_EXECUTION_SCHEMA)
+            effective_schema = plan.get('schema_version', diagnosis['schema_version'])
+            if effective_schema not in SUPPORTED_EXECUTION_SCHEMAS:
+                await audit(conn, 'policy.blocked', 'admin', plan_id, None, None, 'unsupported_schema', idempotency_key, 'blocked', {}, effective_schema)
                 return {'error': 'unsupported schema'}, 400
 
             target_node_id = first_target_node(plan)
@@ -639,7 +811,7 @@ async def queue_execution(plan_id, idempotency_key):
                 plan_id,
                 idempotency_key,
                 target_node_id,
-                SUPPORTED_EXECUTION_SCHEMA,
+                effective_schema,
             )
             await conn.execute(
                 """
@@ -773,13 +945,14 @@ async def approval_valid(conn, plan_id):
 
 
 def plan_auto_allowed(plan):
-    if plan.get('schema_version') == SUPPORTED_EXECUTION_SCHEMA:
+    if plan.get('schema_version') in SUPPORTED_EXECUTION_SCHEMAS:
         policy = plan.get('environment_policy') or {}
         return (
             plan.get('risk_level') == 'low'
             and bool(plan.get('steps'))
             and policy.get('environment') == 'test'
             and policy.get('auto_execute_allowed') is True
+            and not policy.get('security_review_required')
         )
     for step in plan.get('execution_steps', []):
         if step.get('phase') != 'Execute':
@@ -792,7 +965,7 @@ def plan_auto_allowed(plan):
 
 
 def first_target_node(plan):
-    if plan.get('schema_version') == SUPPORTED_EXECUTION_SCHEMA:
+    if plan.get('schema_version') in SUPPORTED_EXECUTION_SCHEMAS:
         return plan.get('target_node_id')
     for step in plan.get('execution_steps', []):
         for command in step.get('commands', []):

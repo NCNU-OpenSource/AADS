@@ -88,7 +88,7 @@ def test_mysql_bad_config_emits_root_mutate_restore_runner():
     )
     fixing = analyzer._to_fixing_plan(plan, _mysql_bad_config_cluster(), "diag_mysql_1", rca)
 
-    assert fixing.schema_version == "3.0"
+    assert fixing.schema_version == "3.1"
     step = fixing.steps[0]
     assert step.runner.argv == ["/usr/local/sbin/aads-mysql-restore-config"]
     assert step.runner.as_root is True
