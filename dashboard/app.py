@@ -85,15 +85,15 @@ def require_admin():
             key_diagnostics(key),
             key_diagnostics(ADMIN_API_KEY),
         )
-        return jsonify({
-            'error': 'unauthorized',
-            'received': key_diagnostics(key),
-            'expected': {
-                'present': bool(ADMIN_API_KEY),
-                'length': len(ADMIN_API_KEY),
-            },
-        }), 401
+        # Diagnostics are logged server-side only — never returned to the client,
+        # which would leak the key length and a hash fingerprint (a credential oracle).
+        return jsonify({'error': 'unauthorized'}), 401
     return None
+
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok'}), 200
 
 
 @app.route('/api/auth/check', methods=['POST'])
@@ -996,4 +996,7 @@ async def audit(conn, event_type, actor, plan_id, step_id, node_id, policy_decis
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # Debug must default OFF: the Werkzeug debugger allows remote code execution
+    # and this binds to 0.0.0.0. Opt in explicitly for local development only.
+    debug = os.getenv('AADS_DASHBOARD_DEBUG', '').lower() in ('1', 'true', 'yes')
+    app.run(host='0.0.0.0', port=5000, debug=debug)

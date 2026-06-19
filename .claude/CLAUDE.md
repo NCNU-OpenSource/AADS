@@ -203,7 +203,8 @@ active configs never reference Spokenly. Install hooks with `pre-commit install`
   (`SUPPORTED_EXECUTION_SCHEMAS={'3.0','3.1'}`) both accept either for backward
   compat, but 3.0 is **never generated** and is only tolerated at the pi-agent
   boundary under `AADS_POLICY_MODE=audit`.
-- **Watch for orphaned code**: `layer3-remediation/` is a byte-identical duplicate
-  of Layer 2 modules that nothing imports (the live Layer 3 is `dashboard/`), and
-  `layer0-storage/timescaledb/{init,retention}.sql` are legacy scripts with a
-  conflicting schema — the canonical schema is `migrations/000…005` (13 tables).
+- **Layer 3 is the `dashboard/` Gate UI**; the notification/suggestion logic runs
+  inside `layer2-analyzer` (`_run_layer3()`), not a separate service. The canonical
+  DB schema is `layer0-storage/timescaledb/migrations/000…005` (13 tables). The old
+  duplicate `layer3-remediation/` and the conflicting legacy `init.sql`/`retention.sql`
+  have been removed.

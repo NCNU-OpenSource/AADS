@@ -150,7 +150,7 @@ AADS 是一套「**觀測 → 診斷 → 修復**」的自動化閉環系統。�
 | **L2 診斷** | `layer2-analyzer`（System Agent） | `layer2-analyzer/src/` | C | 消費異常 → LLM 根因分析 → 產生 FixingPlan 3.1（含 `execution_profile`） |
 | **L2 診斷** | `litellm` | （image）+ `litellm/` | C | LLM 閘道/代理（System Agent 透過它呼叫模型） |
 | **L3 建議/通知** | （已併入 L2）SuggestionGenerator + NotificationHub | `layer2-analyzer/src/{suggestion_generator,notification_hub}.py` | C | 產生修復建議、發通知；由 L2 的 `_run_layer3()` 呼叫 |
-| **L3（舊版獨立）** | 原 layer3-remediation | `layer3-remediation/` | — | **已被 L2 取代**，未啟動為服務（保留參考） |
+| **L3（舊版獨立）** | 原 layer3-remediation | （已移除） | — | **已被 L2 取代**；重複程式碼已於文檔整理時刪除 |
 | **Gate 閘道** | `dashboard`（Gate Console） | `dashboard/` | C | 人工審批：approve / reject / execute |
 | **L4 執行** | `layer4-executor`（Knowledge Agent） | `layer4-executor/src/executor.py` | C | 確定性順序執行器，per-step 呼叫 On-Device Agent |
 | **目標代理** | On-Device Agent | `pi-agent/` | T | argv command runner + hook/audit，實際在目標機執行 runner spec |
@@ -159,7 +159,7 @@ AADS 是一套「**觀測 → 診斷 → 修復**」的自動化閉環系統。�
 
 > **三個容易混淆的點**：
 > 1. `layer0-collector/` 是**設定目錄**（Alloy/Loki/auditd/logrotate 的 config），collector 本身是 Alloy/Loki image，不是自建服務。
-> 2. **Layer 3 已併入 Layer 2**：`layer2-analyzer` 在診斷後會跑 `_run_layer3()` 產生建議與通知。獨立的 `layer3-remediation/` 是舊版，未啟動。
+> 2. **Layer 3 已併入 Layer 2**：`layer2-analyzer` 在診斷後會跑 `_run_layer3()` 產生建議與通知。原獨立的 `layer3-remediation/`（重複碼）已移除。
 > 3. `ingester` 與 `layer1-filter` 都 build 自 `layer1-filter/` 但**角色不同**：`ingester` 是被動接收 Alloy POST 的 sink，`layer1-filter` 是主動輪詢 Loki 的過濾器。
 
 ---

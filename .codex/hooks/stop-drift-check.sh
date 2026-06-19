@@ -18,7 +18,7 @@ DRIFT_FOUND=0
 echo "" >&2
 echo "📁 Layer Structure:" >&2
 
-EXPECTED_LAYERS=("layer0-collector" "layer0-storage" "layer1-filter" "layer2-analyzer" "layer3-remediation")
+EXPECTED_LAYERS=("layer0-collector" "layer0-storage" "layer1-filter" "layer2-analyzer")
 for layer in "${EXPECTED_LAYERS[@]}"; do
     if [[ -d "$PROJECT_ROOT/$layer" ]]; then
         echo "  ✓ $layer exists" >&2
