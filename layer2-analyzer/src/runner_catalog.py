@@ -14,7 +14,14 @@ safety. See docs/runner-v2-plan.md.
 """
 from typing import Dict, List, Optional, Tuple
 
-from schemas.action_plan import ExtractRule, RunnerSpec, VerificationSpec
+from schemas.action_plan import (
+    CommandPermission,
+    ExecutionProfile,
+    ExtractRule,
+    PathPermission,
+    RunnerSpec,
+    VerificationSpec,
+)
 
 WRAPPER = "/usr/local/sbin"
 
@@ -206,3 +213,67 @@ def primary_service(services: List[str]) -> str:
         if service in services:
             return service
     return services[0] if services else "nginx"
+
+
+# Paths each service's repair/probe commands touch (ADR-005). Argv-visible
+# paths (e.g. curl -o /dev/null) are enforced by the PolicyCard path check;
+# wrapper-internal paths (/etc/<service>, snapshot dir) are declared so the
+# human approves the real blast radius alongside the plan.
+_PATH_PERMISSIONS: Dict[str, List[Dict[str, str]]] = {
+    "nginx": [
+        {"path": "/dev/null", "mode": "w"},
+        {"path": "/etc/nginx", "mode": "rw"},
+        {"path": "/var/lib/aads-agent/snapshots/nginx", "mode": "rw"},
+    ],
+    "postgresql": [
+        {"path": "/etc/postgresql", "mode": "rw"},
+        {"path": "/var/lib/aads-agent/snapshots/postgresql", "mode": "rw"},
+    ],
+    "redis": [
+        {"path": "/etc/redis", "mode": "rw"},
+        {"path": "/var/lib/aads-agent/snapshots/redis", "mode": "rw"},
+    ],
+    "mysql": [
+        {"path": "/etc/mysql", "mode": "rw"},
+        {"path": "/var/lib/aads-agent/snapshots/mysql", "mode": "rw"},
+    ],
+}
+
+def execution_profile_for(plan_runners: List[RunnerSpec], services: List[str]) -> ExecutionProfile:
+    """
+    Derive the AppArmor-like permission manifest for a plan (ADR-005).
+
+    Deterministic: built only from the runner specs the catalog itself emitted
+    plus the static per-service path table — the LLM never contributes to it.
+    Every grant is an exact-command grant (allow_extra_args=False): the full
+    argv is pinned, so ``systemctl is-active nginx`` never licenses
+    ``systemctl stop nginx`` and ``curl <probe-url>`` never licenses any other
+    curl invocation.
+    """
+    commands: Dict[Tuple, CommandPermission] = {}
+    for runner in plan_runners:
+        argv0 = runner.argv[0]
+        prefix = list(runner.argv[1:])
+        key = (argv0, tuple(prefix), runner.as_root, runner.side_effect)
+        existing = commands.get(key)
+        timeout = max(runner.timeout_seconds, existing.max_timeout_seconds if existing else 0)
+        commands[key] = CommandPermission(
+            argv0=argv0,
+            argv_prefix=prefix,
+            as_root=runner.as_root,
+            side_effect=runner.side_effect,
+            max_timeout_seconds=timeout,
+        )
+
+    paths: Dict[str, PathPermission] = {}
+    for service in services:
+        for entry in _PATH_PERMISSIONS.get(service, []):
+            merged_mode = entry["mode"]
+            if entry["path"] in paths:
+                merged_mode = "".join(sorted(set(paths[entry["path"]].mode + entry["mode"])))
+            paths[entry["path"]] = PathPermission(path=entry["path"], mode=merged_mode)
+
+    return ExecutionProfile(
+        allowed_commands=sorted(commands.values(), key=lambda c: (c.argv0, c.argv_prefix)),
+        path_permissions=sorted(paths.values(), key=lambda p: p.path),
+    )

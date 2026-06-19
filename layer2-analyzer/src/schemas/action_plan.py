@@ -13,6 +13,7 @@ Design Philosophy (ADR-004):
 
 Related: ADR-002 Structured Output Decision, ADR-004 Claude Style Plan Design
 """
+import os
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -74,6 +75,117 @@ class RunnerSpec(BaseModel):
         if not value or any((not isinstance(arg, str) or arg == "") for arg in value):
             raise ValueError("runner.argv must be a non-empty list of non-empty strings")
         return value
+
+
+class CommandPermission(BaseModel):
+    """
+    One allowed command shape inside an ExecutionProfile.
+
+    ``argv0`` is the exact program path; ``argv_prefix`` pins the arguments
+    after argv0. With ``allow_extra_args=False`` (the default) the whole argv
+    must equal ``[argv0, *argv_prefix]`` — catalog-derived profiles are
+    exact-command grants. ``allow_extra_args=True`` relaxes this to prefix
+    matching for future dynamically-adjusted plans.
+    """
+
+    argv0: str = Field(..., min_length=1)
+    argv_prefix: List[str] = Field(default_factory=list)
+    allow_extra_args: bool = Field(default=False)
+    as_root: bool = Field(default=False)
+    side_effect: Literal["read", "mutate"] = Field(default="read")
+    max_timeout_seconds: int = Field(default=600, ge=1, le=600)
+
+
+class PathPermission(BaseModel):
+    """Absolute path prefix the plan's commands may touch, with rwx mode."""
+
+    path: str = Field(..., min_length=1, pattern=r"^/")
+    mode: str = Field(..., pattern=r"^[rwx]{1,3}$")
+
+
+class ExecutionProfile(BaseModel):
+    """
+    AppArmor-like permission manifest generated at plan time (ADR-005).
+
+    Derived deterministically from runner_catalog — never authored by the LLM —
+    approved by the human together with the plan, and enforced fail-closed by
+    the On-Device Agent PolicyCard for every command in the plan (steps,
+    verifications, snapshot, rollback).
+    """
+
+    profile_version: Literal["1.0"] = Field(default="1.0")
+    generated_by: str = Field(default="runner_catalog")
+    allowed_commands: List[CommandPermission] = Field(..., min_length=1)
+    path_permissions: List[PathPermission] = Field(default_factory=list)
+
+
+def profile_allows(profile: Dict[str, Any], runner: Dict[str, Any]) -> Optional[str]:
+    """
+    Pure matching predicate: does ``profile`` permit ``runner``?
+
+    Returns None when allowed, otherwise a machine-readable failure reason.
+    The pi-agent PolicyCard carries a verbatim twin of this function (it must
+    not import layer2); a parity test pins the two implementations together.
+    """
+    if not profile or not profile.get("allowed_commands"):
+        return "profile_missing"
+
+    argv = list(runner.get("argv") or [])
+    if not argv:
+        return "argv_not_allowed"
+
+    matched = None
+    for perm in profile["allowed_commands"]:
+        prefix = list(perm.get("argv_prefix") or [])
+        if argv[0] != perm["argv0"] or argv[1:1 + len(prefix)] != prefix:
+            continue
+        if not perm.get("allow_extra_args", False) and len(argv) != 1 + len(prefix):
+            continue
+        matched = perm
+        break
+    if matched is None:
+        return "argv_not_allowed"
+
+    if bool(runner.get("as_root", False)) != bool(matched.get("as_root", False)):
+        return "as_root_mismatch"
+    if (runner.get("side_effect") or "read") != (matched.get("side_effect") or "read"):
+        return "side_effect_mismatch"
+    if int(runner.get("timeout_seconds") or 30) > int(matched.get("max_timeout_seconds") or 600):
+        return "timeout_exceeds_profile"
+
+    path_perms = profile.get("path_permissions") or []
+
+    def _covered(target: str, need_mode: str) -> bool:
+        normalized = os.path.normpath(target)
+        for perm in path_perms:
+            base = os.path.normpath(perm["path"])
+            within = normalized == base or normalized.startswith(base.rstrip("/") + "/")
+            if within and (not need_mode or need_mode in perm.get("mode", "")):
+                return True
+        return False
+
+    # cwd "/" is the RunnerSpec default and grants no data access by itself;
+    # any other cwd must be explicitly covered (a "/" path_permission would
+    # cover every path argument and void the check, so it is never emitted).
+    cwd = runner.get("cwd") or "/"
+    if ".." in cwd.split("/"):
+        return "cwd_not_allowed"
+    if cwd != "/" and not _covered(cwd, "r"):
+        return "cwd_not_allowed"
+
+    for token in argv[1:]:
+        if not token.startswith("/"):
+            continue
+        if ".." in token.split("/"):
+            return "path_arg_not_allowed"
+        if not _covered(token, ""):
+            return "path_arg_not_allowed"
+
+    env = runner.get("env") or {}
+    if env:
+        return "env_not_allowed"
+
+    return None
 
 
 class ExtractRule(BaseModel):
@@ -181,18 +293,20 @@ class FixingPlan(BaseModel):
     """
     Executable System Agent plan for the controller-side Knowledge Agent.
 
-    schema 3.0 replaces the legacy catalog ``command_id`` contract with runner
-    specs. The Knowledge Agent must execute only this schema and must not infer
-    additional actions.
+    schema 3.0 replaced the legacy catalog ``command_id`` contract with runner
+    specs. schema 3.1 adds the required ``execution_profile`` permission
+    manifest (ADR-005). The Knowledge Agent must execute only this schema and
+    must not infer additional actions.
     """
 
-    schema_version: Literal["3.0"] = Field(default="3.0")
+    schema_version: Literal["3.1"] = Field(default="3.1")
     plan_id: str = Field(..., min_length=1)
     rca_report_id: str = Field(..., min_length=1)
     target_node_id: str = Field(..., min_length=1)
     goal: str = Field(..., min_length=1)
     risk_level: Literal["low", "medium", "high", "critical"] = Field(default="low")
     environment_policy: Dict[str, Any] = Field(default_factory=dict)
+    execution_profile: ExecutionProfile
     pre_execution_snapshot: PreExecutionSnapshot = Field(default_factory=PreExecutionSnapshot)
     rollback: RollbackSpec = Field(default_factory=RollbackSpec)
     steps: List[FixingPlanStep] = Field(..., min_length=1)
@@ -210,7 +324,23 @@ class FixingPlan(BaseModel):
             raise ValueError("prod plans cannot be auto-executable")
         if not self.self_check.passed:
             raise ValueError("FixingPlan self_check must pass before storage")
+        profile = self.execution_profile.model_dump()
+        for runner, where in self._all_runners():
+            reason = profile_allows(profile, runner.model_dump())
+            if reason is not None:
+                raise ValueError(f"execution_profile does not cover {where}: {reason}")
         return self
+
+    def _all_runners(self):
+        """Every runner the plan can possibly execute, with its location label."""
+        for step in self.steps:
+            yield step.runner, f"steps[{step.step_id}].runner"
+            yield step.verification.runner, f"steps[{step.step_id}].verification.runner"
+        yield self.final_verification.runner, "final_verification.runner"
+        if self.pre_execution_snapshot.runner is not None:
+            yield self.pre_execution_snapshot.runner, "pre_execution_snapshot.runner"
+        if self.rollback.runner is not None:
+            yield self.rollback.runner, "rollback.runner"
 
 
 # ============================================================

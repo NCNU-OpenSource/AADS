@@ -16,6 +16,7 @@ const STATUS_META = {
   kb_import_failed:               { label: "kb import failed", tone: "green", bucket: "history" },
   rejected:                       { label: "rejected",         tone: "grey",  bucket: "history" },
   failed_retryable:               { label: "failed retryable", tone: "amber", bucket: "attention" },
+  paused_for_review:              { label: "paused · review",  tone: "amber", bucket: "attention" },
   blocked:                        { label: "blocked",          tone: "red",   bucket: "attention" },
   execution_failed:               { label: "execution failed", tone: "red",   bucket: "attention" },
   execution_failed_unknown_state: { label: "failed · unknown", tone: "red",   bucket: "attention" },
@@ -28,8 +29,8 @@ const INFLIGHT = new Set(["queued", "executing", "final_verifying"]);
 const TERMINAL_FAIL = new Set(["blocked", "execution_failed", "execution_failed_unknown_state"]);
 
 function bucketOf(report) { return statusMeta(report.plan_status).bucket; }
-// V2 runner plans are schema 3.0 (kept the helper name to limit churn).
-function isSchemaV2(report) { return (report.action_plan || {}).schema_version === "3.0"; }
+// V2 runner plans are schema 3.0/3.1 (kept the helper name to limit churn).
+function isSchemaV2(report) { return ["3.0", "3.1"].includes((report.action_plan || {}).schema_version); }
 
 function severityTone(sev) {
   return { critical: "red", high: "amber", medium: "blue", low: "green" }[sev] || "grey";

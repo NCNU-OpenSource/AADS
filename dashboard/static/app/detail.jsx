@@ -18,6 +18,7 @@ function stepperModel(status) {
   if (status === "final_verifying") {m.approve = "done";m.execute = "done";m.verify = "active-blue";} else
   if (RESOLVED.has(status)) {m.approve = "done";m.execute = "done";m.verify = "done";} else
   if (status === "failed_retryable") {m.approve = "done";m.execute = "active-amber";} else
+  if (status === "paused_for_review") {m.approve = "done";m.execute = "active-amber";} else
   if (status === "execution_failed" || status === "blocked") {m.approve = "done";m.execute = "fail";}
   return m;
 }
@@ -234,10 +235,54 @@ function AuditBlock({ audit }) {
 /* ============================================================
    The gate / action zone — varies by status
    ============================================================ */
-function GateZone({ report, locked, reason, setReason, onApprove, onReject, onExecute, onRetry, onReapproveAndRetry, onRediagnose, now }) {
+function GateZone({ report, locked, reason, setReason, onApprove, onReject, onExecute, onRetry, onReapproveAndRetry, onResume, onAbort, onRediagnose, now }) {
   const st = report._status;
   const plan = report.action_plan || {};
   const auto = (plan.environment_policy || {}).auto_execute_allowed === true;
+
+  // PAUSED FOR REVIEW → drift escalation: human decides (ADR-006)
+  if (st === "paused_for_review") {
+    const esc = report.escalation || {};
+    const ap = report.approval || {};
+    const approvalValid = ap.approved_until && new Date(ap.approved_until).getTime() > now;
+    const DRIFT_LABEL = {
+      approved_plan_hash_mismatch: "plan content changed after approval",
+      policy_violation: "On-Device PolicyCard denied a command of this approved plan",
+      verification_failed: "a step's verification probe did not match the expected state",
+      step_retries_exhausted: "a mutating step kept failing after all retries",
+      final_verification_failed: "the final verification probe failed after all steps ran",
+      unrecoverable_step_state: "a step was left in a state the executor cannot safely recover",
+    };
+    return (
+      <div className="card">
+        <div className="card-pad">
+          <div className="callout amber">
+            <Icon name="exclamation-diamond" />
+            <div>
+              <strong>Execution paused — drift detected.</strong> {DRIFT_LABEL[esc.drift_type] || "the execution diverged from the approved plan"}.
+              <div className="xs muted mono" style={{ marginTop: 7 }}>
+                drift_type: {esc.drift_type || "—"} · escalation {shortId(esc.escalation_id || "—")} · {fmtTime(esc.created_at)}
+              </div>
+            </div>
+          </div>
+          {esc.details && <JsonBlock data={esc.details} className="xs" />}
+        </div>
+        <div className="gatebar">
+          <div className="gate-msg">
+            <strong>{approvalValid ? "Resume re-runs from the failed step" : "Re-approval required before resume"}</strong>
+            <span>Resume needs a valid approval window; Abort closes this execution; Re-diagnose starts fresh RCA.</span>
+          </div>
+          <div className="gate-actions">
+            <Btn variant="danger" icon="x-circle" disabled={locked} onClick={() => onAbort(report)}>Abort</Btn>
+            <Btn icon="diagram-3" disabled={locked} onClick={() => onRediagnose(report)}>Re-diagnose</Btn>
+            <Btn variant="approve" icon="check2-circle" disabled={locked} onClick={() => onResume(report)}>
+              {approvalValid ? "Resume" : "Re-approve & Resume"}
+            </Btn>
+          </div>
+        </div>
+      </div>);
+
+  }
 
   // AWAITING → approve
   if (st === "pending_approval") {

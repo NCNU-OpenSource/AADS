@@ -20,6 +20,8 @@ from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 from langchain_core.tools import tool
 
+import log_guard
+
 logger = logging.getLogger(__name__)
 
 # Configuration
@@ -88,7 +90,9 @@ async def query_loki(query: str, start_time: str, end_time: str, limit: int = 10
                     log_lines = log_lines[:limit]
                     log_lines.append(f"... (truncated to {limit} lines)")
 
-                return "\n".join(log_lines)
+                # Log content is attacker-writable: scan for injection, taint
+                # the investigation on hits, and fence the data (ADR-007).
+                return log_guard.guard_tool_output("\n".join(log_lines), "loki")
 
     except Exception as e:
         logger.error(f"Error in query_loki: {e}")
@@ -141,7 +145,8 @@ async def query_prometheus(promql: str, time: Optional[str] = None) -> str:
                         label_str = ", ".join([f"{k}={v}" for k, v in labels.items()])
                         metric_lines.append(f"{label_str} = {metric_value}")
 
-                return "\n".join(metric_lines)
+                # Metric labels can carry attacker-influenced strings too.
+                return log_guard.guard_tool_output("\n".join(metric_lines), "prometheus")
 
     except Exception as e:
         logger.error(f"Error in query_prometheus: {e}")
@@ -231,13 +236,16 @@ async def execute_diagnostic_command(command: str) -> str:
 
         if process.returncode != 0:
             logger.warning(f"Command failed with code {process.returncode}: {error}")
-            return f"Command failed (exit code {process.returncode}):\n{error}\n\nPartial output:\n{output}"
+            return log_guard.guard_tool_output(
+                f"Command failed (exit code {process.returncode}):\n{error}\n\nPartial output:\n{output}",
+                "diagnostic_command",
+            )
 
         # Limit output size to prevent token explosion
         if len(output) > 10000:
             output = output[:10000] + f"\n... (truncated, total {len(output)} chars)"
 
-        return output if output else "(No output)"
+        return log_guard.guard_tool_output(output, "diagnostic_command") if output else "(No output)"
 
     except Exception as e:
         logger.error(f"Error executing diagnostic command: {e}")

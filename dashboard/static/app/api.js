@@ -63,11 +63,12 @@
       ? { ...plan.final_verification, expect: expectString(plan.final_verification) }
       : {};
 
-    // A schema != 2.0 plan has no executable steps regardless of plan_status.
-    // Normalise to needs_triage so the queue bucket and status badge are consistent:
+    // A plan outside the executable schemas has no runner steps regardless of
+    // plan_status. Normalise to needs_triage so the queue bucket and status
+    // badge are consistent:
     //   - "approved"/"pending_approval" on a schema 1.0 item is misleading noise.
     //   - "rejected" is already a terminal state and should stay as-is.
-    const isNonExecutable = !plan.schema_version || plan.schema_version !== "3.0";
+    const isNonExecutable = !["3.0", "3.1"].includes(plan.schema_version);
     const terminalOrRejected = ["rejected", "blocked", "execution_failed",
       "execution_failed_unknown_state", "final_verified", "kb_imported",
       "kb_skipped", "kb_import_failed"].includes(d.plan_status);
@@ -246,8 +247,8 @@
     const out = {};
 
     // approval — needed for the 30-min countdown (approved items) AND to know
-    // whether a failed_retryable plan still has valid approval for retry.
-    if (status === "approved" || status === "failed_retryable") {
+    // whether a failed_retryable/paused plan still has valid approval.
+    if (status === "approved" || status === "failed_retryable" || status === "paused_for_review") {
       try {
         const ap = await getJSON(`/api/plans/${id}/approval`);
         if (ap && ap.decision === "approved" && ap.approved_until) {
@@ -262,8 +263,9 @@
 
     // execution-derived decorations
     const needsExec = INFLIGHT_SET.has(status) || FAIL_SET.has(status)
-      || status === "failed_retryable" || RESOLVED_SET.has(status);
-    if (needsExec || plan.schema_version === "3.0") {
+      || status === "failed_retryable" || status === "paused_for_review"
+      || RESOLVED_SET.has(status);
+    if (needsExec || ["3.0", "3.1"].includes(plan.schema_version)) {
       try {
         const execs = await getJSON(`/api/plans/${id}/execution`);
         const exec = latestExecution(execs);
@@ -280,6 +282,14 @@
         }
       } catch (e) {}
     }
+
+    // drift escalation — what paused this execution and why (ADR-006)
+    if (status === "paused_for_review") {
+      try {
+        const escalations = await getJSON(`/api/plans/${id}/escalations`);
+        out.escalation = (escalations || []).find((e) => e.status === "open") || (escalations || [])[0] || null;
+      } catch (e) {}
+    }
     return out;
   }
 
@@ -288,10 +298,13 @@
   const approve = (id, key, reason) => postJSON(`/api/plans/${id}/approve`, { key, body: { reason } });
   const reject = (id, key, reason) => postJSON(`/api/plans/${id}/reject`, { key, body: { reason } });
   const execute = (id, key) => postJSON(`/api/plans/${id}/execute`, { key, idem: mintIdem() });
+  const resume = (id, key) => postJSON(`/api/plans/${id}/resume`, { key });
+  const abort = (id, key, reason) => postJSON(`/api/plans/${id}/abort`, { key, body: { reason } });
+  const openEscalations = () => getJSON(`/api/escalations?status=open`).catch(() => []);
 
   window.AADS_API = {
     IDEM_TTL_MIN, loadAll, enrichReport, mapReport,
-    authCheck, approve, reject, execute, mintIdem,
+    authCheck, approve, reject, execute, resume, abort, openEscalations, mintIdem,
     RESOLVED_SET, INFLIGHT_SET, FAIL_SET,
   };
 })();

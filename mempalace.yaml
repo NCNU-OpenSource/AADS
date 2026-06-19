@@ -10,8 +10,6 @@ rooms:
   description: Files from layer0-storage/
 - name: layer1_filter
   description: Files from layer1-filter/
-- name: layer3_remediation
-  description: Files from layer3-remediation/
 - name: layer2_analyzer
   description: Files from layer2-analyzer/
 - name: grafana

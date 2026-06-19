@@ -2,7 +2,7 @@
 # ============================================================================
 # AADS Server — one-shot bootstrap from GitHub (curl | bash)
 #
-#   curl -fsSL https://raw.githubusercontent.com/bs10081/AADS/main/dist/install-server.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/NCNU-OpenSource/AADS/main/dist/install-server.sh | bash
 #
 # Downloads the prebuilt server bundle from GitHub Releases, extracts it to
 # AADS_INSTALL_DIR, then runs dist/bootstrap-server.sh interactively.
@@ -18,7 +18,7 @@
 #   AADS_INSTALL_DIR               where to extract the bundle
 #                                  (default: $HOME/aads  or  /opt/aads if root)
 #   AADS_RELEASE_BASE_URL          GitHub Releases base URL
-#                                  (default: https://github.com/bs10081/AADS/releases/latest/download)
+#                                  (default: https://github.com/NCNU-OpenSource/AADS/releases/latest/download)
 # ============================================================================
 set -euo pipefail
 
@@ -27,7 +27,7 @@ ok()   { printf '\033[1;32m  ✓\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m  !\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
-RELEASE_BASE="${AADS_RELEASE_BASE_URL:-https://github.com/bs10081/AADS/releases/latest/download}"
+RELEASE_BASE="${AADS_RELEASE_BASE_URL:-https://github.com/NCNU-OpenSource/AADS/releases/latest/download}"
 
 # Default install dir: ~/aads for regular users, /opt/aads for root
 if [[ -z "${AADS_INSTALL_DIR:-}" ]]; then

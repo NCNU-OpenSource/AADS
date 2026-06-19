@@ -18,7 +18,7 @@
 #   TIMESCALEDB_PASSWORD           DB password (default: auto-generated)
 #   LITELLM_MASTER_KEY             in-stack proxy key (default: auto-generated)
 #   AADS_SERVER_IP                 IP agents use to reach this server (auto)
-#   AADS_IMAGE_REGISTRY            default: ghcr.io/bs10081
+#   AADS_IMAGE_REGISTRY            default: ghcr.io/ncnu-opensource
 #   AADS_IMAGE_TAG                 default: latest
 # ============================================================================
 set -euo pipefail
@@ -94,7 +94,7 @@ tune_docker_daemon() {
 }
 tune_docker_daemon
 
-AADS_IMAGE_REGISTRY="${AADS_IMAGE_REGISTRY:-ghcr.io/bs10081}"
+AADS_IMAGE_REGISTRY="${AADS_IMAGE_REGISTRY:-ghcr.io/ncnu-opensource}"
 AADS_IMAGE_TAG="${AADS_IMAGE_TAG:-latest}"
 
 # ── Secrets / config ────────────────────────────────────────────────────────
@@ -176,7 +176,7 @@ else
   if grep -qi "unauthorized\|denied\|authentication required" "$PULL_ERR"; then
     warn "GHCR pull unauthorized — packages are private by default."
     warn "Falling back to local build from the public repository (takes ~5 min)."
-    warn "To skip this next time: make packages public at https://github.com/bs10081?tab=packages"
+    warn "To skip this next time: make packages public at https://github.com/orgs/NCNU-OpenSource/packages"
 
     SRC_DIR="$(mktemp -d /tmp/aads-src.XXXXXX)"
     cleanup_src() { rm -rf "$SRC_DIR"; }
@@ -184,7 +184,7 @@ else
 
     log "Cloning public repository"
     command -v git >/dev/null 2>&1 || { sudo apt-get install -y git >/dev/null; }
-    git clone --depth 1 https://github.com/bs10081/AADS.git "$SRC_DIR"
+    git clone --depth 1 https://github.com/NCNU-OpenSource/AADS.git "$SRC_DIR"
 
     # Overlay our already-generated .env and config dirs from the bundle
     cp "$ENV_FILE" "$SRC_DIR/.env"
@@ -220,7 +220,7 @@ else
 fi
 
 # ── Summary + agent install command ─────────────────────────────────────────
-GITHUB_RELEASE_BASE="https://github.com/bs10081/AADS/releases/latest/download"
+GITHUB_RELEASE_BASE="https://github.com/NCNU-OpenSource/AADS/releases/latest/download"
 
 cat <<EOF
 

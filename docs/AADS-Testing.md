@@ -1,6 +1,6 @@
 # AADS 測試說明文件
 
-**文件版本**: 1.1 ｜ **更新日期**: 2026-06-03 ｜ **對應分支**: `codex/ubuntu-agent-layer0-4`
+**文件版本**: 1.2 ｜ **更新日期**: 2026-06-17 ｜ **對應分支**: `feature/execution-hardening`（HEAD `942bd55`）
 
 本文件涵蓋 AADS 的兩套端對端測試：**Chaos E2E**（測系統自身韌性）與
 **Service-Coverage E2E**（測修復能力）。系統架構見 [AADS-System-Overview.md](AADS-System-Overview.md)。
@@ -94,7 +94,7 @@ node lock 生命週期、優雅降級、恢復正確性。
 | **CM-01** agent_killed_mid_execution | execute 前殺掉 target 的 `aads-agent` | `failed_retryable`，node_locks=0 | Agent 死亡不洩漏 lock |
 | **CM-02** executor_crashed_mid_step | 執行中途 stop layer4-executor 容器再重啟 | 從 DB 恢復 → `kb_skipped` | crash 後從 DB（非記憶體）恢復、不重複執行 |
 | **CM-03** loki_unavailable | 停 Loki 90 秒並弄壞 nginx | 期間無新 anomaly 寫入 | 資料來源斷裂不誤報 |
-| **CM-04** litellm_down | 停 LiteLLM 並弄壞 nginx | 期間無 schema 3.0 plan 產生 | LLM 不可用時不亂發計畫 |
+| **CM-04** litellm_down | 停 LiteLLM 並弄壞 nginx | 期間無 schema 3.1 plan 產生 | LLM 不可用時不亂發計畫 |
 | **CM-05** approval_expired_before_exec | approve 後改 DB 讓授權過期再 execute | HTTP 403 拒絕 | 授權時間窗口硬性執行 |
 | **CM-06** concurrent_repair_lock | 注入一個 live node_lock 模擬並行 | `policy.blocked:node_locked` | 同節點最多一個執行中 |
 | **CM-07** snapshot_missing | 執行前刪掉 nginx 快照 | `blocked:snapshot_failed` | 無回滾基準時拒絕修復 |
@@ -153,19 +153,26 @@ bash scripts/lab/deploy-target.sh
 | **SR-RD-01** redis_stopped | `systemctl stop redis-server` | AADS → `redis.restart` → 服務 active |
 | **SR-RD-02** redis_bad_config | 注入 redis.conf 錯誤 | AADS → `restore_known_good_config` → 服務 active |
 | **SR-DC-01** container_stopped | `docker stop <allowlisted>` | AADS → `docker.container_restart` → running |
-| **SR-DC-02** container_not_allowed | 嘗試重啟非白名單容器 | pi-agent 回 400 `container_not_allowed` |
+| **SR-DC-02** container_not_allowed | 對已移除的 legacy catalog endpoint `POST /v1/actions/run` 發請求 | pi-agent 回 **404/405**（catalog endpoint 已在 runner.v1/V2 移除；非白名單容器的拒絕現在發生在 wrapper，回 `blocked: container_not_allowed`） |
 | **SR-MY-01** mysql_stopped | `systemctl stop mysql` | AADS → `mysql.restart` → 服務 active |
 | **SR-MY-02** mysql_bad_config | 注入 my.cnf 錯誤 | AADS → `restore_known_good_config` → 服務 active |
 
 服務未安裝時場景自動 SKIP（不算 FAIL）。
 
-### 安全特性：Docker 容器雙重白名單
+### 安全特性：Docker 容器白名單（單層 wrapper 管制）
 
-`docker.container_restart` 的容器名受**兩層**白名單管制：
-1. **wrapper 腳本**內的 `AADS_DOCKER_ALLOWED_CONTAINERS`（OS 層；V2 已無 catalog arg_allowlist）
-2. **wrapper 腳本**內的 `AADS_DOCKER_ALLOWED_CONTAINERS` 環境變數（OS 層）
+`docker.container_restart` / `docker.container_start` 的容器名管制現在是**單一層**：
+root-owned wrapper 腳本（`pi-agent/wrappers/aads-docker-container-restart`、
+`aads-docker-container-start`）讀取 `AADS_DOCKER_ALLOWED_CONTAINERS`（comma-separated，
+設在 target 的 `/etc/aads-agent/agent.env`），不在清單內就 `echo "blocked: container_not_allowed"`
+並 `exit 42`。
 
-兩層缺一不可，sudoers 用 `*` 通配參數但實際管制在 wrapper。
+runner.v1/V2 模型已移除舊的 catalog `arg_allowlist`（不再有靜態指令目錄當安全邊界），
+所以過去描述的「catalog + wrapper 雙層」不再成立。sudoers 仍用 `*` 通配參數，
+但實際容器名管制只在 wrapper。
+
+> 注意：wrapper 內第 11 行註解仍寫「second gate after pi-agent catalog validation」，
+> 那是 V2 前的殘留文字；catalog gate 已不存在，wrapper 即唯一的容器白名單關卡。
 
 ---
 
@@ -207,11 +214,18 @@ aads-agent: active
 
 這輪不是重跑自動 PASS 報表，而是從乾淨 Gate 開始，讓 operator 在 UI 手動
 Approve / Execute，驗證實際修復閉環：target service 真的被破壞，Layer 1/2
-產生 FixingPlan 3.0，Gate 出現 Queue，Layer 4 執行後服務恢復。
+產生 FixingPlan 3.1，Gate 出現 Queue，Layer 4 執行後服務恢復。
+
+> Schema 版本說明：Layer 2 **只**產生 FixingPlan **3.1**（`schema_version`
+> 在 `layer2-analyzer/src/schemas/action_plan.py` 被 pin 為 `Literal["3.1"]`，
+> `execution_profile` 為必填，model 直接拒絕 3.0）。3.0 僅在**消費端**作為 legacy-accept
+> 保留：executor 的 `validate_plan`（`layer4-executor/src/executor.py`）與 dashboard
+> 的 `SUPPORTED_EXECUTION_SCHEMAS` 接受 `{3.0, 3.1}`，但 `execution_profile.allowed_commands`
+> 只在 schema==3.1 時要求。本 lab demo 看到的都是 3.1。
 
 2026-06-03 起，課堂展示建議使用 `scripts/lab/demo-nginx-manual-gate.sh` 產生單一
 Nginx bad-config 場景。它會自動拒絕 stale pending/approved queue items、還原 Nginx baseline、
-注入壞設定、等待 schema 3.0 restore plan，但不會 approve/execute。若 Queue 產生兩筆，
+注入壞設定、等待 schema 3.1 restore plan，但不會 approve/execute。若 Queue 產生兩筆，
 選 runner 包含 `aads-nginx-restore-known-good` / `nginx.restore_config` 的那筆；延遲 log
 產生的 `nginx.start` item 視為 stale，不應執行。
 
@@ -277,6 +291,61 @@ final   mysql.connection_test             -> success, accepting_connections=true
 
 ---
 
+## 4.5 Per-service 單元測試
+
+除了上面兩套 lab E2E，每個 service 目錄各自帶 pytest 單元測試。慣例：每個測試檔
+用 `sys.path.insert(0, ".../src")` 把該 service 的 `src/` 推進 path，所以 **pytest
+必須從 service 目錄內執行**（從 repo root 直接對某個 service 跑通常可行，但對 import
+路徑最安全的方式仍是進到該 service 目錄）。
+
+```bash
+# 無額外相依，repo 內 .venv 即可跑：
+.venv/bin/python -m pytest pi-agent/tests/ -q
+.venv/bin/python -m pytest layer4-executor/tests/ -q
+.venv/bin/python -m pytest layer1-filter/tests/ -q
+
+# Layer 2 需要完整 agent stack（langchain/langgraph，見 layer2-analyzer/requirements.txt），
+# 從它自己的目錄跑：
+cd layer2-analyzer && /…/AADS/.venv/bin/python -m pytest tests/ -q
+```
+
+**取得當下測試數量**（不要硬背數字，會隨開發漂移；用 collect-only 確認）：
+
+```bash
+# 從 service 目錄內：
+cd pi-agent && python -m pytest --co -q
+```
+
+在 HEAD `942bd55`（branch `feature/execution-hardening`）上以 `--co -q` 收集到的數量：
+
+| Service | Collected tests | 備註 |
+|---------|-----------------|------|
+| `pi-agent` | 35 | 無額外相依 |
+| `layer4-executor` | 37 | 無額外相依 |
+| `layer1-filter` | 4 | 無額外相依 |
+| `layer2-analyzer` | 104 | 在精簡 `.venv`（缺 heavy agent stack）上會有 1 個 collection error（`tests/test_agent_tools.py`）；完整 stack 下應全綠 |
+| `dashboard` | 0 | 目前無測試 |
+
+> 這些是 **collected**（收集到）的數量，不等於 PASS 數量。實際 PASS/FAIL 請各自跑一次。
+> 完整綠燈需在 Docker/CI 的真實 stack 下執行。
+
+### Execution-hardening 對應的測試覆蓋（ADR-005/006/007）
+
+執行路徑硬化引入了一批新的非終態與防護，對應測試與不變量如下：
+
+| 防護 / 狀態 | 來源 | 覆蓋 / 驗證方式 |
+|------------|------|----------------|
+| **`profile_allows` 雙副本一致性（ADR-005）** | `layer2-analyzer/src/schemas/action_plan.py` 與 `pi-agent/src/safety_cards/policy_card.py` 各有一份 | `layer2-analyzer/tests/test_parity.py` 斷言兩份 `profile_allows` 對同一輸入回**相同 verdict**（`l2_result == pi_result`），不是 byte-identical 原始碼（docstring 本來就不同） |
+| **ExecutionProfile 由程式產生** | `runner_catalog.execution_profile_for`（`layer2-analyzer/src/runner_catalog.py`）；LLM 不參與 | profile manifest：`profile_version='1.0'`、`generated_by='runner_catalog'`、`allowed_commands[]`、`path_permissions[]`，且為 exact-command 授權（`allow_extra_args=False`） |
+| **PolicyCard fail-closed** | `pi-agent/src/safety_cards/policy_card.py`，`AADS_POLICY_MODE` 預設 `enforce`（deny），`audit` 為 warn-but-run | PolicyCard 已 ship 且預設 fail-closed；`AADS_POLICY_MODE` 不在 `.env.example`／compose，僅程式預設 |
+| **`plan_sha256` drift（TOCTOU，ADR-006）** | dashboard 與 executor 各有一份 `sha256(json.dumps(plan, sort_keys=True, separators=(',',':')))`，必須 byte-identical（第三組 parity coupling） | hash mismatch → 暫停，`drift_type='approved_plan_hash_mismatch'` |
+| **`paused_for_review` 為非終態** | `layer4-executor/src/executor.py`，`TERMINAL_STATUSES` = `{final_verified, kb_imported, kb_skipped, kb_import_failed, execution_failed, execution_failed_unknown_state, blocked}` | `paused_for_review`、`failed_retryable` 皆**非**終態；`kb_skipped` 在 `ENABLE_KNOWLEDGE_BASE=false` 時是正常成功 |
+| **`classify_step_failure` 路由** | `layer4-executor/src/executor.py::classify_step_failure` | hook_denied / verification_failed / retries_exhausted → pause/escalate，於 dashboard 呈現為 resume/abort |
+| **`execution_escalations`（migration 005）** | `layer0-storage/timescaledb/migrations/005_execution_escalations.sql`（第 13 張表 + `plan_approvals.plan_sha256` 欄位） | `drift_type` enum：`approved_plan_hash_mismatch \| policy_violation \| verification_failed \| step_retries_exhausted \| final_verification_failed \| unrecoverable_step_state`；`status`：`open \| resolved`；`resolution`：`resumed \| aborted \| rediagnosed`（`rediagnosed` 目前保留未用）；`severity` 寫死 `high`；`escalation_id` = `esc_<uuid>` |
+| **log-injection 防禦（ADR-007）** | `layer2-analyzer/src/log_guard.py`（deterministic regex scanner + `fence()` + contextvars taint registry） | tainted diagnosis 會在 `analyze_cluster`（`main.py`）於 `_to_fixing_plan` 之後覆寫三個 key：`auto_execute_allowed=False`、`requires_approval=True`、`security_review_required=True`，tainted plan 永遠無法 auto-execute；prod auto-execution 本身即 schema-forbidden |
+
+---
+
 ## 5. 常用除錯指令
 
 ```bash
@@ -285,17 +354,17 @@ multipass exec aads-controller -- bash -lc "cd ~/AADS && sudo docker compose --e
   exec -T timescaledb psql -U logdb -d logdb -At -c \
   \"SELECT result::text FROM plan_executions WHERE plan_id='<PLAN>' ORDER BY requested_at DESC LIMIT 1;\""
 
-# 確認 plan 是否為可審批的 schema 3.0（空/404 = fallback = Layer 2 出錯）：
+# 確認 plan 是否為可審批的 schema 3.1（空/404 = fallback = Layer 2 出錯）：
 curl -s -H \"X-Admin-API-Key: $(tr -d '\n' < .aads-lab-admin-key)\" \
-  -X POST http://192.168.252.2:5000/api/plans/<PLAN>/approve \
+  -X POST http://${AADS_CONTROLLER_IP}:5000/api/plans/<PLAN>/approve \
   -H 'Content-Type: application/json' -d '{\"reason\":\"x\"}'
 
 # Layer 2 崩潰日誌：
 multipass exec aads-controller -- bash -lc "cd ~/AADS && sudo docker compose --env-file .env.lab \
   logs --tail=30 layer2-analyzer | grep -E 'ERROR|Exception|Pydantic'"
 
-# 確認 runner capabilities 已上線：
-curl -s -H \"Authorization: Bearer <token>\" http://192.168.252.3:8090/v1/node/facts | \
+# 確認 runner capabilities 已上線（on-device pi-agent 監聽 8090）：
+curl -s -H \"Authorization: Bearer <token>\" http://${AADS_TARGET_IP}:8090/v1/node/facts | \
   python3 -c \"import sys,json; print(json.load(sys.stdin)['runner_capabilities'])\"
 ```
 

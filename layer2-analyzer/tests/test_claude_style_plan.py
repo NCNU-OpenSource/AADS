@@ -1,5 +1,5 @@
 """
-Test ClaudeStylePlan schema validation and FixingPlan 3.0 (runner-based) output.
+Test ClaudeStylePlan schema validation and FixingPlan 3.1 (runner-based) output.
 """
 import pytest
 from pydantic import ValidationError
@@ -9,6 +9,7 @@ import os
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
+import runner_catalog
 from schemas.action_plan import (
     ClaudeStylePlan,
     ExecutionStep,
@@ -22,6 +23,7 @@ from schemas.action_plan import (
     RunnerSpec,
     StepCommand,
     VerificationSpec,
+    profile_allows,
 )
 
 
@@ -95,48 +97,75 @@ class TestRunnerSpec:
             )
 
 
+def _nginx_plan_kwargs():
+    """Shared FixingPlan kwargs for the canonical nginx repair plan."""
+    step_runner = _mutate_runner(["/usr/local/sbin/aads-nginx-start"])
+    snapshot_runner = _mutate_runner(["/usr/local/sbin/aads-nginx-ensure-known-good-snapshot"])
+    rollback_runner = _mutate_runner(["/usr/local/sbin/aads-nginx-restore-known-good"])
+    step_verification = _verification(
+        ["systemctl", "is-active", "nginx"],
+        {"active": {"from": "stdout_stripped", "equals": "active"}},
+        {"active": True},
+    )
+    final_verification = _verification(
+        ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "http://127.0.0.1/"],
+        {"http_code": {"from": "stdout_stripped", "as_int": True}},
+        {"http_code": 200},
+    )
+    profile = runner_catalog.execution_profile_for(
+        [step_runner, snapshot_runner, rollback_runner, step_verification.runner, final_verification.runner],
+        ["nginx"],
+    )
+    return dict(
+        plan_id="diag_1",
+        rca_report_id="rca_1",
+        target_node_id="target-1",
+        goal="Restore nginx",
+        risk_level="low",
+        environment_policy={"environment": "test", "auto_execute_allowed": True},
+        execution_profile=profile,
+        pre_execution_snapshot=PreExecutionSnapshot(enabled=True, runner=snapshot_runner, scope="nginx_config"),
+        rollback=RollbackSpec(enabled=True, runner=rollback_runner),
+        steps=[
+            FixingPlanStep(
+                step_id=1,
+                order=1,
+                runner=step_runner,
+                context={"service": "nginx", "operation": "start"},
+                expected_outcome="nginx service is active",
+                on_failure="rollback",
+                verification=step_verification,
+            )
+        ],
+        final_verification=final_verification,
+        self_check=PlanSelfCheck(passed=True, rationale="runner specs"),
+    )
+
+
 class TestFixingPlan:
-    """Test executable FixingPlan 3.0 schema."""
+    """Test executable FixingPlan 3.1 schema."""
 
     def test_valid_fixing_plan_v3(self):
-        plan = FixingPlan(
-            plan_id="diag_1",
-            rca_report_id="rca_1",
-            target_node_id="target-1",
-            goal="Restore nginx",
-            risk_level="low",
-            environment_policy={"environment": "test", "auto_execute_allowed": True},
-            pre_execution_snapshot=PreExecutionSnapshot(
-                enabled=True,
-                runner=_mutate_runner(["/usr/local/sbin/aads-nginx-ensure-known-good-snapshot"]),
-                scope="nginx_config",
-            ),
-            rollback=RollbackSpec(enabled=True, runner=_mutate_runner(["/usr/local/sbin/aads-nginx-restore-known-good"])),
-            steps=[
-                FixingPlanStep(
-                    step_id=1,
-                    order=1,
-                    runner=_mutate_runner(["/usr/local/sbin/aads-nginx-start"]),
-                    context={"service": "nginx", "operation": "start"},
-                    expected_outcome="nginx service is active",
-                    on_failure="rollback",
-                    verification=_verification(
-                        ["systemctl", "is-active", "nginx"],
-                        {"active": {"from": "stdout_stripped", "equals": "active"}},
-                        {"active": True},
-                    ),
-                )
-            ],
-            final_verification=_verification(
-                ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "http://127.0.0.1/"],
-                {"http_code": {"from": "stdout_stripped", "as_int": True}},
-                {"http_code": 200},
-            ),
-            self_check=PlanSelfCheck(passed=True, rationale="runner specs"),
-        )
-        assert plan.schema_version == "3.0"
+        plan = FixingPlan(**_nginx_plan_kwargs())
+        assert plan.schema_version == "3.1"
         assert plan.steps[0].runner.side_effect == "mutate"
         assert plan.steps[0].runner.argv[0].endswith("aads-nginx-start")
+
+    def test_fixing_plan_requires_execution_profile(self):
+        kwargs = _nginx_plan_kwargs()
+        kwargs.pop("execution_profile")
+        with pytest.raises(ValidationError):
+            FixingPlan(**kwargs)
+
+    def test_fixing_plan_rejects_profile_not_covering_all_runners(self):
+        kwargs = _nginx_plan_kwargs()
+        # Profile derived from the step runner only — verification probes,
+        # snapshot and rollback are uncovered, so the plan must not validate.
+        kwargs["execution_profile"] = runner_catalog.execution_profile_for(
+            [kwargs["steps"][0].runner], ["nginx"]
+        )
+        with pytest.raises(ValidationError, match="execution_profile does not cover"):
+            FixingPlan(**kwargs)
 
     def test_free_text_verification_rejected(self):
         with pytest.raises(ValidationError):

@@ -168,6 +168,7 @@ function App() {
       rolled_back: e.rolled_back || false,
       trace: e.trace || null,
       _run: e._run || null,
+      escalation: e.escalation || null,
     };
   }), [reports, optimistic, enrich]);
 
@@ -328,6 +329,37 @@ function App() {
     toast("info", "Re-diagnosis", "Trigger a fresh anomaly/RCA cycle from Layer 1–2; a new FixingPlan will appear in the queue.");
   };
 
+  // Resume a paused execution (ADR-006). If the approval window lapsed during
+  // the pause, re-approve first — same plan hash, fresh 30-min window — then
+  // resume; the executor re-runs from the failed step.
+  const onResume = async (report) => {
+    if (!guard()) return;
+    const ap = report.approval || {};
+    const approvalValid = ap.approved_until && new Date(ap.approved_until).getTime() > Date.now();
+    if (!approvalValid) {
+      const apRes = await API.approve(report.diagnosis_id, key(), reason || "re-approve to resume paused execution");
+      if (apRes.status === 401) { toast("danger", "Unauthorized", "Admin key rejected."); setLocked(true); setAuthOpen(true); return; }
+      if (!apRes.ok) { toast("danger", "Re-approve failed", (apRes.data && apRes.data.error) || `HTTP ${apRes.status}`); return; }
+      toast("info", "Re-approved", "Fresh 30-min window open · resuming…");
+    }
+    const res = await API.resume(report.diagnosis_id, key());
+    if (res.status === 401) { toast("danger", "Unauthorized", "Admin key rejected."); setLocked(true); setAuthOpen(true); return; }
+    if (!res.ok) { toast("danger", "Resume failed", (res.data && res.data.error) || `HTTP ${res.status}`); return; }
+    setOptimistic((p) => ({ ...p, [report.diagnosis_id]: { _status: "queued" } }));
+    toast("success", "Execution resumed", `${shortId(res.data?.execution_id || "exec")} re-queued from the failed step`);
+    reloadList({ quiet: true });
+  };
+
+  const onAbort = async (report) => {
+    if (!guard()) return;
+    const res = await API.abort(report.diagnosis_id, key(), reason);
+    if (res.status === 401) { toast("danger", "Unauthorized", "Admin key rejected."); setLocked(true); setAuthOpen(true); return; }
+    if (!res.ok) { toast("danger", "Abort failed", (res.data && res.data.error) || `HTTP ${res.status}`); return; }
+    setOptimistic((p) => ({ ...p, [report.diagnosis_id]: { _status: "execution_failed" } }));
+    toast("info", "Execution aborted", `${shortId(report.diagnosis_id)} closed — re-diagnose to plan a fresh repair`);
+    reloadList({ quiet: true });
+  };
+
   /* ---- auth actions (real /api/auth/check) ---- */
   const runAuthCheck = async () => {
     const res = await API.authCheck(key());
@@ -357,7 +389,7 @@ function App() {
   const onSelect = (id) => setSelectedId(id);
   const onBack = () => { setSelectedId(null); document.body.classList.remove("has-selection"); };
 
-  const handlers = { onApprove, onReject, onExecute, onRetry, onReapproveAndRetry, onRediagnose };
+  const handlers = { onApprove, onReject, onExecute, onRetry, onReapproveAndRetry, onResume, onAbort, onRediagnose };
 
   return (
     <div className="console">

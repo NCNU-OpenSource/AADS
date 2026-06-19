@@ -14,6 +14,11 @@ from schemas.action_plan import (
     FixingPlanStep,
     PlanSelfCheck,
     FixingPlan,
+    # Execution profile (ADR-005)
+    CommandPermission,
+    PathPermission,
+    ExecutionProfile,
+    profile_allows,
     # Legacy Claude Style Plan
     StepCommand,
     ExecutionStep,
@@ -31,6 +36,10 @@ __all__ = [
     "FixingPlanStep",
     "PlanSelfCheck",
     "FixingPlan",
+    "CommandPermission",
+    "PathPermission",
+    "ExecutionProfile",
+    "profile_allows",
     "StepCommand",
     "ExecutionStep",
     "ClaudeStylePlan",

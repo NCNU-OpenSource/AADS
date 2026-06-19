@@ -102,6 +102,9 @@ def test_audit_hook_response_contains_decision_context_and_argv_hash(monkeypatch
         json={
             "runner": {"argv": ["echo", "hello"]},
             "context": {"service": "nginx", "operation": "status", "plan_id": "p1", "step_id": 2},
+            "execution_profile": {
+                "allowed_commands": [{"argv0": "echo", "argv_prefix": ["hello"]}],
+            },
         },
     )
     assert resp.status_code == 200
@@ -124,7 +127,8 @@ def test_facts_returns_runner_capabilities_not_catalog(monkeypatch):
     caps = body["runner_capabilities"]
     assert caps["modes"] == ["argv"]
     assert caps["supports_as_root"] is True
-    assert caps["hook_default"] == "allow_audit"
+    assert caps["hook_default"] == "policy_card+audit"
+    assert caps["policy_mode"] == "enforce"
 
 
 def test_unauthorized_without_token(monkeypatch):
