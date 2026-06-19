@@ -6,7 +6,7 @@
 #   docker compose -f docker-compose.prod.yaml --env-file .env up -d
 #
 # Image coordinates come from .env (defaults shown):
-#   AADS_IMAGE_REGISTRY=ghcr.io/bs10081
+#   AADS_IMAGE_REGISTRY=ghcr.io/ncnu-opensource
 #   AADS_IMAGE_TAG=latest
 # Build/push the images with .github/workflows/build-images.yml (tag push v*).
 # ============================================================================
@@ -184,7 +184,7 @@ services:
 
   # ── Custom AADS services (PULLED from registry) ───────────────────────────
   layer1-filter:
-    image: ${AADS_IMAGE_REGISTRY:-ghcr.io/bs10081}/aads-layer1-filter:${AADS_IMAGE_TAG:-latest}
+    image: ${AADS_IMAGE_REGISTRY:-ghcr.io/ncnu-opensource}/aads-layer1-filter:${AADS_IMAGE_TAG:-latest}
     container_name: layer1-filter
     environment:
       - LOKI_URL=http://loki:3100
@@ -214,7 +214,7 @@ services:
     restart: unless-stopped
 
   ingester:
-    image: ${AADS_IMAGE_REGISTRY:-ghcr.io/bs10081}/aads-ingester:${AADS_IMAGE_TAG:-latest}
+    image: ${AADS_IMAGE_REGISTRY:-ghcr.io/ncnu-opensource}/aads-ingester:${AADS_IMAGE_TAG:-latest}
     container_name: ingester
     ports:
       - "8000:8000"
@@ -237,7 +237,7 @@ services:
       retries: 3
 
   log-archiver:
-    image: ${AADS_IMAGE_REGISTRY:-ghcr.io/bs10081}/aads-log-archiver:${AADS_IMAGE_TAG:-latest}
+    image: ${AADS_IMAGE_REGISTRY:-ghcr.io/ncnu-opensource}/aads-log-archiver:${AADS_IMAGE_TAG:-latest}
     container_name: log-archiver
     environment:
       - LOKI_URL=http://loki:3100
@@ -259,7 +259,7 @@ services:
     restart: unless-stopped
 
   layer2-analyzer:
-    image: ${AADS_IMAGE_REGISTRY:-ghcr.io/bs10081}/aads-layer2-analyzer:${AADS_IMAGE_TAG:-latest}
+    image: ${AADS_IMAGE_REGISTRY:-ghcr.io/ncnu-opensource}/aads-layer2-analyzer:${AADS_IMAGE_TAG:-latest}
     container_name: layer2-analyzer
     ports:
       - "8080:8080"
@@ -306,7 +306,7 @@ services:
     restart: unless-stopped
 
   layer4-executor:
-    image: ${AADS_IMAGE_REGISTRY:-ghcr.io/bs10081}/aads-layer4-executor:${AADS_IMAGE_TAG:-latest}
+    image: ${AADS_IMAGE_REGISTRY:-ghcr.io/ncnu-opensource}/aads-layer4-executor:${AADS_IMAGE_TAG:-latest}
     container_name: layer4-executor
     environment:
       - DB_HOST=timescaledb
@@ -326,7 +326,7 @@ services:
     restart: unless-stopped
 
   dashboard:
-    image: ${AADS_IMAGE_REGISTRY:-ghcr.io/bs10081}/aads-dashboard:${AADS_IMAGE_TAG:-latest}
+    image: ${AADS_IMAGE_REGISTRY:-ghcr.io/ncnu-opensource}/aads-dashboard:${AADS_IMAGE_TAG:-latest}
     container_name: dashboard
     ports:
       - "5000:5000"

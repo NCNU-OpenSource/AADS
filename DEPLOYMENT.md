@@ -11,7 +11,7 @@ Deploy the server first — it mints the token the agents need.
 **HTTPS — pull directly from GitHub (no repo checkout needed):**
 
 ```bash
-curl -fsSL https://github.com/bs10081/AADS/releases/latest/download/install-server.sh | bash
+curl -fsSL https://github.com/NCNU-OpenSource/AADS/releases/latest/download/install-server.sh | bash
 ```
 
 Downloads `aads-server.tgz` from GitHub Releases, extracts it to `~/aads`
@@ -19,7 +19,7 @@ Downloads `aads-server.tgz` from GitHub Releases, extracts it to `~/aads`
 Fully non-interactive if all vars are pre-set:
 
 ```bash
-curl -fsSL https://github.com/bs10081/AADS/releases/latest/download/install-server.sh | \
+curl -fsSL https://github.com/NCNU-OpenSource/AADS/releases/latest/download/install-server.sh | \
   AADS_LITELLM_UPSTREAM_API_KEY=sk-... bash
 ```
 
@@ -31,7 +31,7 @@ bash dist/bootstrap-server.sh
 
 Both paths interactively collect the upstream LLM API key (the only required
 value), auto-generate all other secrets, pull the prebuilt images
-(`ghcr.io/bs10081/aads-*`), start the stack, verify the database, and print
+(`ghcr.io/ncnu-opensource/aads-*`), start the stack, verify the database, and print
 the exact agent install command — with the token already filled in.
 
 > Private registry? Authenticate once before running:
@@ -45,11 +45,11 @@ Pick whichever fits your network:
 **HTTPS (recommended — pulls from public GitHub, no server port needed):**
 
 ```bash
-curl -fsSL https://github.com/bs10081/AADS/releases/latest/download/install-agent.sh | sudo \
+curl -fsSL https://github.com/NCNU-OpenSource/AADS/releases/latest/download/install-agent.sh | sudo \
   AADS_SERVER=<server-ip> \
   AADS_AGENT_TOKEN=<token> \
   AADS_ADMIN_API_KEY=<admin-key> \
-  AADS_RELEASE_BASE_URL=https://github.com/bs10081/AADS/releases/latest/download bash
+  AADS_RELEASE_BASE_URL=https://github.com/NCNU-OpenSource/AADS/releases/latest/download bash
 ```
 
 **HTTP / air-gapped (payload served by the AADS dashboard itself):**
@@ -87,7 +87,7 @@ alternatively pull from the release by setting `AADS_RELEASE_BASE_URL`.
 ## Manual / Dev Start (build locally)
 
 ```bash
-git clone https://github.com/bs10081/AADS
+git clone https://github.com/NCNU-OpenSource/AADS
 cd AADS
 cp .env.example .env   # edit secrets
 docker compose up -d --build   # builds images locally instead of pulling

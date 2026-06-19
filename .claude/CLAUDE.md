@@ -122,7 +122,7 @@ curl http://localhost:8080/health   # Layer 2 Analyzer
 ```
 
 `docker-compose.yaml` builds from source; `docker-compose.prod.yaml` pulls
-prebuilt `ghcr.io/bs10081/aads-*:${AADS_IMAGE_TAG}` images and is what the
+prebuilt `ghcr.io/ncnu-opensource/aads-*:${AADS_IMAGE_TAG}` images and is what the
 installers use. DB migrations: `scripts/db/apply-migrations.sh`.
 
 ### Deploy (release installers — the recommended path)

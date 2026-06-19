@@ -20,13 +20,13 @@ starts the Docker Compose stack, generates secrets, and prints the matching
 agent install command.
 
 ```bash
-curl -fsSL https://github.com/bs10081/AADS/releases/latest/download/install-server.sh | bash
+curl -fsSL https://github.com/NCNU-OpenSource/AADS/releases/latest/download/install-server.sh | bash
 ```
 
 For non-interactive setup, provide the upstream LLM key:
 
 ```bash
-curl -fsSL https://github.com/bs10081/AADS/releases/latest/download/install-server.sh | \
+curl -fsSL https://github.com/NCNU-OpenSource/AADS/releases/latest/download/install-server.sh | \
   AADS_LITELLM_UPSTREAM_API_KEY=sk-... bash
 ```
 
@@ -50,11 +50,11 @@ Run this on each target host. The server bootstrap prints a fully populated
 command; the shape is:
 
 ```bash
-curl -fsSL https://github.com/bs10081/AADS/releases/latest/download/install-agent.sh | sudo \
+curl -fsSL https://github.com/NCNU-OpenSource/AADS/releases/latest/download/install-agent.sh | sudo \
   AADS_SERVER=<server-ip> \
   AADS_AGENT_TOKEN=<token-from-server> \
   AADS_ADMIN_API_KEY=<admin-key-from-server> \
-  AADS_RELEASE_BASE_URL=https://github.com/bs10081/AADS/releases/latest/download bash
+  AADS_RELEASE_BASE_URL=https://github.com/NCNU-OpenSource/AADS/releases/latest/download bash
 ```
 
 For an air-gapped or lab install, the Dashboard can serve the installer and
@@ -90,7 +90,7 @@ Runtime requirements:
 | Component | Version / source |
 | --- | --- |
 | Docker Compose | v2 |
-| Custom AADS images | `ghcr.io/bs10081/aads-*:${AADS_IMAGE_TAG:-latest}` |
+| Custom AADS images | `ghcr.io/ncnu-opensource/aads-*:${AADS_IMAGE_TAG:-latest}` |
 | Python service base image | `python:3.11-slim` |
 | Loki | `grafana/loki:3.6.0` |
 | TimescaleDB | `timescale/timescaledb:latest-pg16` |
