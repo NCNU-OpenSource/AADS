@@ -1,10 +1,14 @@
 # Service-Coverage E2E — Completion Handoff
 
 **Date**: 2026-06-02
-**Branch**: `codex/ubuntu-agent-layer0-4`
+**Branch (historical)**: `codex/ubuntu-agent-layer0-4` — that work merged via
+PR #2; this handoff now lives on `feature/execution-hardening`. Treat the old
+branch name as stale.
 **Goal**: Extend AADS beyond nginx so it can detect and repair PostgreSQL,
 Redis, Docker container, and MySQL/MariaDB failures. Verification lives in
-`scripts/lab/e2e-service-repair.sh` (`SR-*` scenarios).
+`scripts/lab/e2e-service-repair.sh` (`SR-*` scenarios). Note: Docker repair
+operations are **not yet implemented** in `runner_catalog.py` — see Remaining
+work item 1.
 
 ---
 
@@ -20,17 +24,39 @@ Every supported service follows the same 4-layer pattern:
 
 ```text
 Layer 1 detect -> Layer 2 diagnose+plan -> pi-agent runner execute -> SR-* verify
-Alloy/Loki        FixingPlan 3.0 steps      argv runner on target        E2E result
+Alloy/Loki        FixingPlan 3.1 steps      argv runner on target        E2E result
 ```
 
-Supported runner operations (Layer 2 (service, operation) -> runner spec; see layer2-analyzer/src/runner_catalog.py):
+Supported runner operations (Layer 2 (service, operation) -> runner spec; see
+`layer2-analyzer/src/runner_catalog.py`). Counts are probes + mutations per
+service; there are **no** `docker` or `system` catalog entries:
 
-- nginx: 7
-- postgresql: 7
-- redis: 7
-- docker: 3
-- mysql: 7
-- system: 1
+- nginx: 7 (probes: `status`, `config_test`, `http_check`; mutations: `start`,
+  `reload`, `restore_config`, `ensure_snapshot`) — `config_test` is nginx-only
+- postgresql: 6 (probes: `status`, `connection_test`; mutations: `restart`,
+  `reload`, `restore_config`, `ensure_snapshot`)
+- redis: 6 (probes: `status`, `ping`; mutations: `restart`, `reload`,
+  `restore_config`, `ensure_snapshot`)
+- mysql: 6 (probes: `status`, `connection_test`; mutations: `restart`,
+  `reload`, `restore_config`, `ensure_snapshot`)
+
+> Re-derive these counts from source rather than trusting the list above:
+> the (service, operation) keys live in `runner_catalog.py`.
+
+### Security model
+
+The execution path is hardened by three coupled ADRs — read them before
+touching any planning or runner code:
+
+- **ADR-005** ExecutionProfile / PolicyCard — `docs/obsidian-vault/ADR/ADR-005-execution-profile-and-policy-card.md`
+- **ADR-006** drift detection / pause-escalate — `docs/obsidian-vault/ADR/ADR-006-drift-detection-pause-escalate.md`
+- **ADR-007** log-injection defense — `docs/obsidian-vault/ADR/ADR-007-log-injection-defense.md`
+- Cross-cutting audit: `docs/SECURITY_HARDENING_AUDIT.md`
+
+FixingPlan 3.1 carries a required `execution_profile` manifest generated
+deterministically by `runner_catalog.execution_profile_for` (the LLM never
+contributes to it), and the pi-agent `PolicyCard` enforces it fail-closed
+(`AADS_POLICY_MODE=enforce` by default).
 
 ---
 
@@ -52,6 +78,9 @@ SR-RD-01  PASS  terminal=kb_skipped, redis=active
 SR-RD-02  PASS  terminal=kb_skipped, redis=active
 SR-DC-01  SKIP  Docker not installed on aads-target
 SR-DC-02  SKIP  Docker not installed on aads-target
+# NOTE: even with Docker installed, SR-DC-01 cannot pass today — Layer 2
+# has no docker.* operations in runner_catalog.py, so no `docker.` plan
+# will ever be generated. See Remaining work item 1.
 SR-MY-01  PASS  terminal=kb_skipped, mysql=active
 SR-MY-02  PASS  terminal=kb_skipped, mysql=active
 
@@ -320,8 +349,13 @@ SR-RD-02 PASS terminal=kb_skipped, redis=active
 
 ## 8. Remaining work
 
-1. Install Docker on `aads-target` and create the allowed `aads-test-nginx`
-   container so `SR-DC-01` and `SR-DC-02` can run.
+1. Add Docker container repair support. This is **not** just an install step:
+   `runner_catalog.py` currently has **no** `docker.*` operations, so Layer 2
+   never emits a `docker.` plan and `SR-DC-01` can never pass even with Docker
+   present. Required work: add docker probe + mutation operations to
+   `runner_catalog.py` (and matching pi-agent wrappers / PolicyCard grants),
+   then install Docker on `aads-target` and create the allowed `aads-test-nginx`
+   container so `SR-DC-01` / `SR-DC-02` can run.
 2. Persist currently live-only lab config into repo templates:
    - target Alloy config that tails PostgreSQL, Redis, MySQL, and syslog
    - `.env.lab` multi-service `LAYER1_LOKI_QUERY`
@@ -335,9 +369,9 @@ SR-RD-02 PASS terminal=kb_skipped, redis=active
    inside the analyzer container today, so common host commands like
    `journalctl`, `ps`, `ss`, `docker`, and `curl` may be unavailable. Prefer
    target-side runner probes (argv + extractor) for deterministic evidence.
-7. Fix Nginx config repair as a complete state transition. The current
-   `restore_config` operation can leave Nginx inactive after config repair if
-   the wrapper tries to reload an inactive unit.
+7. Fix Nginx config repair as a complete state transition — see the full
+   write-up and proposed fixes in section 4 ("Known issue: Nginx partial repair
+   when service is inactive").
 
 ---
 

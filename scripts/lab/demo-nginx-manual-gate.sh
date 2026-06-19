@@ -4,7 +4,7 @@
 # This script intentionally does NOT approve or execute a plan. It prepares a
 # clean manual Dashboard demo by restoring the target baseline, optionally
 # rejecting stale pending Gate items, injecting a broken nginx.conf, and waiting
-# until the Dashboard queue shows a schema 3.0 restore plan.
+# until the Dashboard queue shows a FixingPlan restore plan (schema 3.0 or 3.1).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -252,7 +252,9 @@ def candidate_reports(started_at):
         status = report.get("plan_status")
         if status not in {"pending_approval", "approved", "queued"}:
             continue
-        if plan_schema(report) != "3.0":
+        # The System Agent now emits FixingPlan 3.1; 3.0 remains accepted by the
+        # Gate/executor for legacy plans. Accept either so the demo can find a plan.
+        if plan_schema(report) not in {"3.0", "3.1"}:
             continue
         if parse_ts(report.get("timestamp")) < started_at:
             continue

@@ -67,11 +67,51 @@ Restore runners must return a blocked result if the required known-good snapshot
 
 ## Agent Execution Model
 
-- `System Agent` stores executable `FixingPlan` JSON with `schema_version="3.0"`.
+- `System Agent` (Layer 2) emits executable `FixingPlan` JSON with `schema_version="3.1"`
+  **only**. The 3.1 schema requires an `execution_profile` manifest
+  (`layer2-analyzer/src/schemas/action_plan.py` pins `schema_version` to the literal
+  `"3.1"` and makes `execution_profile` a required field). Schema `3.0` is
+  **legacy-accepted on the consumer side only** — `validate_plan`
+  (`layer4-executor/src/executor.py`) and the Dashboard
+  (`SUPPORTED_EXECUTION_SCHEMAS = {'3.0', '3.1'}`) still parse a stored 3.0 plan,
+  but Layer 2 no longer produces one.
 - `Gate` approves, rejects, or queues execution through `POST /api/plans/{plan_id}/execute`.
 - `Knowledge Agent` runs on the controller and calls the target On-Device Agent one runner step at a time. It does not push the whole plan to the target.
 - `On-Device Agent` remains stateless for execution. It exposes `/health`, `/v1/node/facts`, `/v1/commands/run`, and the reserved `/v1/agent-tasks/run` RCA dispatch contract. Legacy `/v1/probes/run` and `/v1/actions/run` are removed in V2.
 - Verification and final verification must be runner probes with structured extractor results. Free text and LLM judgement are not valid execution checks.
+
+## Execution Security Invariants
+
+The execution path is hardened across three coupled ADRs (ADR-005/006/007; see
+`docs/SECURITY_HARDENING_AUDIT.md`). These hold by default in the lab — do not
+disable them for a demo.
+
+- **ExecutionProfile / PolicyCard (ADR-005)**: every 3.1 FixingPlan carries an
+  `execution_profile` manifest generated **deterministically** from the runner
+  catalog (`layer2-analyzer/src/runner_catalog.py::execution_profile_for`). The
+  LLM never contributes to it. The On-Device Agent's `PolicyCard`
+  (`pi-agent/src/safety_cards/policy_card.py`) enforces the manifest
+  **fail-closed**: `AADS_POLICY_MODE` defaults to `enforce` (code default — it is
+  not set in `.env.example` or compose), so a step outside the manifest is denied.
+  `AADS_POLICY_MODE=audit` only warns-but-runs and is not the lab default.
+- **Drift detection (ADR-006)**: `plan_sha256` binds execution to the exact
+  approved plan (TOCTOU guard). The Dashboard and executor compute this hash with
+  byte-identical logic; a mismatch pauses execution with
+  `drift_type='approved_plan_hash_mismatch'` instead of running a tampered plan.
+- **Pause and resume**: `paused_for_review` is a **non-terminal, recoverable**
+  state, not a failure. Failures route through `classify_step_failure`
+  (hook_denied / verification_failed / retries_exhausted) and record a row in
+  `execution_escalations` (migration 005). The Dashboard surfaces these as
+  **resume or abort** — an operator resumes after fixing the cause or aborts to
+  end the run. `failed_retryable` is likewise non-terminal.
+- **Log-injection defence (ADR-007)**: `layer2-analyzer/src/log_guard.py` is a
+  deterministic scanner + data-fence + taint registry. Log data is untrusted
+  input to the LLM; a tainted diagnosis is forced into human review
+  (`auto_execute_allowed=False`, `requires_approval=True`,
+  `security_review_required=True`) and can never auto-execute.
+- **Admin auth**: approve / execute and other mutating Gate actions require the
+  `AADS_ADMIN_API_KEY`, passed in the `X-Admin-API-Key` request header. GET
+  read endpoints are unauthenticated; only POST mutations call `require_admin`.
 
 ## Commands
 
@@ -100,7 +140,7 @@ Use `scripts/lab/deploy-target.sh` after changing `pi-agent/`, wrappers, sudoers
 
 `scripts/lab/e2e-service-repair.sh` resets target service configs from known-good snapshots before injected scenarios and verifies service recovery through the Gate/Layer 4 path. It covers PostgreSQL, Redis, Docker, and MySQL/MariaDB scenarios; Docker cases skip until Docker and the allowlisted `aads-test-nginx` container exist on the target.
 
-`scripts/lab/demo-nginx-manual-gate.sh` is the one-click classroom demo helper for the Nginx bad-config scenario. It verifies lab policy, rejects stale pending/approved Gate items, restores a known-good Nginx baseline, injects a bad `nginx.conf`, waits for a schema 3.0 restore plan, and then stops. The operator must still click Approve and Execute in the Dashboard.
+`scripts/lab/demo-nginx-manual-gate.sh` is the one-click classroom demo helper for the Nginx bad-config scenario. It verifies lab policy, rejects stale pending/approved Gate items, restores a known-good Nginx baseline, injects a bad `nginx.conf`, waits for a restore plan (the script's schema filter accepts `3.0` or `3.1`; Layer 2 emits `3.1`), and then stops. The operator must still click Approve and Execute in the Dashboard.
 
 ## Manual Gate Demo Workflow
 
@@ -115,7 +155,9 @@ bash scripts/lab/demo-nginx-manual-gate.sh
 
 The script performs the Gate-visible reset by rejecting stale pending/approved
 items, verifies the target baseline, injects the bad Nginx config, and waits for
-a new schema 3.0 restore plan. It intentionally does not approve or execute.
+a new restore plan (schema `3.1`; the script's schema filter accepts `3.0` or
+`3.1`, so the manual-gate steps work against either). It intentionally does not
+approve or execute.
 
 2. Open the Dashboard:
 
@@ -126,6 +168,14 @@ http://100.72.172.83:5000/
 3. Manually press Approve, then Execute for the restore plan shown by the
 script. Prefer a plan whose runner contains `aads-nginx-restore-known-good` or
 `nginx.restore_config`; do not execute a stale `nginx.start` item if one appears.
+Approve and Execute are admin-gated: the Dashboard sends `AADS_ADMIN_API_KEY` in
+the `X-Admin-API-Key` header, so the configured admin key must match.
+
+   If a step trips a safety card or a verification probe, the execution enters
+   `paused_for_review` (non-terminal) and the Dashboard shows **Resume** /
+   **Abort** instead of a terminal result. This is the normal recoverable path,
+   not a crash — fix the underlying cause and resume, or abort to end the run.
+   The pause is recorded in `execution_escalations`.
 
 4. Verify after Execute:
 
@@ -212,16 +262,12 @@ aads-agent: active
 
 ## 2026-06-02 Manual Gate Demo Evidence
 
-| Demo | Plan | Execution | Command | Terminal |
-| --- | --- | --- | --- | --- |
-| Nginx bad config | `diag_cluster_0_1780388144` | `exec_bf8fdb55b7e24a96b2359f8400ce9bfa` | `nginx.restore_known_good_config` | `kb_skipped` |
-| PostgreSQL stopped | `diag_cluster_0_1780388401` | `exec_5d6c0a63a5244ddb9ce32d4bd541d746` | `postgresql.restart` | `kb_skipped` |
-| Redis bad config | `diag_cluster_0_1780388700` | `exec_d545741acc924aee9eff2f343cba09fa` | `redis.restore_known_good_config` | `kb_skipped` |
-| MySQL bad config | `diag_cluster_0_1780390317` | `exec_9585cf92a913455a9b023d492a246e81` | `mysql.restore_known_good_config` | `kb_skipped` |
-
-MySQL final verification observed `accepting_connections=true`; the direct
-terminal health check showed `mysql.service` active/running and the injected
-`datadir=/nonexistent/...` marker removed from `mysqld.cnf`.
+The per-service manual-gate run table (Nginx / PostgreSQL / Redis / MySQL plan,
+execution, command, terminal) lives in
+[`docs/service-coverage-handoff.md` §3](../service-coverage-handoff.md#3-manual-gate-demo-status)
+and is not duplicated here. That section also records the MySQL final
+verification (`accepting_connections=true`, `mysql.service` active, injected
+`datadir=/nonexistent/...` marker removed from `mysqld.cnf`).
 
 ## 2026-05-27 Multipass E2E Evidence
 

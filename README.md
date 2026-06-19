@@ -41,6 +41,8 @@ Useful server environment variables:
 | `AADS_ADMIN_API_KEY` | Dashboard/Gate admin key | generated |
 | `PI_AGENT_TOKEN` | Shared server-to-agent bearer token | generated |
 | `TIMESCALEDB_PASSWORD` | TimescaleDB password | generated |
+| `AADS_POLICY_MODE` | On-device PolicyCard mode: `enforce` (fail-closed) or `audit` (warn-only) | `enforce` |
+| `ENABLE_KNOWLEDGE_BASE` | Import successful repairs into the knowledge base | `false` (lab) |
 
 ### 2. Install an On-Device Agent
 
@@ -72,9 +74,9 @@ registers the node with the server.
 ### 3. Verify
 
 ```bash
-# Server
+# Server — GET endpoints are read-only and need no admin key
 docker compose -f docker-compose.prod.yaml --env-file .env ps
-curl -H "X-Admin-API-Key: <admin-key>" http://<server>:5000/api/agents
+curl http://<server>:5000/api/agents
 
 # Target
 curl -H "Authorization: Bearer <token>" http://<target>:8090/v1/node/facts
@@ -133,7 +135,8 @@ Layer 2                                                          System Agent
                                                                  consumes anomalies
                                                                  queries Loki/Prometheus
                                                                  RCA through LiteLLM/LLM
-                                                                 emits FixingPlan 3.0
+                                                                 emits FixingPlan 3.1
+                                                                 (+ execution_profile)
 
 Layer 3                                                          Dashboard / Gate
                                                                  admin-key approval
@@ -143,7 +146,8 @@ Layer 3                                                          Dashboard / Gat
 Layer 4  On-Device Agent ◄────────────────────────────────────── Knowledge Agent
          runner.v1 HTTP API                                     layer4-executor
          argv-first Command Runner                              node locks
-         root wrappers + audit hook                             per-step execution
+         PolicyCard + root wrappers                             plan_sha256 drift guard
+         + audit hook                                           per-step execution
 ```
 
 Main server ports:
@@ -156,7 +160,12 @@ Main server ports:
 | Loki | `3100` | Log query and ingestion |
 | Layer 2 Analyzer | `8080` | System Agent health/API |
 | Ingester | `8000` | Anomaly ingestion helper |
+| LiteLLM proxy | `4000` | LLM gateway — all model calls route here |
 | TimescaleDB | `5432` | Persistent raw/anomaly/diagnosis DB |
+
+The **On-Device Agent** (`runner.v1`) listens on `8090` on each target host — it is
+installed by the agent installer, not part of the server Compose stack. The optional
+GPU LogBERT profile also exposes cAdvisor (`8081`) and the DCGM exporter (`9400`).
 
 ## Agents And Connections
 
@@ -164,7 +173,7 @@ AADS currently uses three agent roles plus the Dashboard Gate:
 
 | Agent | Runs on | Responsibility |
 | --- | --- | --- |
-| System Agent | Server, `layer2-analyzer` | Consumes `anomaly_logs`, clusters events, queries Loki/Prometheus, calls LiteLLM/LLM for RCA, and produces `FixingPlan 3.0`. |
+| System Agent | Server, `layer2-analyzer` | Consumes `anomaly_logs`, clusters events, queries Loki/Prometheus, calls LiteLLM/LLM for RCA, and produces `FixingPlan 3.1` (with the required `execution_profile` manifest). |
 | Knowledge Agent / Executor | Server, `layer4-executor` | Polls approved/queued plans from TimescaleDB, holds node locks, executes steps in order, records audit/execution state. |
 | On-Device Agent | Target host, `aads-agent` | Exposes `runner.v1`, receives per-step runner requests, executes argv-first commands through hooks and root wrappers. |
 
@@ -181,9 +190,31 @@ Connection model:
   from `/v1/node/facts`.
 
 The `runner.v1` model intentionally avoids a static command catalog as the
-long-term safety boundary. Runner requests carry argv, context, side-effect
-metadata, and audit-hook output; future safety cards can make contextual
-allow/deny decisions before execution.
+safety boundary. Runner requests carry argv, context, and side-effect metadata;
+the on-device **safety cards** make contextual allow/deny decisions before
+execution. The `PolicyCard` is shipped and **fail-closed by default**
+(`AADS_POLICY_MODE=enforce`) — see the Security model below.
+
+## Security model
+
+The execution path is hardened by three coupled ADRs (full write-up in
+[docs/SECURITY_HARDENING_AUDIT.md](docs/SECURITY_HARDENING_AUDIT.md); decision
+records ADR-005/006/007 under `docs/obsidian-vault/ADR/`):
+
+- **ExecutionProfile / PolicyCard (ADR-005)** — every `FixingPlan 3.1` carries a
+  required `execution_profile` manifest, generated deterministically from the
+  runner catalog (never by the LLM). The on-device `PolicyCard` enforces it
+  **fail-closed** (`AADS_POLICY_MODE=enforce`, the default); set `audit` to warn
+  without blocking.
+- **Drift detection (ADR-006)** — `plan_sha256` binds execution to the exact
+  approved plan (a TOCTOU guard). On hash mismatch or step failure the executor
+  moves the plan to the non-terminal `paused_for_review` status and records an
+  `execution_escalations` row; an operator then resumes or aborts from the
+  Dashboard.
+- **Log-injection defence (ADR-007)** — log data is untrusted input to the LLM. A
+  deterministic scanner (`log_guard.py`) fences external log content and taints any
+  diagnosis built from suspicious data, forcing human review (a tainted plan can
+  never auto-execute).
 
 ## Manual Dashboard Demo
 

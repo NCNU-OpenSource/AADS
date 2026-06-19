@@ -61,9 +61,9 @@ curl -fsSL http://<server>:5000/install-agent.sh | sudo \
   AADS_ADMIN_API_KEY=<admin-key> bash
 ```
 
-Both commands install the On-Device Agent (V2 runner), auto-register the node,
-and install the Alloy log forwarder. Every prompt can be pre-set via environment
-variable (see the header of `dist/install-agent.sh`).
+Both commands install the On-Device Agent (`runner.v1` API on port `8090`),
+auto-register the node, and install the Alloy log forwarder. Every prompt can be
+pre-set via environment variable (see the header of `dist/install-agent.sh`).
 
 ### 3. Verify
 
@@ -101,14 +101,43 @@ curl http://localhost:8080/health  # Layer 2 Analyzer
 - Docker & Docker Compose v2
 - (Optional) NVIDIA GPU + Container Toolkit for the GPU LogBERT profile
 
+## Security & operations
+
+- **Human-in-the-loop is mandatory.** The System Agent produces plans but never
+  auto-executes them in production — an operator approves / rejects / executes from
+  the Dashboard. Mutating Dashboard actions require `AADS_ADMIN_API_KEY` (header
+  `X-Admin-API-Key`); the server→agent channel uses the `PI_AGENT_TOKEN` bearer.
+- **Fail-closed execution.** The on-device `PolicyCard` enforces each plan's
+  `execution_profile` with `AADS_POLICY_MODE=enforce` (the default). `plan_sha256`
+  guards against tampering between approval and execution; on drift the plan moves
+  to `paused_for_review` for a resume/abort decision. Full write-up:
+  [docs/SECURITY_HARDENING_AUDIT.md](docs/SECURITY_HARDENING_AUDIT.md).
+- **Database migrations.** `scripts/db/apply-migrations.sh` applies
+  `layer0-storage/timescaledb/migrations/*.sql` in order. `AADS_DB_MIGRATION_MODE=safe`
+  (default) is additive; `destructive` drops and recreates all tables — lab only.
+- **Network exposure.** Targets' Alloy → server Loki (`3100`); executor → target
+  agent (`8090`); operators → Dashboard (`5000`). Keep these on trusted networks —
+  the agent token and admin key are the only auth on those paths.
+- All secrets live in `.env` (copy from `.env.example`); the only value you must
+  supply is the upstream LLM API key.
+
 ## Architecture
 
 ```
-Layer 0 (Collection) → Layer 1 (Filter) → Layer 2 (Analysis) → Layer 3 (Remediation)
-         ↓                    ↓                   ↓
-      Loki              PostgreSQL          Notifications
-      Prometheus        TimescaleDB
+Layer 0        Layer 1          Layer 2            Layer 3           Layer 4
+Collection  →  Filter        →  Analysis        →  Remediation    →  Execution
+               (pattern +       (System Agent)     (Dashboard/Gate)  (Executor +
+                LogBERT)                                              On-Device Agent)
+   ↓              ↓                 ↓                  ↓                 ↓
+ Alloy         anomaly_logs      RCA via LiteLLM    human approve/    runner.v1 :8090
+ Loki          (TimescaleDB)     → FixingPlan 3.1   reject/execute    PolicyCard +
+ Prometheus                      (+execution_       plan_sha256       root wrappers
+                                  profile)          drift guard
 ```
+
+Layers 0–3 run on the server (Docker Compose); Layer 4 spans the server-side
+executor and the On-Device Agent installed on each target. See
+[.claude/CLAUDE.md](.claude/CLAUDE.md) for the full cross-layer contract.
 
 ## Services
 
@@ -118,10 +147,15 @@ Layer 0 (Collection) → Layer 1 (Filter) → Layer 2 (Analysis) → Layer 3 (Re
 | Prometheus | 9090 | Metrics storage |
 | Grafana | 3000 | Visualization |
 | TimescaleDB | 5432 | Time-series database |
-| Dashboard | 5000 | Web UI |
+| LiteLLM proxy | 4000 | LLM gateway (all model calls route here) |
+| Dashboard / Gate | 5000 | Web UI + approval API |
 | Ingester | 8000 | Anomaly ingester |
-| Layer2 Analyzer | 8080 | LLM analysis webhook |
-| Alloy | 12345 | Log/metrics collector |
+| Layer 2 Analyzer | 8080 | System Agent health/API |
+| cAdvisor | 8081 | Container metrics |
+| Alloy | 12345 | Log/metrics collector (runs on targets) |
+| layer4-executor | — | Approved-plan poller (no host port) |
+| On-Device Agent | 8090 | `runner.v1` API (installed on each target) |
+| DCGM exporter | 9400 | GPU metrics (`gpu` profile, off by default) |
 
 ## Event-Driven Flow
 
@@ -143,4 +177,7 @@ Fan-out to:
 
 ## Documentation
 
-See `docs/obsidian-vault/` for complete architecture documentation.
+- [.claude/CLAUDE.md](.claude/CLAUDE.md) — architecture, layers, security model, conventions
+- [docs/AADS-System-Overview.md](docs/AADS-System-Overview.md) — system overview
+- [docs/SECURITY_HARDENING_AUDIT.md](docs/SECURITY_HARDENING_AUDIT.md) — execution-path security model
+- `docs/obsidian-vault/ADR/` — ADR-005 / 006 / 007 (execution-hardening decisions)

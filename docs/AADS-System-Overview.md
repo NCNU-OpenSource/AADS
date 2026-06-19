@@ -2,7 +2,7 @@
 
 **AI Auto Debug System** — 自動偵測、診斷、修復伺服器服務故障的系統
 
-**文件版本**: 1.1 ｜ **更新日期**: 2026-06-03 ｜ **對應分支**: `codex/ubuntu-agent-layer0-4`
+**文件版本**: 1.2 ｜ **更新日期**: 2026-06-17 ｜ **對應分支**: `feature/execution-hardening`
 
 ---
 
@@ -10,23 +10,25 @@
 
 目前 demo 環境的主要入口如下。Gate Console 是人工審批與展示修復流程的主畫面；其他服務主要用於除錯、觀測與查證。
 
+> 下表位址以 `${AADS_CONTROLLER_IP}` / `${AADS_TARGET_IP}` 佔位，實際 IP 以 `.env.lab` 與當前 lab 拓撲為準（不要把真實 IP 寫進文件或 commit）。
+
 | 用途 | 位址 | 備註 |
 |------|------|------|
-| **AADS Gate Console / Dashboard** | `http://100.72.172.83:5000/` | demo 時主要開這個；Approve 與 Execute 需輸入 Admin Key |
-| Grafana | `http://100.72.172.83:3000/` | 指標與 Loki/Grafana dashboard；compose 設定允許 anonymous viewer |
-| Prometheus | `http://100.72.172.83:9090/` | metrics 查詢與健康檢查 |
-| Loki API | `http://100.72.172.83:3100/` | Layer 1 查詢 raw log 的來源 |
-| Layer 2 Analyzer API | `http://100.72.172.83:8080/` | System Agent webhook/API |
-| cAdvisor | `http://100.72.172.83:8081/` | controller container resource metrics |
-| Target On-Device Agent | `http://100.77.197.118:8090/` | 需 Bearer token；`/health` 未帶 token 會回 401，屬正常保護 |
+| **AADS Gate Console / Dashboard** | `http://${AADS_CONTROLLER_IP}:5000/` | demo 時主要開這個；Approve 與 Execute 需輸入 Admin Key |
+| Grafana | `http://${AADS_CONTROLLER_IP}:3000/` | 指標與 Loki/Grafana dashboard；compose 設定允許 anonymous viewer |
+| Prometheus | `http://${AADS_CONTROLLER_IP}:9090/` | metrics 查詢與健康檢查 |
+| Loki API | `http://${AADS_CONTROLLER_IP}:3100/` | Layer 1 查詢 raw log 的來源 |
+| Layer 2 Analyzer API | `http://${AADS_CONTROLLER_IP}:8080/` | System Agent webhook/API |
+| cAdvisor | `http://${AADS_CONTROLLER_IP}:8081/` | controller container resource metrics（容器內 8080） |
+| Target On-Device Agent | `http://${AADS_TARGET_IP}:8090/` | 需 Bearer token；`/health` 未帶 token 會回 401，屬正常保護 |
 
 目前 lab 拓撲：
 
 | 角色 | 位址 | 說明 |
 |------|------|------|
-| Controller | `100.72.172.83` | 跑 Docker Compose stack、Gate、Layer 1/2/4、Loki、Prometheus、Grafana、TimescaleDB、LiteLLM |
-| Target | `100.77.197.118` | 被監控/被修復的節點，跑 nginx、PostgreSQL、Redis、MySQL/MariaDB、Alloy、`aads-agent` |
-| Target node id | `3bf76430-cf5d-44c6-8ff2-ee0161f73740` | Layer 1 `LAYER1_LOKI_QUERY` 與 Gate plan 會用它定位目標節點 |
+| Controller | `${AADS_CONTROLLER_IP}` | 跑 Docker Compose stack、Gate、Layer 1/2/4、Loki、Prometheus、Grafana、TimescaleDB、LiteLLM |
+| Target | `${AADS_TARGET_IP}` | 被監控/被修復的節點，跑 nginx、PostgreSQL、Redis、MySQL/MariaDB、Alloy、`aads-agent` |
+| Target node id | `${AADS_TARGET_NODE_ID}` | Layer 1 `LAYER1_LOKI_QUERY` 與 Gate plan 會用它定位目標節點 |
 
 > **Secret 原則**：Dashboard 的 Admin Key 與 pi-agent Bearer token 只放在本機 `.aads-lab-admin-key` / `.aads-lab-token` 或 controller `.env.lab`，不要寫進文件或 commit。
 
@@ -44,7 +46,7 @@ AADS 是一套「**觀測 → 診斷 → 修復**」的自動化閉環系統。�
 | 可控 | 人工審批閘道、30 分鐘授權窗口、idempotency key |
 | 可回復 | 每個修復前先建立 known-good 快照，失敗自動 rollback |
 | 可恢復 | 執行器狀態存 DB，crash 後從 DB 而非記憶體恢復 |
-| 防注入 | LLM 產出 (service, operation)→runner spec，affected_service 來自觀測標籤；hook+audit 為新邊界 |
+| 防注入 | LLM 產出 (service, operation)→runner spec，affected_service 來自觀測標籤；ExecutionProfile/PolicyCard fail-closed 強制 + `log_guard` taint→強制人工審查 |
 
 ---
 
@@ -59,12 +61,12 @@ AADS 是一套「**觀測 → 診斷 → 修復**」的自動化閉環系統。�
 | On-Device Agent | FastAPI 0.109、Uvicorn 0.27、Pydantic 2.12+、Python `subprocess.run(shell=False)`、systemd、root runner wrapper、service wrapper scripts | target 端 `/health`、`/v1/node/facts`、`/v1/commands/run`；所有修復動作以 argv runner spec 執行 |
 | Layer 0 日誌與長期儲存 | Grafana Alloy、Grafana Loki 3.6、TimescaleDB/PostgreSQL 16、Python log-archiver、aiohttp、asyncpg | Alloy tail target log；Loki 作短期查詢；log-archiver 將 raw logs 落到 TimescaleDB `raw_logs` |
 | Layer 1 異常過濾 | Python、asyncpg、aiohttp、requests、Drain3、PyTorch 2.1、Transformers 4.35、NumPy、PyYAML、FastAPI/Uvicorn（ingester） | `layer1-filter` 主動輪詢 Loki；`ingester` 被動接收 fan-out；pattern filter 與可選 LogBERT 寫入 `anomaly_logs` |
-| Layer 2 System Agent | FastAPI、Uvicorn、asyncpg、aiohttp、Pydantic 2.7、OpenAI Python SDK、LangChain、LangGraph、langchain-openai、LiteLLM、可選 Ollama | 消費 anomaly、聚合 cluster、用 LLM 做 RCA、產生展示用 `ClaudeStylePlan` 與可執行 `FixingPlan 3.0` |
+| Layer 2 System Agent | FastAPI、Uvicorn、asyncpg、aiohttp、Pydantic 2.7、OpenAI Python SDK、LangChain、LangGraph、langchain-openai、LiteLLM、可選 Ollama | 消費 anomaly、聚合 cluster、用 LLM 做 RCA、產生展示用 `ClaudeStylePlan` 與可執行 `FixingPlan 3.1`（含確定性產生的 `execution_profile`） |
 | Layer 3 建議/通知 | Python suggestion generator、notification hub、Slack/Webhook | 舊 Layer 3 已併入 Layer 2 `_run_layer3()`；負責修復建議與通知，不再獨立啟動 |
 | Layer 4 Knowledge Agent / Executor | Python、asyncpg、aiohttp、Pydantic、DB-driven state machine | 無 LLM import；從 DB 取 queued execution，拿 node lock，逐步呼叫 target `/v1/commands/run` |
 | Observability | Prometheus、Grafana、cAdvisor、DCGM Exporter（GPU profile）、Grafana Alloy debug UI | 提供 metrics、container resource、GPU metrics 與 dashboard 視覺化 |
 | LLM Gateway | LiteLLM、OpenAI-compatible upstream API、可選 Ollama | 統一模型 API；Layer 2 只打 `http://litellm:4000/v1` |
-| Database / Schema | TimescaleDB hypertable、PostgreSQL JSONB、migrations `000`-`004` | 12 張核心表：logs、anomalies、diagnosis、approvals、executions、locks、audit、agent registry、knowledge cases |
+| Database / Schema | TimescaleDB hypertable、PostgreSQL JSONB、migrations `000`-`005` | 13 張核心表：logs、anomalies、diagnosis、approvals、executions、locks、audit、agent registry、knowledge cases，外加 `execution_escalations`（drift/暫停佇列，migration 005）；005 同時為 `plan_approvals` 加上 `plan_sha256` 欄位 |
 | 測試 / Demo | pytest、pytest-asyncio、curl、psql、Bash E2E scripts、macOS `gtimeout` fallback | 單元測試覆蓋 runner/executor/L2；`chaos-e2e.sh` 與 `e2e-service-repair.sh` 用於自動驗證；`demo-nginx-manual-gate.sh` 用於手動 Dashboard demo |
 
 **Dashboard 前端特性**：
@@ -82,9 +84,9 @@ AADS 是一套「**觀測 → 診斷 → 修復**」的自動化閉環系統。�
 1. Target 上的 Alloy tail nginx/PostgreSQL/Redis/MySQL/syslog，將 log 推到 controller Loki。
 2. `layer1-filter` 用 `LAYER1_LOKI_QUERY={node_id="..."}` 輪詢 Loki，把異常寫入 TimescaleDB `anomaly_logs`。
 3. `layer2-analyzer` 每 30 秒消費 anomaly，聚合成 cluster，呼叫 LiteLLM/LLM 做 RCA。
-4. Layer 2 先產生展示用 `ClaudeStylePlan`，再用 deterministic post-process 轉為 `FixingPlan 3.0`。
+4. Layer 2 先產生展示用 `ClaudeStylePlan`，再用 deterministic post-process 轉為 `FixingPlan 3.1`（由 `runner_catalog.execution_profile_for` 確定性產生 `execution_profile` 權限清單）。
 5. `diagnosis_reports` 出現 `pending_approval`，Dashboard Queue 會顯示一筆可審批 plan。
-6. Operator 在 Dashboard 輸入 Admin Key，按 **Approve**，Gate 寫入 `plan_approvals` 與 audit event。
+6. Operator 在 Dashboard 輸入 Admin Key，按 **Approve**，Gate 寫入 `plan_approvals`（含 `plan_sha256` 綁定當下 plan 內容）與 audit event。
 7. Operator 再按 **Execute**，前端送 `Idempotency-Key`；Gate 建立 `plan_executions(status=queued)`。
 8. `layer4-executor` 取得 queued execution，先拿 `node_locks`，執行 pre-execution snapshot。
 9. Executor 按順序呼叫 target `/v1/commands/run`，target 以 argv runner + hook/audit + sudo root runner 實作修復。
@@ -117,7 +119,7 @@ AADS 是一套「**觀測 → 診斷 → 修復**」的自動化閉環系統。�
 │ Agent       │  (Alloy) │  Filter      │             │  (Layer 2)    │
 │ (pi-agent)  │          │  異常過濾     │             │  LLM 根因分析  │
 └─────────────┘          └──────────────┘             └───────┬───────┘
-      ▲                                                        │ FixingPlan 3.0
+      ▲                                                        │ FixingPlan 3.1
       │ runner API                                              ▼
       │ (/v1/commands/run)                              ┌─────────────────┐
       │                                               │  Gate           │
@@ -145,14 +147,14 @@ AADS 是一套「**觀測 → 診斷 → 修復**」的自動化閉環系統。�
 | **L0 收集** | auditd / logrotate 設定 | `layer0-collector/{auditd,logrotate}/` | T | 目標主機的稽核與輪替設定 |
 | **L1 過濾** | `layer1-filter` | `layer1-filter/src/` | C | 輪詢 Loki → pattern/LogBERT 過濾 → 寫 `anomaly_logs` |
 | **L1 過濾** | `ingester` | `layer1-filter/ingester/` | C | Fan-out Sink A：接收 Alloy HTTP POST → 寫 `anomaly_logs` |
-| **L2 診斷** | `layer2-analyzer`（System Agent） | `layer2-analyzer/src/` | C | 消費異常 → LLM 根因分析 → 產生 FixingPlan 3.0 |
+| **L2 診斷** | `layer2-analyzer`（System Agent） | `layer2-analyzer/src/` | C | 消費異常 → LLM 根因分析 → 產生 FixingPlan 3.1（含 `execution_profile`） |
 | **L2 診斷** | `litellm` | （image）+ `litellm/` | C | LLM 閘道/代理（System Agent 透過它呼叫模型） |
 | **L3 建議/通知** | （已併入 L2）SuggestionGenerator + NotificationHub | `layer2-analyzer/src/{suggestion_generator,notification_hub}.py` | C | 產生修復建議、發通知；由 L2 的 `_run_layer3()` 呼叫 |
 | **L3（舊版獨立）** | 原 layer3-remediation | `layer3-remediation/` | — | **已被 L2 取代**，未啟動為服務（保留參考） |
 | **Gate 閘道** | `dashboard`（Gate Console） | `dashboard/` | C | 人工審批：approve / reject / execute |
 | **L4 執行** | `layer4-executor`（Knowledge Agent） | `layer4-executor/src/executor.py` | C | 確定性順序執行器，per-step 呼叫 On-Device Agent |
 | **目標代理** | On-Device Agent | `pi-agent/` | T | argv command runner + hook/audit，實際在目標機執行 runner spec |
-| **資料層** | `timescaledb` | （image） | C | 12 張表的狀態與稽核儲存 |
+| **資料層** | `timescaledb` | （image） | C | 13 張表的狀態與稽核儲存（含 `execution_escalations`） |
 | **觀測支援** | Prometheus / cadvisor / dcgm-exporter / Grafana | （images） | C | 指標收集與視覺化（供 L2 metrics 關聯用） |
 
 > **三個容易混淆的點**：
@@ -164,10 +166,10 @@ AADS 是一套「**觀測 → 診斷 → 修復**」的自動化閉環系統。�
 
 ### 2.1 On-Device Agent （`pi-agent/` ｜ 目標代理 ｜ 跑在 target VM）
 
-> **V2（runner.v1）**：已用 **argv-first Command Runner + context-aware Hook** 取代舊的
+> **runner.v1**：已用 **argv-first Command Runner + context-aware Hook** 取代舊的
 > catalog command whitelist。安全邊界不再是「`command_id` 是否在 catalog」，而是每次
-> execution 的完整 **runner spec + context + hook 決策 + append-only audit**。詳見
-> [`docs/runner-v2-plan.md`](runner-v2-plan.md)。
+> execution 的完整 **runner spec + context + PolicyCard/hook 決策 + append-only audit**。
+> Agent 自報 `runner_capabilities.schema_version="runner.v1"`（`AGENT_VERSION='2.1.0'`）。
 
 跑在**目標主機**上的無狀態代理（FastAPI），暴露一個 **full-power argv command runner**。它從不接受任意 shell（argv 以 `shell=False` 執行）；特權操作（`as_root=true`）透過**單一** root runner wrapper 完成。
 
@@ -177,15 +179,19 @@ AADS 是一套「**觀測 → 診斷 → 修復**」的自動化閉環系統。�
 - `POST /v1/commands/run` — 執行一個 runner spec（取代 `/v1/probes/run` + `/v1/actions/run`）
 - `POST /v1/agent-tasks/run` — 保留給未來的 target-side RCA（v1 未啟用）
 
-**安全邊界（V2）**：
-1. **Hook + Audit**：每次 execution 經 `before_run → execute → after_run`；v1 內建 `AuditHook`（allow + 完整稽核），safety card 之後可 `deny`
+**安全邊界（runner.v1）**：
+1. **PolicyCard + Hook + Audit**：每次 execution 經 `before_run → execute → after_run`；
+   `PolicyCard`（`pi-agent/src/safety_cards/policy_card.py`）已上線，依 plan 的 `execution_profile`
+   做 **fail-closed** 比對——預設 `AADS_POLICY_MODE=enforce`，profile 不允許的 argv 直接 `deny`；
+   `audit` 模式只警告但放行（debug 用）。`AuditHook` 仍負責 append-only 稽核。
 2. **side_effect 驅動鎖**：`runner.side_effect=mutate` 才取 node lock / 觸發 snapshot（不靠 `as_root` 推斷）
 3. **單一 root runner + sudoers**：特權只走一個 root-owned wrapper，sudoers 只授權它
 
 > **Legacy removal note**：舊的三層邊界是 catalog 白名單 + arg_allowlist + 每個 wrapper 的
 > exact-command sudoers。單純 command whitelist 不具 context-aware safety，已移除。OS 層的
-> exact-command 防線刻意降級為單一 root runner，改由 app 層 hook/audit 承接——**test lab 可接受，
-> 正式環境前須補 safety card deny 規則**。
+> exact-command 防線降級為單一 root runner，改由 app 層的 **PolicyCard + hook/audit** 承接——
+> `PolicyCard` 預設 fail-closed (`enforce`)，profile 是 exact-command grant（`allow_extra_args=False`），
+> 因此 `systemctl is-active nginx` 不會授權 `systemctl stop nginx`。詳見下方 ADR-005。
 
 **Runner operations（Layer 2 `(service, operation)` → runner spec 對照，見 `layer2-analyzer/src/runner_catalog.py`）**：
 
@@ -195,9 +201,13 @@ AADS 是一套「**觀測 → 診斷 → 修復**」的自動化閉環系統。�
 | 服務 | read（驗證/probe） | mutate（修復，as_root） |
 |------|--------------------|--------------------------|
 | nginx | status, config_test, http_check | start, reload, restore_config, ensure_snapshot |
-| postgresql | status, connection_test, config_test | restart, reload, restore_config, ensure_snapshot |
-| redis | status, ping, config_test | restart, reload, restore_config, ensure_snapshot |
-| mysql | status, connection_test, config_test | restart, reload, restore_config, ensure_snapshot |
+| postgresql | status, connection_test | restart, reload, restore_config, ensure_snapshot |
+| redis | status, ping | restart, reload, restore_config, ensure_snapshot |
+| mysql | status, connection_test | restart, reload, restore_config, ensure_snapshot |
+
+> `config_test` 是 **nginx 專屬** probe（`nginx -t`）。其他服務沒有 `config_test`，
+> 改用 `connection_test`（pg/mysql）或 `ping`（redis）做修復後驗證。nginx 共 7 個 op
+> （3 probe + 4 mutation），pg/redis/mysql 各 6 個。catalog 中沒有 docker / system op。
 
 驗證採 **argv + 宣告式 extractor**：`is-active`→`{active=true}`、`curl -w %{http_code}`→`{http_code=200}`、
 `redis-cli ping`→`{pong=true}`、`pg_isready`/`mysqladmin ping`→`{returncode=0}`/`{alive=true}`。
@@ -227,10 +237,13 @@ AADS 是一套「**觀測 → 診斷 → 修復**」的自動化閉環系統。�
 - 查詢由 `LAYER1_LOKI_QUERY` 控制。**已從 `{source="target-nginx"}` 改為 `{node_id="..."}`** 以涵蓋節點上所有服務。
 - Loki 查詢使用 forward direction + batch limit；游標必須推進到「本批最新 log timestamp」而不是 poll end，避免高流量窗口跳過後段錯誤 log（Redis bad-config 曾踩到此問題）。
 - 上游 Loki 不可用時靜默降級，不產生誤報（見 Chaos CM-03）。
+- **生產用 LogBERT 就在 `layer1-filter`**：`src/filters/logbert_filter.py` 與 pattern filter 經 `_run_fusion`（規則 `pattern_or_logbert`）融合後，結果直接寫 TimescaleDB `anomaly_logs`（不是 JSON、也不 push 回 Loki）。layer1 硬寫 `device='cpu'`，torch 缺席時 graceful degrade（只跑 pattern filter）。repo 內另有獨立的 `logbert/` 原型（GPU、JSON 輸出、push Loki）與此不同，勿混用。
 
 ### 2.4 Layer 2：System Agent（`layer2-analyzer/` ｜ container `layer2-analyzer` + `litellm` ｜ 跑在 C）
 
-LLM **只用於**根因分析（RCA）+ 產生可審批的 FixingPlan 3.0 + self-check。這是整個系統最複雜的元件，子模組如下：
+LLM **只用於**根因分析（RCA）+ 產生可審批的 FixingPlan 3.1 + self-check。這是整個系統最複雜的元件，子模組如下：
+
+> Layer 2 只發 **3.1**（`schemas/action_plan.py` 把 `schema_version` 釘成 `Literal["3.1"]`，且 `execution_profile` 為必填——model 會直接拒絕 3.0）。3.0 只在「消費端」被向下相容接受。LLM 透過 `langchain_openai.ChatOpenAI` 連到 `LLM_BASE_URL`（compose 預設 `http://litellm:4000/v1`，即 LiteLLM 代理），用的是 OpenAI SDK client 但 base_url 指向代理，因此「不直接打 provider」仍成立。
 
 | 子模組 | 檔案 | 職責 |
 |--------|------|------|
@@ -241,7 +254,9 @@ LLM **只用於**根因分析（RCA）+ 產生可審批的 FixingPlan 3.0 + self
 | 指標關聯 | `root_cause_analyzer/metrics_correlator.py` | 從 Prometheus 拉 CPU/記憶體/GPU 佐證 |
 | 原始日誌 | `raw_log_fetcher.py` | 取回 cluster 對應的原始 log 供 LLM 參考 |
 | 計畫組裝 | `main.py`（orchestrator） | `_ensure_lab_node_agent_steps` / `_to_fixing_plan` 等（見下方流程） |
-| Schema | `schemas/action_plan.py` | Pydantic：`ClaudeStylePlan`（展示用）、`FixingPlan` 3.0（執行用，runner-based）、`RootCauseReport` |
+| Schema | `schemas/action_plan.py` | Pydantic：`ClaudeStylePlan`（展示用）、`FixingPlan` 3.1（執行用，runner-based，含 `execution_profile`）、`ExecutionProfile`、`RootCauseReport`；內含一份 `profile_allows()`（與 pi-agent 同名函式 verdict 對齊，見 `tests/test_parity.py`） |
+| ExecutionProfile 產生器 | `runner_catalog.py::execution_profile_for` | 從 catalog 自己發出的 runner spec + 靜態路徑表，**確定性**產生權限 manifest，LLM 不參與 |
+| 日誌注入防護 | `log_guard.py` | 確定性 regex scanner + `fence()` 資料圍欄 + contextvars taint registry（ADR-007） |
 | **L3 子階段** | `suggestion_generator.py`、`notification_hub.py` | 診斷後 `_run_layer3()` 產生建議 + 發通知（原 Layer 3，已併入此處） |
 
 **計畫組裝流程（`main.py`）**：
@@ -249,25 +264,48 @@ LLM **只用於**根因分析（RCA）+ 產生可審批的 FixingPlan 3.0 + self
 2. LLM Agent 分析產生 `ClaudeStylePlan`（展示用 TODO List）
 3. `_ensure_lab_node_agent_steps()`：**確定性後處理**，依異常訊息/服務標籤偵測服務（nginx/pg/redis/mysql），注入對應 (service, operation) 步驟
    - 服務停止 → `<svc>.restart` / `nginx.start`（轉成 runner spec）
-   - **特定** config error 訊號（invalid line、syntax error、can't open config、MySQL `data dir not found` / `invalid datadir`…）→ `<svc>.restore_known_good_config`
-4. `_to_fixing_plan()`：轉成 schema 3.0 可執行 FixingPlan（runner spec + extractor 驗證）
+   - **特定** config error 訊號（invalid line、syntax error、can't open config、MySQL `data dir not found` / `invalid datadir`…）→ `<svc>.restore_config`（還原 known-good config）
+4. `_to_fixing_plan()`：轉成 schema 3.1 可執行 FixingPlan（runner spec + extractor 驗證 + `execution_profile`）
+   - `execution_profile`：由 `runner_catalog.execution_profile_for()` **確定性**從 plan 的 runner spec + 靜態路徑表產生（`profile_version='1.0'`、`generated_by='runner_catalog'`，含 `allowed_commands[]` / `path_permissions[]`），LLM 不參與
    - `pre_execution_snapshot`：**service-aware**，`_snapshot_command_for()` 依服務選 `<svc>.ensure_config_snapshot`
    - `final_verification`：**service-aware**，`_final_verification_for()` 依服務選 `<svc>.connection_test` / `redis.ping` / `nginx.http_check`
-5. Pydantic 驗證後寫入 `diagnosis_reports`
+5. **Taint 覆寫（ADR-007）**：若工具輸出被 `log_guard` 判定有 injection-shaped 內容，`analyze_cluster` 會在 `_to_fixing_plan` 之後覆寫 `environment_policy` 三個 key——`auto_execute_allowed=False`、`requires_approval=True`、`security_review_required=True`，被污染的 plan 永遠無法自動執行，強制人工在 Gate 審查。
+6. Pydantic 驗證後寫入 `diagnosis_reports`
 
-**防注入**：`affected_service` 只能來自觀測標籤；LLM 不能直接送 shell command，只能經 Layer 2 deterministic post-process 轉成 `(service, operation)`，再由 `runner_catalog.py` 產生固定 argv runner spec；日誌一律視為資料。
+**防注入**：`affected_service` 只能來自觀測標籤；LLM 不能直接送 shell command，只能經 Layer 2 deterministic post-process 轉成 `(service, operation)`，再由 `runner_catalog.py` 產生固定 argv runner spec；日誌一律視為**不可信輸入**並以 `fence()` 圍欄後才餵給 LLM。工具來源標籤為 `loki` / `prometheus` / `diagnostic_command`。
 
-**重要**：若產生不出可執行步驟，會 fallback 成 schema 1.0（`*_fallback` diagnosis_id），Gate 會拒絕審批 → 代表 L2 某處出錯（過去遇過：空 `affected_service`/`root_cause` 觸發 Pydantic 例外）。
+**重要**：若產生不出可執行步驟，會 fallback 成非執行用 schema（`*_fallback` diagnosis_id），Gate 會拒絕審批 → 代表 L2 某處出錯（過去遇過：空 `affected_service`/`root_cause` 觸發 Pydantic 例外）。
 
 ### 2.5 Gate：審批閘道（`dashboard/` ｜ container `dashboard` ｜ 跑在 C）
 
 人工審批閘道（Flask + Direction-B 兩欄式 Console UI）。
 
-- **Admin-key 認證**（`X-Admin-API-Key`）
+- **Admin-key 認證**（`X-Admin-API-Key`）：只有 POST mutation 需要；GET 讀取端點不需 admin key
 - **approve / reject / execute** 三個動作
 - **30 分鐘授權窗口**：approve 後逾時 execute 會被 403 拒絕（見 Chaos CM-05）
 - **Idempotency 矩陣**：同 key 重送回 200/400/409
-- **Schema 3.0 guard**：approve 與 execute 都檢查 plan 必須是 schema 3.0 且有可執行步驟，否則拒絕
+- **Schema guard**：`SUPPORTED_EXECUTION_SCHEMAS = {'3.0', '3.1'}`（向下相容接受兩者；標準產出為 `SUPPORTED_EXECUTION_SCHEMA = '3.1'`）。approve / execute 都檢查 plan schema 在支援集合內且有可執行步驟，否則拒絕。
+- **`plan_sha256`（TOCTOU 守門）**：approve 時 Gate 算 `plan_sha256(plan)` 並寫入 `plan_approvals.plan_sha256`，把審批綁定到「當下被核可的確切 plan 內容」。雜湊定義為 `sha256(json.dumps(plan, sort_keys=True, separators=(',', ':')))`，Dashboard 與 Executor 兩份實作必須 **byte-identical**（第三條 parity coupling）。Executor 執行前重算，若不符即 **pause**，drift 記為 `approved_plan_hash_mismatch`（ADR-006）。
+
+#### ADR-005：ExecutionProfile / PolicyCard（fail-closed 權限 manifest）
+
+- FixingPlan 3.1 攜帶一份必填 `execution_profile` manifest，由 `runner_catalog.execution_profile_for` **確定性**產生（`profile_version='1.0'`、`generated_by='runner_catalog'`），LLM 完全不參與。
+- 每個 grant 都是 **exact-command grant**（`allow_extra_args=False`）：完整 argv 被釘死，`systemctl is-active nginx` 永遠不會授權 `systemctl stop nginx`，`curl <probe-url>` 也不會授權其他 curl。
+- pi-agent 的 `PolicyCard`（`pi-agent/src/safety_cards/policy_card.py`）以此 manifest **fail-closed** 執行；預設 `AADS_POLICY_MODE=enforce`（不在允許清單→deny；`audit` 模式只警告但放行）。`AADS_POLICY_MODE` 未列在 `.env.example` 或 compose，僅以程式碼預設值生效。
+- `profile_allows()` 有兩份拷貝（layer2 與 pi-agent 各一），`layer2-analyzer/tests/test_parity.py` 釘住兩者**判定結果一致**（verdict 相同，非逐字相同——docstring 本就不同）。改一份就要改另一份。
+
+#### ADR-006：Drift 偵測與可恢復暫停
+
+- `plan_sha256` 是 TOCTOU 守門（見上）；任何審批後 plan 被改動都會在執行前被擋下。
+- `paused_for_review` 是 **非終態**：執行可在人工裁決後 resume 或 abort。
+- 暫停事件寫入 `execution_escalations`（migration 005）。`drift_type` 列舉：`approved_plan_hash_mismatch` / `policy_violation` / `verification_failed` / `step_retries_exhausted` / `final_verification_failed` / `unrecoverable_step_state`；`status` = `open` | `resolved`；`resolution` = `resumed` | `aborted` | `rediagnosed`（`rediagnosed` 保留未用）；`severity` 固定 `high`；`escalation_id` 為 `esc_<uuid>`。
+- 失敗經 `classify_step_failure`（executor）分類後路由（hook_denied / verification_failed / retries_exhausted → pause/escalate），在 Dashboard 以 **resume / abort** 呈現。
+
+#### ADR-007：日誌注入防護（log_guard）
+
+- `layer2-analyzer/src/log_guard.py` = 確定性 regex scanner + `fence()` 資料圍欄 + contextvars taint registry。
+- 所有會吸收外部 log 資料的 agent 工具都被包起來；日誌是餵給 LLM 的**不可信輸入**，必須保持圍欄。
+- 一旦偵測到注入訊號，被污染的診斷會在 `analyze_cluster` 中被覆寫成強制人工審查（`auto_execute_allowed=False` / `requires_approval=True` / `security_review_required=True`），永遠無法自動執行。生產環境本來就以 schema 層級禁止 auto-execution（prod 計畫不可 auto-executable）。
 
 ### 2.6 Layer 4：Knowledge Agent / Executor（`layer4-executor/` ｜ container `layer4-executor` ｜ 跑在 C）
 
@@ -275,26 +313,30 @@ LLM **只用於**根因分析（RCA）+ 產生可審批的 FixingPlan 3.0 + self
 
 **執行流程**：
 1. 取得 node lock（TTL = max(timeout×2, 120s)，finally 釋放，啟動時 sweep 過期 lock）
-2. `pre_execution_snapshot`：先建立 known-good 快照；無快照且 `on_failure=block` → 阻擋
-3. 依序執行每個 step 的 runner spec（per-step `POST /v1/commands/run`）
-4. 每步有 verification；失敗依 `on_failure` 決定 rollback 或 abort
-5. `final_verification` 確認整體修復成功
-6. 終態寫入 `plan_executions.status`
+2. **重算 `plan_sha256`** 與審批時的 hash 比對；不符即 pause（`approved_plan_hash_mismatch`，ADR-006 TOCTOU 守門）
+3. `validate_plan`：`SUPPORTED_PLAN_SCHEMAS = {'3.0', '3.1'}`；當 `schema_version=='3.1'` 時，`execution_profile.allowed_commands` 為必填，缺則 `missing_execution_profile`
+4. `pre_execution_snapshot`：先建立 known-good 快照；無快照且 `on_failure=block` → 阻擋
+5. 依序執行每個 step 的 runner spec（per-step `POST /v1/commands/run`）
+6. 每步有 verification；失敗經 `classify_step_failure` 分類後決定 rollback / abort / **pause**（hook_denied / verification_failed / retries_exhausted → pause + 寫 `execution_escalations`）
+7. `final_verification` 確認整體修復成功
+8. 終態寫入 `plan_executions.status`
 
-**終態（terminal states）**：
-`kb_skipped`（成功但不匯入知識）、`kb_imported`、`final_verified`、`blocked`（被安全規則擋下）、`failed_retryable`（暫時性失敗，可重試）、`execution_failed`、`execution_failed_unknown_state`
+**終態（`TERMINAL_STATUSES`，`executor.py`）**：
+`final_verified`、`kb_imported`、`kb_skipped`（成功但不匯入知識，`ENABLE_KNOWLEDGE_BASE=false` 時為正常成功）、`kb_import_failed`、`execution_failed`、`execution_failed_unknown_state`、`blocked`（被安全規則擋下）。
 
-### 2.7 資料層：TimescaleDB（container `timescaledb` ｜ 跑在 C ｜ 12 張表）
+**非終態**：`paused_for_review`（等人工 resume / abort）與 `failed_retryable`（暫時性失敗，可重試）都**不是**終態。
 
-跨所有層的狀態與稽核儲存。各表大致歸屬：
+### 2.7 資料層：TimescaleDB（container `timescaledb` ｜ 跑在 C ｜ 13 張表）
+
+跨所有層的狀態與稽核儲存。Schema 由 `migrations/000`-`005` 定義（000 建 12 張表；005 新增第 13 張表 `execution_escalations`，並為 `plan_approvals` 加上 `plan_sha256` 欄位）。各表大致歸屬：
 
 | 層 | 表 |
 |----|-----|
 | L0 | `raw_logs` |
 | L1 | `anomaly_logs` |
 | L2 | `diagnosis_reports`、`knowledge_cases` |
-| Gate | `plan_approvals`、`idempotency_records` |
-| L4 | `plan_executions`、`execution_steps`、`node_locks` |
+| Gate | `plan_approvals`（含 `plan_sha256`）、`idempotency_records` |
+| L4 | `plan_executions`、`execution_steps`、`node_locks`、`execution_escalations`（drift/暫停佇列） |
 | 跨層 | `agent_nodes`（節點/runner_capabilities 註冊）、`agent_tasks`、`audit_events`（全程稽核） |
 
 ---
@@ -304,8 +346,8 @@ LLM **只用於**根因分析（RCA）+ 產生可審批的 FixingPlan 3.0 + self
 每個受支援的服務都遵循同一套模式（這是擴展新服務的範本）：
 
 ```
-Layer 1 (偵測)      →  Layer 2 (診斷+計畫)      →  pi-agent runner (執行)      →  E2E 測試 (驗證)
-Alloy 收集日誌        FixingPlan 3.0 步驟          argv runner + hook/audit      SR-* 場景
+Layer 1 (偵測)      →  Layer 2 (診斷+計畫)      →  pi-agent runner (執行)            →  E2E 測試 (驗證)
+Alloy 收集日誌        FixingPlan 3.1 步驟          argv runner + PolicyCard/hook/audit  SR-* 場景
 LOKI_QUERY 過濾       service-aware 後處理         root runner + wrapper policy
 ```
 
@@ -325,15 +367,17 @@ LOKI_QUERY 過濾       service-aware 後處理         root runner + wrapper po
 
 | 機制 | 防範的風險 |
 |------|-----------|
-| argv runner + hook/audit + 無任意 shell | LLM 幻覺指令（v1 audit-only，safety card 待補） |
+| argv runner + PolicyCard(fail-closed) + hook/audit + 無任意 shell | LLM 幻覺指令（`AADS_POLICY_MODE=enforce` 預設，profile 外的 argv 直接 deny；ADR-005） |
+| ExecutionProfile exact-command grant（`allow_extra_args=False`） | probe 指令被偷換成 mutation（`is-active`→`stop`）；LLM 不參與 profile 產生 |
+| `plan_sha256` TOCTOU 守門 | 審批後 plan 被竄改（執行前重算不符即 pause，`approved_plan_hash_mismatch`；ADR-006） |
+| `log_guard` taint → 強制人工審查 | 日誌注入操縱 LLM 診斷（被污染的 plan 永不自動執行；ADR-007） |
 | root-owned wrapper + 單一 root runner sudoers grant | 提權、wrapper 被竄改、任意 sudo command |
-| wrapper-level allowlist（如 docker 容器白名單） | 對非授權目標執行動作 |
 | pre-execution snapshot 強制 | 在沒有回滾基準的狀態下亂動（CM-07 / SR-PG-03） |
 | 30 分鐘授權窗口 | 過期授權被利用（CM-05） |
 | node lock | 並行修復互相干擾（CM-06） |
 | DB-driven 恢復 | executor crash 後重複執行（CM-02） |
 | 上游故障靜默降級 | 資料來源斷裂時誤判/誤修（CM-03 / CM-04） |
-| 失敗釋放 lock + failed_retryable | network/agent 故障造成 lock 洩漏（CM-01 / CM-08） |
+| 失敗釋放 lock + failed_retryable（非終態，可重試） | network/agent 故障造成 lock 洩漏（CM-01 / CM-08） |
 
 ---
 
@@ -341,10 +385,12 @@ LOKI_QUERY 過濾       service-aware 後處理         root runner + wrapper po
 
 ### 5.1 目前 demo lab（PVE/Tailscale reachable）
 
-- **Controller**（`100.72.172.83`）：跑所有 Docker 服務（Layer 1/2/4、Gate、Loki、Grafana、Prometheus、TimescaleDB、LiteLLM 等）
-- **Target**（`100.77.197.118`）：被監控的目標主機，跑 On-Device Agent + 業務服務（nginx、postgresql、redis、mysql）+ Alloy
-- **Dashboard**：`http://100.72.172.83:5000/`
-- **Target node id**：`3bf76430-cf5d-44c6-8ff2-ee0161f73740`
+> 真實 IP 與 node id 以 `.env.lab` 與當前 lab 拓撲為準，請勿寫進文件或 commit。下方以佔位符表示。
+
+- **Controller**（`${AADS_CONTROLLER_IP}`）：跑所有 Docker 服務（Layer 1/2/4、Gate、Loki、Grafana、Prometheus、TimescaleDB、LiteLLM 等）
+- **Target**（`${AADS_TARGET_IP}`）：被監控的目標主機，跑 On-Device Agent + 業務服務（nginx、postgresql、redis、mysql）+ Alloy
+- **Dashboard**：`http://${AADS_CONTROLLER_IP}:5000/`
+- **Target node id**：`${AADS_TARGET_NODE_ID}`
 - **Gate policy**：demo 應維持 `AADS_FORCE_GATE_APPROVAL=true`，讓 operator 手動 Approve / Execute
 - **課堂 demo 腳本**：`bash scripts/lab/demo-nginx-manual-gate.sh`，只準備 Nginx bad-config Queue，不代按 Approve / Execute
 
@@ -364,12 +410,14 @@ LOKI_QUERY 過濾       service-aware 後處理         root runner + wrapper po
 
 ### 2026-06-03 demo lab 入口確認
 
-- Dashboard `http://100.72.172.83:5000/` 回 HTTP 200
-- Grafana `http://100.72.172.83:3000/` 回 HTTP 200
-- Prometheus health `http://100.72.172.83:9090/-/healthy` 回 HTTP 200
-- Loki ready `http://100.72.172.83:3100/ready` 回 HTTP 200
-- Layer 2 health `http://100.72.172.83:8080/health` 回 HTTP 200
-- Target agent `http://100.77.197.118:8090/health` 未帶 token 回 HTTP 401，代表 endpoint 可達且 auth 保護生效
+> 位址以佔位符表示；實際 IP 見 `.env.lab`。
+
+- Dashboard `http://${AADS_CONTROLLER_IP}:5000/` 回 HTTP 200
+- Grafana `http://${AADS_CONTROLLER_IP}:3000/` 回 HTTP 200
+- Prometheus health `http://${AADS_CONTROLLER_IP}:9090/-/healthy` 回 HTTP 200
+- Loki ready `http://${AADS_CONTROLLER_IP}:3100/ready` 回 HTTP 200
+- Layer 2 health `http://${AADS_CONTROLLER_IP}:8080/health` 回 HTTP 200
+- Target agent `http://${AADS_TARGET_IP}:8090/health` 未帶 token 回 HTTP 401，代表 endpoint 可達且 auth 保護生效
 
 ### 2026-06-03 Nginx 手動 Dashboard demo
 
@@ -379,7 +427,7 @@ LOKI_QUERY 過濾       service-aware 後處理         root runner + wrapper po
 bash scripts/lab/demo-nginx-manual-gate.sh
 ```
 
-這支腳本會驗證 `.env.lab` 的 forced manual approval / node id / Loki query、檢查 Dashboard Admin Key、確認 target runner 是 `runner.v1`，然後拒絕 stale pending/approved items、還原 Nginx baseline、注入壞的 `nginx.conf`、等待新的 schema 3.0 restore plan 出現在 Queue。它不會呼叫 approve 或 execute API。
+這支腳本會驗證 `.env.lab` 的 forced manual approval / node id / Loki query、檢查 Dashboard Admin Key、確認 target runner 是 `runner.v1`，然後拒絕 stale pending/approved items、還原 Nginx baseline、注入壞的 `nginx.conf`、等待新的 schema 3.1 restore plan 出現在 Queue。它不會呼叫 approve 或 execute API。
 
 operator 在 Dashboard 手動按 **Approve** 與 **Execute** 後，可用：
 
@@ -391,8 +439,8 @@ bash scripts/lab/demo-nginx-manual-gate.sh --verify <DIAGNOSIS_ID>
 
 ### 2026-06-02 手動 Gate demo 後狀態
 
-- controller：`100.72.172.83`；target：`100.77.197.118`
-- target `node_id`：`3bf76430-cf5d-44c6-8ff2-ee0161f73740`
+- controller：`${AADS_CONTROLLER_IP}`；target：`${AADS_TARGET_IP}`
+- target `node_id`：`${AADS_TARGET_NODE_ID}`
 - 成功完成的人工 Gate 修復：Nginx bad config、PostgreSQL stopped、Redis bad config、MySQL bad config
 - 最新確認的 target health：
   - nginx active，`nginx -t` successful

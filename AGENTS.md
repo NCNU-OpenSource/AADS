@@ -1,37 +1,34 @@
-# AI Auto Debug System - Codex 規則
+# AI Auto Debug System — Codex / Agent rules
+
+> The canonical engineering guide for this repo is [`.claude/CLAUDE.md`](.claude/CLAUDE.md)
+> — architecture, the numbered layers, the execution-path security model, test
+> commands, and conventions. **Read it first.** This file only adds the
+> Obsidian-documentation workflow and a few agent-specific reminders.
 
 ## Obsidian 文檔同步
 
-**重要規則**: 每次修改 `docs/obsidian-vault/` 目錄下的任何檔案後，**必須**執行同步腳本將變更上傳到 MinIO。
+同步工具是 **`bash scripts/sync-obsidian`**（一支 bash 腳本，用 `mc mirror` 或
+`aws s3 sync` 把 Obsidian vault 鏡像到 MinIO）。**沒有 Python skill** —
+`~/.claude/skills/` 與 `~/.Codex/skills/` 都不存在這支工具。
 
 ### 執行方式
 
 ```bash
-sync-obsidian
+bash scripts/sync-obsidian --dry-run   # 先預覽要同步的檔案
+bash scripts/sync-obsidian             # 實際鏡像到 MinIO
 ```
 
-或直接執行：
-```bash
-python3 ~/.Codex/skills/sync-obsidian
-```
+由環境變數設定：
 
-### 何時需要同步
+| 變數 | 用途 | 預設 |
+| --- | --- | --- |
+| `AADS_OBSIDIAN_VAULT` | 要同步的 vault 路徑（外接 SSD） | `/Volumes/eSSD/obsidian-aads` |
+| `AADS_OBSIDIAN_BUCKET` | MinIO bucket | `obsidian-aads` |
+| `AADS_OBSIDIAN_ENDPOINT` | MinIO endpoint | `https://s3.tfbs.site` |
+| `AADS_OBSIDIAN_MC_TARGET` | 選用的 `mc` alias | — |
 
-- ✅ 新增 Obsidian 文檔（.md 或 .canvas 文件）
-- ✅ 修改現有 Obsidian 文檔
-- ✅ 刪除 Obsidian 文檔
-- ✅ 更新技術報告 (Technical-Reports/)
-- ✅ 更新 ADR 文檔 (ADR/)
-- ✅ 更新架構圖 (Architecture-Overview.canvas)
-
-### 同步檢查清單
-
-在完成任何涉及 Obsidian 的工作後：
-
-1. [ ] 確認所有文檔修改已儲存
-2. [ ] 執行 `sync-obsidian`
-3. [ ] 檢查同步輸出，確認無錯誤
-4. [ ] 驗證上傳檔案數量合理
+腳本鏡像 **整個 vault**，排除 `.obsidian/`、`.trash/`、`.DS_Store`、`workspace*.json`、
+`data.json`（**沒有副檔名白名單**）。完整說明見 [docs/OBSIDIAN_SYNC.md](docs/OBSIDIAN_SYNC.md)。
 
 ### MinIO 連線資訊
 
@@ -39,49 +36,37 @@ python3 ~/.Codex/skills/sync-obsidian
 - **Bucket**: obsidian-aads
 - **Console**: https://console.tfbs.site
 
-### 技術細節
-
-同步腳本會：
-- 掃描 `docs/obsidian-vault/` 目錄
-- 上傳所有 `.md`、`.canvas`、`.png`、`.jpg` 文件
-- 跳過 `.obsidian/` 配置目錄
-- 保持目錄結構
-- 顯示上傳統計
-
----
-
 ## 專案特定規則
 
-### 文檔結構
+### 文檔結構（現況）
 
-Obsidian vault 組織方式：
+repo 內的 `docs/obsidian-vault/` **目前只有**：
+
 ```
 docs/obsidian-vault/
-├── ADR/                    # Architecture Decision Records
-├── Technical-Reports/      # 實作進度與技術報告
-├── Research/              # 研究筆記
-├── Infrastructure/        # 基礎設施文檔
-├── Services/             # 服務元件文檔
-├── Database/             # 資料庫 Schema
-└── Architecture-Overview.canvas  # 系統架構圖
+└── ADR/                    # Architecture Decision Records (ADR-005 / 006 / 007)
 ```
+
+`Technical-Reports/`、`Research/`、`Infrastructure/`、`Services/`、`Database/`
+**尚未建立**；`Architecture-Overview.canvas` 位於 **repo 根目錄**（不在 vault 內）。
+注意 `scripts/sync-obsidian` 同步的是 `AADS_OBSIDIAN_VAULT` 指向的外接 SSD vault，
+與 repo 內的 `docs/obsidian-vault/` 是兩份不同的東西。
 
 ### 文檔更新原則
 
-1. **實作完成後立即更新文檔**
-   - 新功能 → 更新對應的 Service 文檔
-   - Bug 修復 → 記錄在 Technical-Reports
-   - 架構變更 → 更新 Architecture-Overview.canvas + 寫 ADR
+1. 重大技術選型／架構／API 決策必須寫 ADR（放 `docs/obsidian-vault/ADR/`）。
+2. 架構變更同步更新根目錄的 `Architecture-Overview.canvas`。
+3. 實作或 bug 修復完成後更新對應的 `docs/` 文檔。
 
-2. **測試問題必須記錄**
-   - 遇到的問題、根本原因、解決方案
-   - 記錄在 Technical-Reports 或 Troubleshooting
+### 執行路徑安全（必讀）
 
-3. **重大決策必須寫 ADR**
-   - 技術選型（如 Pydantic vs JSON Schema）
-   - 架構變更（如 Map-Reduce 引入）
-   - API 設計決策
+動到 Layer 4 執行路徑前，先讀 [`docs/SECURITY_HARDENING_AUDIT.md`](docs/SECURITY_HARDENING_AUDIT.md)
+與 ADR-005/006/007。關鍵不變量：
 
----
-
-**最後更新**: 2026-04-08
+- `FixingPlan 3.1` 的必填 `execution_profile`（由 `runner_catalog` 決定性產生，非 LLM）。
+- PolicyCard fail-closed（`AADS_POLICY_MODE=enforce` 為預設）。
+- `plan_sha256` 漂移／TOCTOU 防護；失敗走 `paused_for_review` + `execution_escalations`。
+- `log_guard` 日誌注入防禦（外部日誌是不可信輸入）。
+- `profile_allows()` 在 `layer2-analyzer/src/schemas/action_plan.py` 與
+  `pi-agent/src/safety_cards/policy_card.py` 各有一份 —— 改一邊就要改另一邊，
+  否則 `layer2-analyzer/tests/test_parity.py` 會擋下。

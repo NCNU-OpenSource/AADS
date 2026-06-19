@@ -10,9 +10,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 if [[ "$MODE" == "destructive" ]]; then
   echo "Applying destructive lab migration..."
   docker exec "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -c '
-    DROP TABLE IF EXISTS audit_events, execution_steps, idempotency_records,
-      agent_tasks, plan_executions, plan_approvals, node_locks, agent_nodes,
-      diagnosis_reports, anomaly_logs, raw_logs, knowledge_cases CASCADE;
+    DROP TABLE IF EXISTS execution_escalations, audit_events, execution_steps,
+      idempotency_records, agent_tasks, plan_executions, plan_approvals,
+      node_locks, agent_nodes, diagnosis_reports, anomaly_logs, raw_logs,
+      knowledge_cases CASCADE;
   '
 elif [[ "$MODE" != "safe" ]]; then
   echo "AADS_DB_MIGRATION_MODE must be safe or destructive" >&2
